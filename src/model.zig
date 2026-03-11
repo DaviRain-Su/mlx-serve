@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
 
 pub const HiddenAct = enum { gelu_approx, silu };
 
@@ -285,12 +286,12 @@ pub fn loadWeights(allocator: std.mem.Allocator, model_dir: []const u8) !Weights
         const path = try allocator.dupeZ(u8, path_slice);
         defer allocator.free(path);
 
-        std.debug.print("Loading {s}...\n", .{entry.name});
+        log.info("Loading {s}...\n", .{entry.name});
         try loadSafetensorsFile(allocator, &weights, path, s);
         file_count += 1;
     }
 
-    std.debug.print("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
+    log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
     return weights;
 }
 

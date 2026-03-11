@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
+const log = @import("log.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -99,6 +100,38 @@ pub const KVCache = struct {
         if (shape.len < 3) return 0;
         return @intCast(shape[2]);
     }
+
+    /// Truncate the KV cache to keep only the first `len` tokens on the sequence axis.
+    pub fn truncate(self: *KVCache, len: usize, s: mlx.mlx_stream) !void {
+        for (self.entries) |*entry| {
+            if (!entry.initialized) continue;
+            const shape = mlx.getShape(entry.keys);
+            if (shape.len < 4) continue;
+            const current_seq: usize = @intCast(shape[2]);
+            if (len >= current_seq) continue;
+            if (len == 0) {
+                // Reset to empty
+                _ = mlx.mlx_array_free(entry.keys);
+                _ = mlx.mlx_array_free(entry.values);
+                entry.keys = mlx.mlx_array_new();
+                entry.values = mlx.mlx_array_new();
+                entry.initialized = false;
+                continue;
+            }
+            const seq_end: c_int = @intCast(len);
+            const start = [_]c_int{ 0, 0, 0, 0 };
+            const stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
+            const strides = [_]c_int{ 1, 1, 1, 1 };
+            var trimmed_k = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&trimmed_k, entry.keys, &start, 4, &stop, 4, &strides, 4, s));
+            _ = mlx.mlx_array_free(entry.keys);
+            entry.keys = trimmed_k;
+            var trimmed_v = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&trimmed_v, entry.values, &start, 4, &stop, 4, &strides, 4, s));
+            _ = mlx.mlx_array_free(entry.values);
+            entry.values = trimmed_v;
+        }
+    }
 };
 
 /// Precomputed per-layer weight references (avoids hash lookups during forward pass).
@@ -157,6 +190,9 @@ pub const Transformer = struct {
     owns_lm_head: bool,
     // Whether we own norm arrays (true when we computed 1+weight)
     owns_norms: bool,
+
+    // Compiled forward pass closure (JIT-compiled for Metal kernel fusion)
+    compiled_forward: ?mlx.mlx_closure = null,
 
     // Constant arrays reused every step
     gelu_coeff: ?mlx.mlx_array, // sqrt(2/pi) for GELU approx
@@ -218,7 +254,7 @@ pub const Transformer = struct {
         }
 
         // Precompute per-layer weights
-        std.debug.print("Precomputing layer weights...\n", .{});
+        log.info("Precomputing layer weights...\n", .{});
         const layers = try allocator.alloc(LayerWeights, config.num_hidden_layers);
 
         for (0..config.num_hidden_layers) |i| {
@@ -328,7 +364,7 @@ pub const Transformer = struct {
 
             try mlx.check(mlx.mlx_eval(all_vec));
             const eval_ms = eval_timer.read() / std.time.ns_per_ms;
-            std.debug.print("Batch eval all weights: {d}ms\n", .{eval_ms});
+            log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
         }
 
         // Activation constants
@@ -360,7 +396,63 @@ pub const Transformer = struct {
         };
     }
 
+    /// Create a compiled version of the forward pass for faster decode.
+    /// Call this after init() and before starting generation.
+    pub fn compileForward(self: *Transformer) void {
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &forwardClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, false);
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_forward = compiled;
+            log.info("Forward pass compiled (Metal kernel fusion enabled)\n", .{});
+        } else {
+            log.warn("Forward compilation failed, using uncompiled path\n", .{});
+        }
+    }
+
+    /// C callback for the compiled forward closure.
+    fn forwardClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        // Input is a vector with one array: the token_ids
+        var token_ids = mlx.mlx_array_new();
+        const get_rc = mlx.mlx_vector_array_get(&token_ids, input, 0);
+        if (get_rc != 0) return get_rc;
+        defer _ = mlx.mlx_array_free(token_ids);
+
+        const logits = self.forward(token_ids) catch return -1;
+
+        // Package output as vector array
+        const out_arr = [_]mlx.mlx_array{logits};
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
+        _ = mlx.mlx_array_free(logits);
+        return 0;
+    }
+
+    /// Forward pass using compiled closure if available, falling back to regular.
+    pub fn forwardCompiled(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        if (self.compiled_forward) |compiled| {
+            const in_arr = [_]mlx.mlx_array{token_ids};
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
+            return result;
+        }
+        return self.forward(token_ids);
+    }
+
     pub fn deinit(self: *Transformer) void {
+        if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
         if (self.owns_norms) _ = mlx.mlx_array_free(self.final_norm);
@@ -884,7 +976,7 @@ pub const Transformer = struct {
 fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, fmt, .{prefix}) catch unreachable;
     return weights.get(name) orelse {
-        std.debug.print("MISSING WEIGHT: {s}\n", .{name});
+        log.warn("MISSING WEIGHT: {s}\n", .{name});
         unreachable;
     };
 }
@@ -899,7 +991,7 @@ fn getWeightFmtOpt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const
 fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.layers.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
     return weights.get(name) orelse {
-        std.debug.print("MISSING WEIGHT: {s}\n", .{name});
+        log.warn("MISSING WEIGHT: {s}\n", .{name});
         unreachable;
     };
 }

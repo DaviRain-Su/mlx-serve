@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Version from build option or default
+    const version = b.option([]const u8, "version", "Version string") orelse "0.1.0-dev";
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -17,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "vibe_jinja", .module = vibe_jinja_dep.module("vibe_jinja") },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
 

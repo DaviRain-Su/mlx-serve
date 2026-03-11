@@ -2,7 +2,8 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*'
 
 jobs:
   build:
@@ -21,17 +22,56 @@ jobs:
       - name: Install mlx-c
         run: brew install mlx-c
 
-      - name: Build
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Generate version tag
+      - name: Extract version
         id: version
-        run: echo "tag=v$(date +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
+
+      - name: Package binary with dylibs
+        run: |
+          STAGING="mlx-serve-macos-arm64"
+          mkdir -p "$STAGING/lib"
+
+          # Copy binary
+          cp zig-out/bin/mlx-serve "$STAGING/"
+
+          # Bundle required dylibs
+          cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$STAGING/lib/"
+          cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$STAGING/lib/"
+
+          # Fix rpaths so binary finds bundled dylibs
+          install_name_tool -change \
+            /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib \
+            @executable_path/lib/libmlxc.dylib \
+            "$STAGING/mlx-serve"
+
+          # Fix libmlxc to find bundled libmlx
+          install_name_tool -change \
+            /opt/homebrew/opt/mlx/lib/libmlx.dylib \
+            @loader_path/libmlx.dylib \
+            "$STAGING/lib/libmlxc.dylib"
+
+          # Re-sign after install_name_tool changes
+          codesign --force --sign - "$STAGING/mlx-serve"
+          codesign --force --sign - "$STAGING/lib/libmlxc.dylib"
+          codesign --force --sign - "$STAGING/lib/libmlx.dylib"
+
+          # Verify
+          echo "=== Binary deps ==="
+          otool -L "$STAGING/mlx-serve"
+          echo "=== libmlxc deps ==="
+          otool -L "$STAGING/lib/libmlxc.dylib"
+          echo "=== Version ==="
+          "$STAGING/mlx-serve" --version
+
+          # Create tarball
+          tar -czf "mlx-serve-bin-macos-arm64.tar.gz" "$STAGING"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: mlx-serve ${{ steps.version.outputs.tag }}
+          name: mlx-serve v${{ steps.version.outputs.version }}
           generate_release_notes: true
-          files: zig-out/bin/mlx-serve
+          files: mlx-serve-bin-macos-arm64.tar.gz
