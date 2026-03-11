@@ -6,10 +6,12 @@ const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+const status_mod = @import("status.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
+const StatusBar = status_mod.StatusBar;
 
 /// Global flag set by signal handler for graceful shutdown.
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -84,6 +86,9 @@ pub fn serve(
     log.info("  GET  /v1/models\n", .{});
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n\n", .{});
+
+    var status = StatusBar.init();
+    defer status.deinit();
 
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = server.stream.handle,
@@ -495,6 +500,9 @@ fn handleChatCompletions(
         break :blk false;
     } else false;
 
+    // Parse enable_thinking (default: false — strips <think> blocks from output)
+    const enable_thinking = if (root.get("enable_thinking")) |v| v == .bool and v.bool else false;
+
     // Log the request
     const last_msg = messages.items[messages.items.len - 1];
     const preview_len = @min(last_msg.content.len, 80);
@@ -502,7 +510,7 @@ fn handleChatCompletions(
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template
-    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction);
+    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     defer allocator.free(prompt_ids);
 
     // Enforce context size limit
@@ -527,11 +535,11 @@ fn handleChatCompletions(
     };
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -854,6 +862,7 @@ fn handleNonStreamingGeneration(
     has_tools: bool,
     cached_tokens: u32,
     logprobs_n: u32,
+    enable_thinking: bool,
 ) !void {
     var timer = try std.time.Timer.start();
 
@@ -935,7 +944,11 @@ fn handleNonStreamingGeneration(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, finish_reason,
     });
 
-    const escaped_text = jsonEscape(allocator, final_text) catch "\"\"";
+    // Split thinking content from response
+    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking);
+    const content_text = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
+
+    const escaped_text = jsonEscape(allocator, content_text) catch "\"\"";
     defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
 
     // Build logprobs JSON if requested
@@ -947,12 +960,26 @@ fn handleNonStreamingGeneration(
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
 
+    // Build reasoning_content field if thinking is enabled and reasoning exists
+    var reasoning_json: []const u8 = "";
+    var reasoning_allocated = false;
+    if (enable_thinking) {
+        if (think_split.reasoning_content) |reasoning| {
+            const escaped_reasoning = try jsonEscape(allocator, reasoning);
+            reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
+            allocator.free(escaped_reasoning);
+            reasoning_allocated = true;
+        }
+    }
+    defer if (reasoning_allocated) allocator.free(reasoning_json);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         std.time.milliTimestamp(),
         model_name,
         escaped_text,
+        reasoning_json,
         logprobs_json,
         finish_reason,
         result.prompt_tokens,
@@ -979,6 +1006,7 @@ fn handleStreamingGeneration(
     has_tools: bool,
     cached_tokens: u32,
     logprobs_n: u32,
+    enable_thinking: bool,
 ) !void {
     const chat_id = std.time.milliTimestamp();
     var timer = try std.time.Timer.start();
@@ -1004,10 +1032,11 @@ fn handleStreamingGeneration(
     // First chunk: role announcement
     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null);
 
-    // Buffer for stop sequence detection and tool call detection
+    // Buffer for stop sequence, tool call, and think block detection
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
-    // When tools are present, buffer individual token texts for deferred streaming
+    const needs_buffering = has_tools or stop_sequences.len > 0 or enable_thinking;
+    // When buffering, store individual token texts for deferred streaming
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
         for (token_texts.items) |t| allocator.free(t);
@@ -1020,8 +1049,8 @@ fn handleStreamingGeneration(
         const strip = tok.tok_type == .sentencepiece_bpe;
         const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
 
-        // Accumulate for stop sequence and tool call detection
-        if (has_tools or stop_sequences.len > 0) {
+        // Accumulate for detection
+        if (needs_buffering) {
             try text_buf.appendSlice(allocator, token_text);
         }
 
@@ -1041,8 +1070,8 @@ fn handleStreamingGeneration(
             }
         }
 
-        if (has_tools) {
-            // Buffer tokens — we'll emit them after generation if no tool calls found
+        if (has_tools or enable_thinking) {
+            // Buffer tokens — we'll process them after generation
             try token_texts.append(allocator, token_text);
         } else {
             defer allocator.free(token_text);
@@ -1050,7 +1079,7 @@ fn handleStreamingGeneration(
         }
     }
 
-    // After generation: check for tool calls in accumulated text
+    // After generation: process buffered output
     var finish_reason: []const u8 = if (stopped) "stop" else gen.finish_reason;
     if (has_tools) {
         if (try chat_mod.parseToolCalls(allocator, text_buf.items)) |tool_calls| {
@@ -1064,7 +1093,6 @@ fn handleStreamingGeneration(
 
             // Emit tool call deltas in OpenAI streaming format
             for (tool_calls, 0..) |tc, i| {
-                // First delta: id, type, function name
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
                 defer allocator.free(tc_id);
                 const first_delta = try std.fmt.allocPrint(allocator,
@@ -1073,7 +1101,6 @@ fn handleStreamingGeneration(
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null);
 
-                // Stream arguments in chunks (simulate incremental delivery)
                 const chunk_size: usize = 20;
                 var arg_pos: usize = 0;
                 while (arg_pos < tc.arguments.len) {
@@ -1081,7 +1108,6 @@ fn handleStreamingGeneration(
                     const arg_chunk = tc.arguments[arg_pos..end];
                     const escaped_chunk = try jsonEscape(allocator, arg_chunk);
                     defer allocator.free(escaped_chunk);
-                    // Strip surrounding quotes from jsonEscape (it wraps in quotes)
                     const inner = if (escaped_chunk.len >= 2 and escaped_chunk[0] == '"')
                         escaped_chunk[1 .. escaped_chunk.len - 1]
                     else
@@ -1095,11 +1121,29 @@ fn handleStreamingGeneration(
                 }
             }
             finish_reason = "tool_calls";
+        } else if (enable_thinking) {
+            // No tool calls but thinking enabled — split and stream
+            const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
+            if (think_split.reasoning_content) |reasoning| {
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = reasoning }, null, null);
+            }
+            if (think_split.content.len > 0) {
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null);
+            }
         } else {
-            // No tool calls found — flush buffered tokens as content
+            // No tool calls, no thinking — flush buffered tokens as content
             for (token_texts.items) |t| {
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = t }, null, null);
             }
+        }
+    } else if (enable_thinking) {
+        // Thinking enabled (no tools) — split reasoning from content
+        const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
+        if (think_split.reasoning_content) |reasoning| {
+            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = reasoning }, null, null);
+        }
+        if (think_split.content.len > 0) {
+            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null);
         }
     }
 
@@ -1129,6 +1173,7 @@ fn handleStreamingGeneration(
 const DeltaFields = struct {
     role: ?[]const u8,
     content: ?[]const u8,
+    reasoning_content: ?[]const u8 = null,
     tool_calls_json: ?[]const u8 = null,
 };
 
@@ -1161,6 +1206,15 @@ fn sendSSEChunk(
         const escaped = try jsonEscape(allocator, content);
         defer allocator.free(escaped);
         try delta_buf.appendSlice(allocator, escaped);
+        need_comma = true;
+    }
+
+    if (delta.reasoning_content) |reasoning| {
+        if (need_comma) try delta_buf.appendSlice(allocator, ",");
+        try delta_buf.appendSlice(allocator, "\"reasoning_content\":");
+        const escaped_r = try jsonEscape(allocator, reasoning);
+        defer allocator.free(escaped_r);
+        try delta_buf.appendSlice(allocator, escaped_r);
         need_comma = true;
     }
 

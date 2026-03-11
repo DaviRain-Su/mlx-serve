@@ -1,6 +1,9 @@
 const std = @import("std");
-const jinja = @import("vibe_jinja");
+const jinja_c = @cImport({
+    @cInclude("jinja_wrapper.h");
+});
 const tokenizer_mod = @import("tokenizer.zig");
+const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 
@@ -48,10 +51,19 @@ pub fn loadChatConfig(allocator: std.mem.Allocator, model_dir: []const u8) !Chat
 
     const root = parsed.value.object;
 
-    const chat_template = if (root.get("chat_template")) |v|
+    const chat_template: []const u8 = if (root.get("chat_template")) |v|
         try allocator.dupe(u8, v.string)
-    else
-        try allocator.dupe(u8, "");
+    else blk: {
+        // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
+        const jinja_path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
+        defer allocator.free(jinja_path);
+        if (std.fs.openFileAbsolute(jinja_path, .{})) |f| {
+            defer f.close();
+            break :blk try f.readToEndAlloc(allocator, 1 * 1024 * 1024);
+        } else |_| {
+            break :blk try allocator.dupe(u8, "");
+        }
+    };
 
     const bos_token: ?[]const u8 = if (root.get("bos_token")) |v|
         (if (v == .string) try allocator.dupe(u8, v.string) else null)
@@ -85,24 +97,22 @@ pub fn formatChat(
     chat_config: *const ChatConfig,
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
 ) ![]u32 {
-    // Render the chat template using vibe-jinja
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     defer allocator.free(rendered);
 
-    // Encode the rendered text
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
 
-    // Handle BOS token
     if (chat_config.add_bos_token) {
         if (tok.bos_id) |bos| {
             try ids.append(allocator, bos);
         }
     }
 
-    // Split on special tokens and encode each segment
     try encodeWithSpecialTokens(allocator, tok, rendered, &ids);
+    log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
 
     return ids.toOwnedSlice(allocator);
 }
@@ -114,20 +124,131 @@ fn renderChatTemplate(
     chat_config: *const ChatConfig,
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
 ) ![]const u8 {
-    return try fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction);
+    if (chat_config.chat_template.len == 0) {
+        return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    }
+
+    // Serialize messages to JSON
+    const messages_json = try serializeMessagesJson(allocator, messages);
+    defer allocator.free(messages_json);
+
+    // Build extra context (bos_token, eos_token, enable_thinking)
+    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking);
+    defer allocator.free(extra_json);
+
+    // Null-terminate strings for C
+    const tmpl_z = try allocator.dupeZ(u8, chat_config.chat_template);
+    defer allocator.free(tmpl_z);
+    const msgs_z = try allocator.dupeZ(u8, messages_json);
+    defer allocator.free(msgs_z);
+    const extra_z = try allocator.dupeZ(u8, extra_json);
+    defer allocator.free(extra_z);
+
+    var tools_z: ?[:0]const u8 = null;
+    defer if (tools_z) |tz| allocator.free(tz);
+    if (tools_json) |tj| {
+        tools_z = try allocator.dupeZ(u8, tj);
+    }
+
+    const result_ptr = jinja_c.jinja_render_chat(
+        tmpl_z.ptr,
+        msgs_z.ptr,
+        if (tools_z) |tz| tz.ptr else null,
+        extra_z.ptr,
+        1,
+    );
+
+    if (result_ptr) |ptr| {
+        defer jinja_c.jinja_str_free(ptr);
+        return try allocator.dupe(u8, std.mem.span(ptr));
+    }
+
+    if (jinja_c.jinja_last_error()) |e| {
+        log.debug("  jinja error: {s}, using fallback\n", .{std.mem.span(e)});
+    }
+    return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+}
+
+fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.append(allocator, '[');
+    for (messages, 0..) |msg, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"role\":");
+        try appendJsonString(allocator, &buf, msg.role);
+
+        try buf.appendSlice(allocator, ",\"content\":");
+        if (msg.content.len > 0) {
+            try appendJsonString(allocator, &buf, msg.content);
+        } else {
+            try buf.appendSlice(allocator, "null");
+        }
+
+        if (msg.tool_calls) |tcs| {
+            try buf.appendSlice(allocator, ",\"tool_calls\":[");
+            for (tcs, 0..) |tc, ti| {
+                if (ti > 0) try buf.append(allocator, ',');
+                try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+                try appendJsonString(allocator, &buf, tc.name);
+                try buf.appendSlice(allocator, ",\"arguments\":");
+                try buf.appendSlice(allocator, tc.arguments);
+                try buf.appendSlice(allocator, "}}");
+            }
+            try buf.append(allocator, ']');
+        }
+
+        if (msg.tool_call_id) |tid| {
+            try buf.appendSlice(allocator, ",\"tool_call_id\":");
+            try appendJsonString(allocator, &buf, tid);
+        }
+
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.append(allocator, '{');
+    var need_comma = false;
+
+    if (chat_config.bos_token) |bos| {
+        try buf.appendSlice(allocator, "\"bos_token\":");
+        try appendJsonString(allocator, &buf, bos);
+        need_comma = true;
+    }
+    if (chat_config.eos_token) |eos| {
+        if (need_comma) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "\"eos_token\":");
+        try appendJsonString(allocator, &buf, eos);
+        need_comma = true;
+    }
+    if (need_comma) try buf.append(allocator, ',');
+    if (enable_thinking) {
+        try buf.appendSlice(allocator, "\"enable_thinking\":true");
+    } else {
+        try buf.appendSlice(allocator, "\"enable_thinking\":false");
+    }
+
+    try buf.append(allocator, '}');
+    return buf.toOwnedSlice(allocator);
 }
 
 /// Encode text that may contain special tokens (like <|im_start|>, <bos>, etc.).
-/// Splits the text on known special tokens, encodes text segments normally,
-/// and inserts the special token IDs directly.
 fn encodeWithSpecialTokens(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     text: []const u8,
     ids: *std.ArrayList(u32),
 ) !void {
-    // Collect special tokens sorted by length (longest first for greedy matching)
     var specials = std.ArrayList(SpecialEntry).empty;
     defer specials.deinit(allocator);
 
@@ -136,7 +257,6 @@ fn encodeWithSpecialTokens(
         try specials.append(allocator, .{ .text = entry.key_ptr.*, .id = entry.value_ptr.* });
     }
 
-    // Sort by length descending (greedy match)
     std.mem.sort(SpecialEntry, specials.items, {}, struct {
         fn lessThan(_: void, a: SpecialEntry, b: SpecialEntry) bool {
             return a.text.len > b.text.len;
@@ -145,14 +265,11 @@ fn encodeWithSpecialTokens(
 
     var pos: usize = 0;
     while (pos < text.len) {
-        // Try to match a special token at current position
         var matched = false;
         for (specials.items) |special| {
             if (pos + special.text.len <= text.len and
                 std.mem.eql(u8, text[pos .. pos + special.text.len], special.text))
             {
-                // Encode any text before this special token
-                // (already handled by the loop structure)
                 try ids.append(allocator, special.id);
                 pos += special.text.len;
                 matched = true;
@@ -161,7 +278,6 @@ fn encodeWithSpecialTokens(
         }
         if (matched) continue;
 
-        // Find the next special token
         var next_special_pos: usize = text.len;
         for (specials.items) |special| {
             if (std.mem.indexOf(u8, text[pos..], special.text)) |offset| {
@@ -172,7 +288,6 @@ fn encodeWithSpecialTokens(
             }
         }
 
-        // Encode the text segment before the next special token
         if (next_special_pos > pos) {
             const segment = text[pos..next_special_pos];
             const segment_ids = try tok.encode(allocator, segment);
@@ -189,27 +304,24 @@ const SpecialEntry = struct {
 };
 
 /// Fallback chat formatting for when Jinja rendering fails.
-/// Detects known template patterns and generates the expected format.
 fn fallbackFormatChat(
     allocator: std.mem.Allocator,
     messages: []const Message,
     chat_config: *const ChatConfig,
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
 ) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
-    // Detect template type from eos_token or template content
     const is_chatml = chat_config.eos_token != null and
         std.mem.indexOf(u8, chat_config.eos_token.?, "<|im_end|>") != null;
 
-    // Check if the first message is a system message
     const has_system = messages.len > 0 and std.mem.eql(u8, messages[0].role, "system");
 
     if (is_chatml) {
         // ChatML format (Qwen3, etc.)
-        // If tools are provided and no system message exists, inject a system message with tool defs
         if (tools_json != null and !has_system) {
             try result.appendSlice(allocator, "<|im_start|>system\n");
             try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
@@ -218,14 +330,12 @@ fn fallbackFormatChat(
 
         for (messages) |msg| {
             if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
-                // Append tools to existing system message
                 try result.appendSlice(allocator, "<|im_start|>system\n");
                 try result.appendSlice(allocator, msg.content);
                 try result.appendSlice(allocator, "\n\n");
                 try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
                 try result.appendSlice(allocator, "<|im_end|>\n");
             } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-                // Assistant message with tool calls
                 try result.appendSlice(allocator, "<|im_start|>assistant\n");
                 if (msg.content.len > 0) {
                     try result.appendSlice(allocator, msg.content);
@@ -241,7 +351,6 @@ fn fallbackFormatChat(
                 }
                 try result.appendSlice(allocator, "<|im_end|>\n");
             } else if (std.mem.eql(u8, msg.role, "tool")) {
-                // Tool result message
                 try result.appendSlice(allocator, "<|im_start|>user\n");
                 try result.appendSlice(allocator, "<tool_response>\n");
                 try result.appendSlice(allocator, msg.content);
@@ -256,9 +365,12 @@ fn fallbackFormatChat(
             }
         }
         try result.appendSlice(allocator, "<|im_start|>assistant\n");
-        // Qwen3 thinking models: disable thinking by default (prefill no-think tags)
         if (std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
-            try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
+            if (enable_thinking) {
+                try result.appendSlice(allocator, "<think>\n");
+            } else {
+                try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
+            }
         }
     } else {
         // Gemma/Llama-style format
@@ -266,7 +378,6 @@ fn fallbackFormatChat(
             try result.appendSlice(allocator, bos);
         }
 
-        // Check if this is Llama-style (uses <|start_header_id|>)
         const is_llama = std.mem.indexOf(u8, chat_config.chat_template, "start_header_id") != null;
 
         if (is_llama) {
@@ -275,7 +386,6 @@ fn fallbackFormatChat(
             if (tools_json != null) {
                 try result.appendSlice(allocator, "Environment: ipython\n");
             }
-            // Add system message content
             if (has_system) {
                 try result.appendSlice(allocator, messages[0].content);
             } else {
@@ -340,10 +450,45 @@ fn fallbackFormatChat(
     return result.toOwnedSlice(allocator);
 }
 
+/// Strip `<think>...</think>` block from model output.
+pub fn stripThinkBlock(text: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
+        return std.mem.trimLeft(u8, text[think_end + 8 ..], "\n ");
+    }
+    if (std.mem.startsWith(u8, text, "<think>")) return text[0..0];
+    return text;
+}
+
+pub const ThinkSplit = struct {
+    reasoning_content: ?[]const u8,
+    content: []const u8,
+};
+
+/// Split model output into reasoning_content and content.
+pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
+    if (std.mem.indexOf(u8, text, "</think>")) |end| {
+        const reasoning_start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else 0;
+        const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
+        const content = std.mem.trimLeft(u8, text[end + 8 ..], "\n ");
+        return .{
+            .reasoning_content = if (reasoning.len > 0) reasoning else null,
+            .content = content,
+        };
+    }
+    if (thinking) {
+        return .{ .reasoning_content = text, .content = "" };
+    }
+    return .{ .reasoning_content = null, .content = text };
+}
+
 /// Parse tool calls from model output text.
-/// Looks for <tool_call>...</tool_call> markers or raw JSON with "name"/"arguments" keys.
-/// Returns null if no tool calls found.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
+    // Strip <think>...</think> block if present
+    var effective_text = text;
+    if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
+        effective_text = std.mem.trimLeft(u8, text[think_end + 8 ..], "\n ");
+    }
+
     var calls = std.ArrayList(ParsedToolCall).empty;
     errdefer {
         for (calls.items) |tc| {
@@ -355,30 +500,34 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
 
     // Look for <tool_call>...</tool_call> patterns
     var search_pos: usize = 0;
-    while (search_pos < text.len) {
-        const tag_start = std.mem.indexOf(u8, text[search_pos..], "<tool_call>") orelse break;
+    while (search_pos < effective_text.len) {
+        const tag_start = std.mem.indexOf(u8, effective_text[search_pos..], "<tool_call>") orelse break;
         const content_start = search_pos + tag_start + "<tool_call>".len;
-        const tag_end = std.mem.indexOf(u8, text[content_start..], "</tool_call>") orelse break;
-        const content = std.mem.trim(u8, text[content_start .. content_start + tag_end], " \t\n\r");
+        const tag_end = std.mem.indexOf(u8, effective_text[content_start..], "</tool_call>") orelse break;
+        const content = std.mem.trim(u8, effective_text[content_start .. content_start + tag_end], " \t\n\r");
         search_pos = content_start + tag_end + "</tool_call>".len;
 
-        if (try parseToolCallJson(allocator, content)) |tc| {
+        // Try JSON format first
+        if (tryParseJsonToolCall(allocator, content)) |tc| {
+            try calls.append(allocator, tc);
+            continue;
+        }
+
+        // Fall back to Hermes format: <function=name><parameter=name>value</parameter></function>
+        if (parseHermesToolCall(allocator, content)) |tc| {
             try calls.append(allocator, tc);
         }
     }
 
-    // If no <tool_call> tags, try to find raw JSON tool call in the text
+    // If no <tool_call> tags, try to find raw JSON tool call
     if (calls.items.len == 0) {
-        // Strip any stray closing tags and find the first { in the text
-        var trimmed = std.mem.trim(u8, text, " \t\n\r");
-        // Strip leading </tool_call> if present (model artifact)
+        var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
         if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
             trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
         }
-        // Find the first JSON object
         if (std.mem.indexOf(u8, trimmed, "{")) |brace_pos| {
             const json_start = trimmed[brace_pos..];
-            if (try parseToolCallJson(allocator, json_start)) |tc| {
+            if (tryParseJsonToolCall(allocator, json_start)) |tc| {
                 try calls.append(allocator, tc);
             }
         }
@@ -393,10 +542,8 @@ pub const ParsedToolCall = struct {
     arguments: []const u8, // JSON string
 };
 
-/// Try to parse a JSON string as a tool call.
-/// Supports both {"name":"...", "arguments":{...}} and {"name":"...", "parameters":{...}}
-fn parseToolCallJson(allocator: std.mem.Allocator, json_text: []const u8) !?ParsedToolCall {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return null;
+fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedToolCall {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
     defer parsed.deinit();
 
     if (parsed.value != .object) return null;
@@ -405,74 +552,98 @@ fn parseToolCallJson(allocator: std.mem.Allocator, json_text: []const u8) !?Pars
     const name_val = obj.get("name") orelse return null;
     if (name_val != .string) return null;
 
-    // Look for "arguments" or "parameters" — extract from raw JSON text
-    const args_key = if (std.mem.indexOf(u8, json_text, "\"arguments\"") != null)
-        "arguments"
-    else if (std.mem.indexOf(u8, json_text, "\"parameters\"") != null)
-        "parameters"
-    else
-        return null;
-
-    const args_str = extractJsonValue(allocator, json_text, args_key) orelse
-        try allocator.dupe(u8, "{}");
+    const args_val = obj.get("arguments") orelse (obj.get("parameters") orelse return null);
+    const args_str = switch (args_val) {
+        .object => std.json.Stringify.valueAlloc(allocator, args_val, .{}) catch return null,
+        .string => |s| allocator.dupe(u8, s) catch return null,
+        else => return null,
+    };
 
     return .{
-        .name = try allocator.dupe(u8, name_val.string),
+        .name = allocator.dupe(u8, name_val.string) catch {
+            allocator.free(args_str);
+            return null;
+        },
         .arguments = args_str,
     };
 }
 
-/// Extract a JSON value substring for a given key from raw JSON text.
-fn extractJsonValue(allocator: std.mem.Allocator, json: []const u8, key: []const u8) ?[]const u8 {
-    // Find "key"
-    var buf: [256]u8 = undefined;
-    const search_key = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return null;
-    const key_pos = std.mem.indexOf(u8, json, search_key) orelse return null;
-    var i = key_pos + search_key.len;
+fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
+    const fn_start_tag = "<function=";
+    const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
+    const name_start = fn_start + fn_start_tag.len;
+    const name_end = std.mem.indexOf(u8, block[name_start..], ">") orelse return null;
+    const fn_name = std.mem.trim(u8, block[name_start .. name_start + name_end], " \n");
 
-    // Skip whitespace and colon
-    while (i < json.len and (json[i] == ' ' or json[i] == ':' or json[i] == '\t' or json[i] == '\n' or json[i] == '\r')) {
-        i += 1;
-    }
-    if (i >= json.len) return null;
+    var args_map = std.ArrayList(u8).empty;
+    defer args_map.deinit(allocator);
+    args_map.append(allocator, '{') catch return null;
 
-    // Extract the value
-    if (json[i] == '{' or json[i] == '[') {
-        const open = json[i];
-        const close: u8 = if (open == '{') '}' else ']';
-        var depth: usize = 1;
-        var j = i + 1;
-        var in_str = false;
-        while (j < json.len and depth > 0) {
-            if (json[j] == '\\' and in_str) {
-                j += 1;
-            } else if (json[j] == '"') {
-                in_str = !in_str;
-            } else if (!in_str) {
-                if (json[j] == open) depth += 1;
-                if (json[j] == close) depth -= 1;
-            }
-            j += 1;
+    const fn_body_start = name_start + name_end + 1;
+    const fn_end = std.mem.indexOf(u8, block[fn_body_start..], "</function>") orelse block.len - fn_body_start;
+    const fn_body = block[fn_body_start .. fn_body_start + fn_end];
+
+    var param_search: usize = 0;
+    var first_param = true;
+    while (std.mem.indexOf(u8, fn_body[param_search..], "<parameter=")) |ps| {
+        const p_name_start = param_search + ps + "<parameter=".len;
+        const p_name_end = std.mem.indexOf(u8, fn_body[p_name_start..], ">") orelse break;
+        const p_name = std.mem.trim(u8, fn_body[p_name_start .. p_name_start + p_name_end], " \n");
+        const p_val_start = p_name_start + p_name_end + 1;
+        const p_val_end = std.mem.indexOf(u8, fn_body[p_val_start..], "</parameter>") orelse break;
+        const p_val = std.mem.trim(u8, fn_body[p_val_start .. p_val_start + p_val_end], "\n");
+
+        if (!first_param) args_map.append(allocator, ',') catch return null;
+        first_param = false;
+
+        args_map.append(allocator, '"') catch return null;
+        args_map.appendSlice(allocator, p_name) catch return null;
+        args_map.appendSlice(allocator, "\":") catch return null;
+
+        const trimmed_val = std.mem.trim(u8, p_val, " ");
+        if (isJsonLiteral(trimmed_val)) {
+            args_map.appendSlice(allocator, trimmed_val) catch return null;
+        } else {
+            appendJsonString(allocator, &args_map, trimmed_val) catch return null;
         }
-        if (depth == 0) return allocator.dupe(u8, json[i..j]) catch null;
-    } else if (json[i] == '"') {
-        // String value — find closing quote
-        var j = i + 1;
-        while (j < json.len) {
-            if (json[j] == '\\') {
-                j += 1;
-            } else if (json[j] == '"') {
-                return allocator.dupe(u8, json[i + 1 .. j]) catch null;
-            }
-            j += 1;
+
+        param_search = p_val_start + p_val_end + "</parameter>".len;
+    }
+
+    args_map.append(allocator, '}') catch return null;
+
+    return .{
+        .name = allocator.dupe(u8, fn_name) catch return null,
+        .arguments = allocator.dupe(u8, args_map.items) catch return null,
+    };
+}
+
+fn isJsonLiteral(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "null")) return true;
+    if (s[0] == '{' or s[0] == '[') return true;
+    _ = std.fmt.parseFloat(f64, s) catch return false;
+    return true;
+}
+
+fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
         }
     }
-    return null;
+    try buf.append(allocator, '"');
 }
 
 /// Append tool definitions as a system prompt section.
-fn appendToolSystemPrompt(allocator: std.mem.Allocator, result: *std.ArrayList(u8), tools_json: []const u8, tool_choice_instruction: ?[]const u8) !void {
-    try result.appendSlice(allocator,
+fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayList(u8), tools_json: []const u8, tool_choice_instruction: ?[]const u8) !void {
+    try result_buf.appendSlice(allocator,
         \\You are a helpful assistant with access to the following functions. To call a function, respond with a JSON object in the following format:
         \\<tool_call>
         \\{"name": "function_name", "arguments": {"arg1": "value1"}}
@@ -481,8 +652,8 @@ fn appendToolSystemPrompt(allocator: std.mem.Allocator, result: *std.ArrayList(u
         \\Available functions:
         \\
     );
-    try result.appendSlice(allocator, tools_json);
+    try result_buf.appendSlice(allocator, tools_json);
     if (tool_choice_instruction) |instr| {
-        try result.appendSlice(allocator, instr);
+        try result_buf.appendSlice(allocator, instr);
     }
 }

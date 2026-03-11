@@ -4,12 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // vibe-jinja dependency for chat template rendering
-    const vibe_jinja_dep = b.dependency("vibe_jinja", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     // Version from build option or default
     const version = b.option([]const u8, "version", "Version string") orelse "0.1.0-dev";
 
@@ -22,10 +16,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libcpp = true,
         .imports = &.{
-            .{ .name = "vibe_jinja", .module = vibe_jinja_dep.module("vibe_jinja") },
             .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
+
+    // jinja.cpp (C++ Jinja2 engine compiled by Zig)
+    mod.addCSourceFiles(.{
+        .files = &.{"lib/jinja_cpp/jinja_wrapper.cpp"},
+        .flags = &.{ "-std=c++11", "-DNDEBUG" },
+    });
+    mod.addIncludePath(b.path("lib/jinja_cpp"));
+    mod.addIncludePath(b.path("lib/jinja_cpp/third_party"));
 
     // mlx-c include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -36,6 +37,9 @@ pub fn build(b: *std.Build) void {
         .name = "mlx-serve",
         .root_module = mod,
     });
+
+    exe.linkFramework("IOKit");
+    exe.linkFramework("CoreFoundation");
 
     b.installArtifact(exe);
 
