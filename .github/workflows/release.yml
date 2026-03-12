@@ -88,9 +88,10 @@ jobs:
           # Copy binary
           cp zig-out/bin/mlx-serve "$STAGING/"
 
-          # Bundle required dylibs
+          # Bundle required dylibs and Metal shader library
           cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$STAGING/lib/"
           cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$STAGING/lib/"
+          cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$STAGING/lib/"
 
           # Fix rpaths so binary finds bundled dylibs
           install_name_tool -change \
