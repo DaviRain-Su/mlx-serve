@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.3.0)'
+        required: true
+        type: string
 
 jobs:
   build:
@@ -24,7 +30,20 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git tag v${{ steps.version.outputs.version }}
+          git push origin v${{ steps.version.outputs.version }}
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
@@ -72,6 +91,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           name: mlx-serve v${{ steps.version.outputs.version }}
           generate_release_notes: true
           files: mlx-serve-bin-macos-arm64.tar.gz
