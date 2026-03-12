@@ -28,6 +28,37 @@ jobs:
       - name: Install mlx-c
         run: brew install mlx-c
 
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Allow codesign to access the keychain without prompts
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          # Verify identity is available
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
       - name: Extract version
         id: version
         run: |
@@ -48,7 +79,9 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
 
-      - name: Package binary with dylibs
+      - name: Package and sign binary
+        env:
+          SIGNING_IDENTITY: "Developer ID Application: David Dalcu (${{ secrets.APPLE_TEAM_ID }})"
         run: |
           STAGING="mlx-serve-macos-arm64"
           mkdir -p "$STAGING/lib"
@@ -72,12 +105,14 @@ jobs:
             @loader_path/libmlx.dylib \
             "$STAGING/lib/libmlxc.dylib"
 
-          # Re-sign after install_name_tool changes
-          codesign --force --sign - "$STAGING/mlx-serve"
-          codesign --force --sign - "$STAGING/lib/libmlxc.dylib"
-          codesign --force --sign - "$STAGING/lib/libmlx.dylib"
+          # Sign with Developer ID
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/lib/libmlx.dylib"
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/lib/libmlxc.dylib"
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
 
           # Verify
+          echo "=== Signature ==="
+          codesign --verify --deep --strict --verbose=2 "$STAGING/mlx-serve"
           echo "=== Binary deps ==="
           otool -L "$STAGING/mlx-serve"
           echo "=== libmlxc deps ==="
@@ -85,8 +120,31 @@ jobs:
           echo "=== Version ==="
           "$STAGING/mlx-serve" --version
 
-          # Create tarball
-          tar -czf "mlx-serve-bin-macos-arm64.tar.gz" "$STAGING"
+          # Create zip for notarization (notarytool requires zip, not tar)
+          ditto -c -k --keepParent "$STAGING" "mlx-serve-macos-arm64.zip"
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Submit for notarization and wait
+          xcrun notarytool submit "mlx-serve-macos-arm64.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the binary so it works offline
+          xcrun stapler staple "mlx-serve-macos-arm64/mlx-serve"
+
+      - name: Package tarball
+        run: tar -czf "mlx-serve-bin-macos-arm64.tar.gz" "mlx-serve-macos-arm64"
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain $RUNNER_TEMP/signing.keychain-db || true
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
