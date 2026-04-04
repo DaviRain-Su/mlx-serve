@@ -117,8 +117,8 @@ jobs:
           cp "$SWIFT_BIN_PATH/MLXClaw" "$CONTENTS/MacOS/MLXClaw"
           cp zig-out/bin/mlx-serve "$CONTENTS/MacOS/mlx-serve"
 
-          # Resource bundle (Bundle.main.bundleURL looks at the .app root)
-          cp -R "$SWIFT_BIN_PATH/MLXClaw_MLXClaw.bundle" "$APP/"
+          # App resources (tray icon etc.)
+          cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
 
           # Info.plist
           cp app/Info.plist "$CONTENTS/"

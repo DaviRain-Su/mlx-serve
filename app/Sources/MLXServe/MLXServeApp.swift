@@ -4,11 +4,17 @@ import AppKit
 @main
 struct MLXClawApp: App {
     private static let menuBarIcon: NSImage = {
-        if let url = Bundle.module.url(forResource: "tray", withExtension: "png", subdirectory: "Resources"),
-           let img = NSImage(contentsOf: url) {
-            img.size = NSSize(width: 18, height: 18)
-            img.isTemplate = true
-            return img
+        // Try Bundle.main (works in .app bundles) then Bundle.module (works in dev builds)
+        let candidates: [URL?] = [
+            Bundle.main.resourceURL?.appendingPathComponent("Resources/tray.png"),
+            Bundle.main.bundleURL.appendingPathComponent("MLXClaw_MLXClaw.bundle/Resources/tray.png"),
+        ]
+        for case let url? in candidates {
+            if let img = NSImage(contentsOf: url) {
+                img.size = NSSize(width: 18, height: 18)
+                img.isTemplate = true
+                return img
+            }
         }
         return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Claw")!
     }()

@@ -22,7 +22,7 @@ echo "=== Building MLX Claw $CALVER ==="
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
 swift build -c release 2>&1 | tail -5
-SWIFT_BIN=".build/release/MLXClaw"
+SWIFT_BIN="$(swift build -c release --show-bin-path)/MLXClaw"
 if [ ! -f "$SWIFT_BIN" ]; then
     echo "ERROR: Swift build failed"
     exit 1
@@ -64,7 +64,10 @@ mkdir -p "$CONTENTS/Frameworks"
 mkdir -p "$CONTENTS/Resources"
 
 # Main Swift executable
-cp "$SCRIPT_DIR/$SWIFT_BIN" "$CONTENTS/MacOS/MLXClaw"
+cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXClaw"
+
+# App resources (tray icon etc.)
+cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
 
 # mlx-serve Zig binary
 cp "$PROJECT_ROOT/$MLX_BIN" "$CONTENTS/MacOS/mlx-serve"

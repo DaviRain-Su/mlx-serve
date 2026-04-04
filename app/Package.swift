@@ -8,7 +8,7 @@ let package = Package(
         .executableTarget(
             name: "MLXClaw",
             path: "Sources/MLXServe",
-            resources: [.copy("Resources")]
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "MLXClawTests",
