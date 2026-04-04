@@ -130,8 +130,35 @@ fn renderChatTemplate(
         return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     }
 
+    // Templates that use tool_responses (e.g. Gemma 4) don't understand role:"tool".
+    // They expect role:"assistant" with tool_responses and null content so the model
+    // turn stays open for generation. Transform tool messages for these templates.
+    const uses_tool_responses = std.mem.indexOf(u8, chat_config.chat_template, "tool_responses") != null;
+    var jinja_messages: ?[]Message = null;
+    defer if (jinja_messages) |jm| allocator.free(jm);
+
+    if (uses_tool_responses) {
+        var transformed = try allocator.alloc(Message, messages.len);
+        for (messages, 0..) |msg, idx| {
+            if (std.mem.eql(u8, msg.role, "tool") and msg.tool_call_id != null) {
+                // Change role to "assistant" (template maps to "model").
+                // Keep tool_call_id so serializeMessagesJson builds tool_responses from content.
+                transformed[idx] = .{
+                    .role = "assistant",
+                    .content = msg.content,
+                    .tool_calls = null,
+                    .tool_call_id = msg.tool_call_id,
+                };
+            } else {
+                transformed[idx] = msg;
+            }
+        }
+        jinja_messages = transformed;
+    }
+
     // Serialize messages to JSON
-    const messages_json = try serializeMessagesJson(allocator, messages);
+    const effective_messages = jinja_messages orelse messages;
+    const messages_json = try serializeMessagesJson(allocator, effective_messages);
     defer allocator.free(messages_json);
 
     // Build extra context (bos_token, eos_token, enable_thinking)
@@ -182,7 +209,13 @@ fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message
         try appendJsonString(allocator, &buf, msg.role);
 
         try buf.appendSlice(allocator, ",\"content\":");
-        if (msg.content.len > 0) {
+        // For tool response messages transformed to role:"assistant" (Gemma path),
+        // set content to null so the Jinja template leaves the turn open for generation.
+        // The actual content is carried in tool_responses.
+        const is_transformed_tool = msg.tool_call_id != null and std.mem.eql(u8, msg.role, "assistant");
+        if (is_transformed_tool) {
+            try buf.appendSlice(allocator, "null");
+        } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else {
             try buf.appendSlice(allocator, "null");
@@ -204,6 +237,35 @@ fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message
         if (msg.tool_call_id) |tid| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try appendJsonString(allocator, &buf, tid);
+
+            // Also include tool_responses for Jinja templates that use it (e.g. Gemma 4).
+            // Look up the tool name from the preceding assistant message's tool_calls.
+            var tool_name: []const u8 = "unknown";
+            if (i > 0) {
+                // Search backwards for the nearest assistant message with tool_calls
+                var j: usize = i;
+                while (j > 0) {
+                    j -= 1;
+                    if (messages[j].tool_calls) |prev_tcs| {
+                        for (prev_tcs) |tc| {
+                            if (std.mem.eql(u8, tc.id, tid)) {
+                                tool_name = tc.name;
+                                break;
+                            }
+                        }
+                        break; // Only check the nearest assistant with tool_calls
+                    }
+                }
+            }
+            try buf.appendSlice(allocator, ",\"tool_responses\":[{\"name\":");
+            try appendJsonString(allocator, &buf, tool_name);
+            try buf.appendSlice(allocator, ",\"response\":");
+            if (msg.content.len > 0) {
+                try appendJsonString(allocator, &buf, msg.content);
+            } else {
+                try buf.appendSlice(allocator, "\"\"");
+            }
+            try buf.appendSlice(allocator, "}]");
         }
 
         try buf.append(allocator, '}');
@@ -548,9 +610,17 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         while (search_pos < effective_text.len) {
             const tag_start = std.mem.indexOf(u8, effective_text[search_pos..], "<|tool_call>") orelse break;
             const content_start = search_pos + tag_start + "<|tool_call>".len;
-            const tag_end = std.mem.indexOf(u8, effective_text[content_start..], "<tool_call|>") orelse break;
-            const content = std.mem.trim(u8, effective_text[content_start .. content_start + tag_end], " \t\n\r");
-            search_pos = content_start + tag_end + "<tool_call|>".len;
+            const tag_end_opt = std.mem.indexOf(u8, effective_text[content_start..], "<tool_call|>");
+            const content = if (tag_end_opt) |tag_end|
+                std.mem.trim(u8, effective_text[content_start .. content_start + tag_end], " \t\n\r")
+            else
+                // Incomplete tool call (model hit EOS before closing tag) — use rest of text
+                std.mem.trim(u8, effective_text[content_start..], " \t\n\r");
+
+            search_pos = if (tag_end_opt) |tag_end|
+                content_start + tag_end + "<tool_call|>".len
+            else
+                effective_text.len;
 
             if (parseGemma4ToolCall(allocator, content)) |tc| {
                 try calls.append(allocator, tc);
@@ -681,10 +751,13 @@ fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]c
         // Check if value starts with <|"|> delimiter
         if (pos + str_delim.len <= body.len and std.mem.eql(u8, body[pos .. pos + str_delim.len], str_delim)) {
             pos += str_delim.len;
-            // Find closing delimiter
-            const end = std.mem.indexOf(u8, body[pos..], str_delim) orelse break;
+            // Find closing delimiter (may be missing if model output was truncated)
+            const end = std.mem.indexOf(u8, body[pos..], str_delim) orelse (body.len - pos);
             const value = body[pos .. pos + end];
-            pos = pos + end + str_delim.len;
+            pos = if (pos + end + str_delim.len <= body.len)
+                pos + end + str_delim.len
+            else
+                body.len;
 
             // JSON-escape the value
             result.append(allocator, '"') catch return null;
@@ -1027,6 +1100,48 @@ test "parseToolCalls Gemma 4 with channel thinking" {
     try testing.expectEqualStrings("get_weather", calls[0].name);
 }
 
+test "parseToolCalls Gemma 4 truncated (no closing tag)" {
+    const allocator = testing.allocator;
+    // Model hit EOS before generating <tool_call|>
+    const text = "<|tool_call>call:browse{action:<|\"|>browse<|\"|>,url:<|\"|>https://finance.yahoo.com<|\"|>}";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+    // Should have parsed at least the action argument
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("browse", parsed.value.object.get("action").?.string);
+}
+
+test "parseToolCalls Gemma 4 truncated mid-value" {
+    const allocator = testing.allocator;
+    // Model stopped mid-URL, no closing <|"|> for the value
+    const text = "<|tool_call>call:browse{action:<|\"|>navigate<|\"|>,url:<|\"|>https://finance.";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+    // Should have parsed the complete action and the truncated URL
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("navigate", parsed.value.object.get("action").?.string);
+    // URL should be present (truncated but captured)
+    try testing.expect(parsed.value.object.get("url") != null);
+}
+
 test "isJsonLiteral" {
     try testing.expect(isJsonLiteral("true"));
     try testing.expect(isJsonLiteral("false"));
@@ -1121,4 +1236,324 @@ test "serializeMessagesJson with tool_calls" {
     // Should contain tool_calls array
     try testing.expect(std.mem.indexOf(u8, result, "\"tool_calls\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+}
+
+test "serializeMessagesJson tool response includes tool_responses for Jinja" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+        .{ .role = "tool", .content = "file1.txt\nfile2.txt", .tool_call_id = "call_1" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // Must contain tool_responses for Gemma-style Jinja templates
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") != null);
+    // Must contain the tool name looked up from preceding assistant's tool_calls
+    try testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+    // Must contain the response content
+    try testing.expect(std.mem.indexOf(u8, result, "file1.txt") != null);
+    // Must also keep tool_call_id for OpenAI-style templates
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_call_id\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"call_1\"") != null);
+}
+
+test "serializeMessagesJson tool response name lookup matches by id" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_A", .name = "readFile", .arguments = "{\"path\":\"a.txt\"}" },
+        .{ .id = "call_B", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+        // Response for call_B (shell), not call_A (readFile)
+        .{ .role = "tool", .content = "dir_listing", .tool_call_id = "call_B" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // The tool_responses name should be "shell" (matched by id "call_B"), not "readFile"
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const tool_msg = parsed.value.array.items[1].object;
+    const tool_responses = tool_msg.get("tool_responses").?.array;
+    try testing.expectEqualStrings("shell", tool_responses.items[0].object.get("name").?.string);
+}
+
+test "serializeMessagesJson tool response falls back to unknown when no match" {
+    const allocator = testing.allocator;
+    // No preceding assistant message with tool_calls
+    const messages = [_]Message{
+        .{ .role = "tool", .content = "result", .tool_call_id = "call_orphan" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // Should fall back to "unknown" tool name
+    try testing.expect(std.mem.indexOf(u8, result, "\"unknown\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") != null);
+}
+
+test "serializeMessagesJson full tool calling conversation" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_99_0", .name = "shell", .arguments = "{\"command\":\"echo hello\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "Run echo hello" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+        .{ .role = "tool", .content = "hello", .tool_call_id = "call_99_0" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
+
+    // Verify roles
+    try testing.expectEqualStrings("system", parsed.value.array.items[0].object.get("role").?.string);
+    try testing.expectEqualStrings("user", parsed.value.array.items[1].object.get("role").?.string);
+    try testing.expectEqualStrings("assistant", parsed.value.array.items[2].object.get("role").?.string);
+    try testing.expectEqualStrings("tool", parsed.value.array.items[3].object.get("role").?.string);
+
+    // Verify assistant has tool_calls
+    const assistant = parsed.value.array.items[2].object;
+    try testing.expect(assistant.get("tool_calls") != null);
+
+    // Verify tool message has both tool_call_id AND tool_responses
+    const tool_msg = parsed.value.array.items[3].object;
+    try testing.expectEqualStrings("call_99_0", tool_msg.get("tool_call_id").?.string);
+    try testing.expect(tool_msg.get("tool_responses") != null);
+    const tool_responses = tool_msg.get("tool_responses").?.array;
+    try testing.expectEqualStrings("shell", tool_responses.items[0].object.get("name").?.string);
+    try testing.expectEqualStrings("hello", tool_responses.items[0].object.get("response").?.string);
+}
+
+test "serializeMessagesJson multiple parallel tool responses" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "readFile", .arguments = "{\"path\":\"a.txt\"}" },
+        .{ .id = "call_2", .name = "shell", .arguments = "{\"command\":\"date\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+        .{ .role = "tool", .content = "file content", .tool_call_id = "call_1" },
+        .{ .role = "tool", .content = "Fri Apr 4", .tool_call_id = "call_2" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+
+    // First tool response should have name "readFile"
+    const tool1 = parsed.value.array.items[1].object;
+    const tr1 = tool1.get("tool_responses").?.array.items[0].object;
+    try testing.expectEqualStrings("readFile", tr1.get("name").?.string);
+
+    // Second tool response should have name "shell"
+    const tool2 = parsed.value.array.items[2].object;
+    const tr2 = tool2.get("tool_responses").?.array.items[0].object;
+    try testing.expectEqualStrings("shell", tr2.get("name").?.string);
+}
+
+test "serializeMessagesJson tool response with empty content" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"mkdir test\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+        .{ .role = "tool", .content = "", .tool_call_id = "call_1" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // Should still have tool_responses with empty response string
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+}
+
+// ── Fallback formatter tests ──
+
+test "fallbackFormatChat ChatML with tool calls and responses" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "List files" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+        .{ .role = "tool", .content = "file1.txt\nfile2.txt" },
+    };
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<|im_end|>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"shell\"}}]";
+    const result = try fallbackFormatChat(allocator, &messages, &config, tools_json, null, false);
+    defer allocator.free(result);
+
+    // Should have <tool_call> block for assistant
+    try testing.expect(std.mem.indexOf(u8, result, "<tool_call>") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\": \"shell\"") != null);
+    // Should have <tool_response> block for tool result
+    try testing.expect(std.mem.indexOf(u8, result, "<tool_response>") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "file1.txt") != null);
+    // Should end with assistant prompt
+    try testing.expect(std.mem.endsWith(u8, result, "<|im_start|>assistant\n"));
+}
+
+test "fallbackFormatChat ChatML tool response uses user role" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "tool", .content = "42" },
+    };
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<|im_end|>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Tool responses in ChatML use <|im_start|>user role
+    try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>user\n<tool_response>") != null);
+    // Should NOT have <|im_start|>tool (invalid role)
+    try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>tool") == null);
+}
+
+test "fallbackFormatChat Gemma tool response uses user role" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Run ls" },
+        .{ .role = "tool", .content = "file1.txt" },
+    };
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<eos>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Gemma tool results should be in user turn
+    try testing.expect(std.mem.indexOf(u8, result, "<start_of_turn>user\nTool result: file1.txt") != null);
+    // Should NOT have <start_of_turn>tool (invalid role)
+    try testing.expect(std.mem.indexOf(u8, result, "<start_of_turn>tool") == null);
+}
+
+test "fallbackFormatChat Llama tool response uses ipython role" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "tool", .content = "hello" },
+    };
+    var config = ChatConfig{
+        .chat_template = "start_header_id",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<|eot_id|>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Llama tool results use ipython role
+    try testing.expect(std.mem.indexOf(u8, result, "<|start_header_id|>ipython<|end_header_id|>") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "hello") != null);
+}
+
+test "fallbackFormatChat ChatML assistant with empty content and tool_calls" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"date\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+    };
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<|im_end|>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Empty content should not produce a blank line before <tool_call>
+    try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>assistant\n<tool_call>") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"name\": \"shell\"") != null);
+}
+
+test "fallbackFormatChat multi-round tool calling" {
+    const allocator = testing.allocator;
+    const tc1 = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+    };
+    const tc2 = [_]ToolCall{
+        .{ .id = "call_2", .name = "readFile", .arguments = "{\"path\":\"main.py\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Read main.py" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc1 },
+        .{ .role = "tool", .content = "main.py" },
+        .{ .role = "assistant", .content = "Found it.", .tool_calls = &tc2 },
+        .{ .role = "tool", .content = "print('hello')" },
+    };
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<|im_end|>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Should have two <tool_call> blocks
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOf(u8, result[pos..], "<tool_call>")) |offset| {
+        count += 1;
+        pos += offset + 11;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+
+    // Should have two <tool_response> blocks
+    count = 0;
+    pos = 0;
+    while (std.mem.indexOf(u8, result[pos..], "<tool_response>")) |offset| {
+        count += 1;
+        pos += offset + 15;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+
+    // Second assistant should have content before tool_call
+    try testing.expect(std.mem.indexOf(u8, result, "Found it.\n<tool_call>") != null);
 }

@@ -5,6 +5,7 @@ struct StatusMenuView: View {
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
     @State private var showDownloads = false
+    @State private var showLog = false
     let openChat: () -> Void
     let openBrowser: () -> Void
 
@@ -51,19 +52,34 @@ struct StatusMenuView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
 
-                    Button {
-                        server.toggle(modelPath: appState.selectedModelPath)
-                    } label: {
-                        HStack {
-                            Image(systemName: server.status == .running || server.status == .starting ? "stop.fill" : "play.fill")
-                            Text(server.status == .running || server.status == .starting ? "Stop Server" : "Start Server")
+                    HStack(spacing: 6) {
+                        Button {
+                            server.toggle(modelPath: appState.selectedModelPath)
+                        } label: {
+                            HStack {
+                                Image(systemName: server.status == .running || server.status == .starting ? "stop.fill" : "play.fill")
+                                Text(server.status == .running || server.status == .starting ? "Stop Server" : "Start Server")
+                            }
+                            .frame(maxWidth: .infinity)
                         }
-                        .frame(maxWidth: .infinity)
+                        .buttonStyle(.borderedProminent)
+                        .tint(server.status == .running ? .red : .accentColor)
+                        .disabled(appState.selectedModelPath.isEmpty)
+                        .controlSize(.regular)
+
+                        Button {
+                            showLog.toggle()
+                        } label: {
+                            Image(systemName: "text.alignleft")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .help("Server Log")
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(server.status == .running ? .red : .accentColor)
-                    .disabled(appState.selectedModelPath.isEmpty)
-                    .controlSize(.regular)
+
+                    if showLog {
+                        ServerLogView(log: server.serverLog)
+                    }
 
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
@@ -146,7 +162,7 @@ struct StatusMenuView: View {
                 } label: {
                     HStack {
                         Image(systemName: "arrow.down.circle")
-                        Text("Download Gemma 4 Models")
+                        Text("Download Models")
                             .font(.subheadline)
                         Spacer()
                         Image(systemName: showDownloads ? "chevron.up" : "chevron.down")
@@ -322,5 +338,41 @@ struct MaxTokensSection: View {
             return "\(maxTokens / 1024)K"
         }
         return "\(maxTokens)"
+    }
+}
+
+struct ServerLogView: View {
+    let log: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Server Log")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(log, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Copy Log")
+            }
+
+            ScrollView {
+                Text(log.isEmpty ? "(no output yet)" : log)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(log.isEmpty ? .tertiary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(height: 180)
+            .background(.black.opacity(0.3))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
     }
 }

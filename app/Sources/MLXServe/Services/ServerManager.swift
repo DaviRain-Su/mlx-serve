@@ -13,7 +13,7 @@ class ServerManager: ObservableObject {
     private var process: Process?
     private var healthTimer: Timer?
     private let api = APIClient()
-    private var stderrBuf = ""
+    @Published var serverLog = ""
 
     var baseURL: String { "http://localhost:\(port)" }
 
@@ -25,7 +25,7 @@ class ServerManager: ObservableObject {
         currentModelPath = resolvedModel
         status = .starting
         lastError = ""
-        stderrBuf = ""
+        serverLog = ""
 
         let binaryPath = resolveBinaryPath()
         guard FileManager.default.fileExists(atPath: binaryPath) else {
@@ -61,10 +61,10 @@ class ServerManager: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor in
-                self?.stderrBuf += str
+                self?.serverLog += str
                 // Keep only last 2KB
-                if let s = self, s.stderrBuf.count > 2048 {
-                    s.stderrBuf = String(s.stderrBuf.suffix(2048))
+                if let s = self, s.serverLog.count > 65536 {
+                    s.serverLog = String(s.serverLog.suffix(65536))
                 }
             }
         }
@@ -114,7 +114,7 @@ class ServerManager: ObservableObject {
         healthTimer = nil
         process = nil
 
-        let errSnippet = stderrBuf.trimmingCharacters(in: .whitespacesAndNewlines)
+        let errSnippet = serverLog.trimmingCharacters(in: .whitespacesAndNewlines)
         let shortErr = errSnippet.isEmpty ? "exit code \(exitCode)" : String(errSnippet.suffix(200))
 
         if case .running = status {

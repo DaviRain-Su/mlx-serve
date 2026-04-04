@@ -232,9 +232,10 @@ class APIClient {
         }
 
         var firstTokenTime: Date?
-        // Accumulate tool call deltas across chunks
-        var pendingToolCalls: [String: (name: String, args: String)] = [:] // keyed by index
+        // Accumulate tool call deltas across chunks, keyed by index
+        var pendingToolCalls: [String: (id: String, name: String, args: String)] = [:]
         var hasToolCalls = false
+        var emittedToolCalls = false
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data: ") else { continue }
@@ -291,51 +292,51 @@ class APIClient {
                 hasToolCalls = true
                 for tc in tcArray {
                     let idx = "\(tc["index"] as? Int ?? 0)"
+                    var existing = pendingToolCalls[idx] ?? (id: "", name: "", args: "")
+                    if let id = tc["id"] as? String {
+                        existing.id = id
+                    }
                     if let function = tc["function"] as? [String: Any] {
-                        var existing = pendingToolCalls[idx] ?? (name: "", args: "")
                         if let name = function["name"] as? String {
                             existing.name = name
                         }
                         if let args = function["arguments"] as? String {
                             existing.args += args
                         }
-                        pendingToolCalls[idx] = existing
                     }
-                    if pendingToolCalls[idx] == nil, tc["id"] != nil {
-                        pendingToolCalls[idx] = (name: "", args: "")
-                    }
+                    pendingToolCalls[idx] = existing
                 }
             }
 
             // Check finish_reason for tool_calls
             if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" {
-                // Emit accumulated tool calls
                 var calls: [ToolCall] = []
-                for (idx, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
+                for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                     var args: [String: String] = [:]
                     if let data = tc.args.data(using: .utf8),
                        let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                         for (k, v) in dict { args[k] = "\(v)" }
                     }
-                    calls.append(ToolCall(id: "call_\(idx)", name: tc.name, arguments: args))
+                    calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args))
                 }
                 if !calls.isEmpty {
                     continuation.yield(.toolCalls(calls))
+                    emittedToolCalls = true
                 }
             }
         }
 
-        // Also emit tool calls if accumulated but not yet emitted
-        if hasToolCalls && !pendingToolCalls.isEmpty {
+        // Fallback: emit tool calls if stream ended without finish_reason
+        if hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
             var calls: [ToolCall] = []
-            for (idx, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
+            for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                 if tc.name.isEmpty { continue }
                 var args: [String: String] = [:]
                 if let data = tc.args.data(using: .utf8),
                    let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     for (k, v) in dict { args[k] = "\(v)" }
                 }
-                calls.append(ToolCall(id: "call_\(idx)", name: tc.name, arguments: args))
+                calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args))
             }
             if !calls.isEmpty {
                 continuation.yield(.toolCalls(calls))

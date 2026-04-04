@@ -171,9 +171,6 @@ struct WebSearchHandler: ToolHandler {
         let url = "https://html.duckduckgo.com/html/?q=\(encoded)"
 
         let browser = await BrowserManager.shared
-        if await browser.webView == nil {
-            throw ToolError.executionFailed("Browser window is not open. Open it from the menu bar dropdown.")
-        }
         return try await browser.navigate(to: url)
     }
 }
@@ -184,11 +181,6 @@ struct BrowseHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         let action = parameters["action"] ?? "navigate"
         let browser = await BrowserManager.shared
-
-        // Check browser window is open
-        if await browser.webView == nil {
-            throw ToolError.executionFailed("Browser window is not open. Open it from the menu bar dropdown.")
-        }
 
         switch action {
         case "navigate":

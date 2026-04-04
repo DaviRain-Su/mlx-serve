@@ -9,14 +9,19 @@ class BrowserManager: ObservableObject {
     @Published var pageTitle: String = ""
     @Published var isLoading: Bool = false
 
-    var webView: WKWebView?
+    /// Always available — created eagerly so tools work without the Browser window.
+    let webView: WKWebView
+
+    private init() {
+        let config = WKWebViewConfiguration()
+        config.preferences.isElementFullscreenEnabled = true
+        self.webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1024, height: 768), configuration: config)
+        webView.allowsBackForwardNavigationGestures = true
+    }
 
     func navigate(to urlString: String) async throws -> String {
         guard let url = URL(string: urlString) else {
             throw ToolError.executionFailed("Invalid URL: \(urlString)")
-        }
-        guard let webView else {
-            throw ToolError.executionFailed("Browser not open. Open the browser window first.")
         }
 
         let navResult = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
@@ -28,23 +33,27 @@ class BrowserManager: ObservableObject {
 
         // Auto-read page content after navigation
         try await Task.sleep(nanoseconds: 500_000_000) // let JS render
-        let text = try await readText()
+        let rawText = try await readText()
         let title = webView.title ?? ""
+        let text = Self.cleanExtractedText(rawText)
         return "\(navResult)\nTitle: \(title)\n\nPage content:\n\(text)"
     }
 
     func readText() async throws -> String {
-        guard let webView else {
-            throw ToolError.executionFailed("Browser not open.")
-        }
         let js = """
         (function() {
             var clone = document.body.cloneNode(true);
-            var remove = clone.querySelectorAll('script,style,nav,header,footer,form,iframe,noscript,svg,[role="navigation"],[role="banner"],[role="contentinfo"],.nav,.navbar,.menu,.sidebar,.footer,.header,.ad,.ads,.cookie');
+            var remove = clone.querySelectorAll('script,style,nav,header,footer,form,iframe,noscript,svg,img,video,audio,canvas,button,input,select,textarea,[role="navigation"],[role="banner"],[role="contentinfo"],[role="complementary"],[aria-hidden="true"],.nav,.navbar,.menu,.sidebar,.footer,.header,.ad,.ads,.advert,.cookie,.popup,.modal,.overlay,.social,.share,.comment,.related');
             for (var i = 0; i < remove.length; i++) remove[i].remove();
             var text = clone.innerText || '';
-            text = text.replace(/\\n{3,}/g, '\\n\\n').replace(/[ \\t]+/g, ' ').trim();
-            return text.substring(0, 4000);
+            // Aggressive cleanup: trim each line, collapse blank lines, remove noise
+            text = text.split('\\n')
+                .map(function(line) { return line.trim(); })
+                .filter(function(line) { return line.length > 0; })
+                .join('\\n');
+            // Collapse any remaining multi-newlines
+            text = text.replace(/\\n{3,}/g, '\\n\\n');
+            return text.substring(0, 3000);
         })()
         """
         let result = try await webView.evaluateJavaScript(js)
@@ -52,18 +61,12 @@ class BrowserManager: ObservableObject {
     }
 
     func readHTML() async throws -> String {
-        guard let webView else {
-            throw ToolError.executionFailed("Browser not open.")
-        }
         let js = "document.documentElement.outerHTML.substring(0, 8000)"
         let result = try await webView.evaluateJavaScript(js)
         return jsResultToString(result)
     }
 
     func click(selector: String) async throws -> String {
-        guard let webView else {
-            throw ToolError.executionFailed("Browser not open.")
-        }
         let escaped = selector.replacingOccurrences(of: "'", with: "\\'")
         let js = """
         (function() {
@@ -78,20 +81,48 @@ class BrowserManager: ObservableObject {
     }
 
     func evaluateJS(_ script: String) async throws -> String {
-        guard let webView else {
-            throw ToolError.executionFailed("Browser not open.")
-        }
         let result = try await webView.evaluateJavaScript(script)
         return jsResultToString(result)
     }
 
     func getInfo() async throws -> String {
-        guard let webView else {
-            throw ToolError.executionFailed("Browser not open.")
-        }
         let url = webView.url?.absoluteString ?? "about:blank"
         let title = webView.title ?? ""
         return "Title: \(title)\nURL: \(url)"
+    }
+
+    /// Clean extracted page text for optimal LLM consumption.
+    /// Removes whitespace noise, short junk lines, and caps length.
+    static func cleanExtractedText(_ raw: String) -> String {
+        let lines = raw.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                guard !line.isEmpty else { return false }
+                // Drop very short lines that are usually UI artifacts (e.g., "Ad", single chars)
+                if line.count < 3 { return false }
+                // Drop lines that are only punctuation/symbols
+                let alphanumeric = line.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+                if alphanumeric.count == 0 { return false }
+                return true
+            }
+
+        var result = lines.joined(separator: "\n")
+
+        // Collapse remaining multi-newlines
+        while result.contains("\n\n\n") {
+            result = result.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        }
+
+        // Cap at 1500 chars — small models work better with concise context
+        if result.count > 1500 {
+            result = String(result.prefix(1500))
+            // Don't cut mid-line
+            if let lastNewline = result.lastIndex(of: "\n") {
+                result = String(result[...lastNewline])
+            }
+        }
+
+        return result
     }
 }
 

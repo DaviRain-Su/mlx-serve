@@ -9,6 +9,10 @@ let package = Package(
             name: "MLXClaw",
             path: "Sources/MLXServe",
             resources: [.copy("Resources")]
-        )
+        ),
+        .testTarget(
+            name: "MLXClawTests",
+            path: "Tests/MLXClawTests"
+        ),
     ]
 )

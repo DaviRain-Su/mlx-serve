@@ -10,26 +10,26 @@ struct BrowserView: View {
             // URL bar
             HStack(spacing: 8) {
                 Button {
-                    browser.webView?.goBack()
+                    browser.webView.goBack()
                 } label: {
                     Image(systemName: "chevron.left")
                 }
                 .buttonStyle(.plain)
-                .disabled(!(browser.webView?.canGoBack ?? false))
+                .disabled(!browser.webView.canGoBack)
 
                 Button {
-                    browser.webView?.goForward()
+                    browser.webView.goForward()
                 } label: {
                     Image(systemName: "chevron.right")
                 }
                 .buttonStyle(.plain)
-                .disabled(!(browser.webView?.canGoForward ?? false))
+                .disabled(!browser.webView.canGoForward)
 
                 Button {
                     if browser.isLoading {
-                        browser.webView?.stopLoading()
+                        browser.webView.stopLoading()
                     } else {
-                        browser.webView?.reload()
+                        browser.webView.reload()
                     }
                 } label: {
                     Image(systemName: browser.isLoading ? "xmark" : "arrow.clockwise")
@@ -75,17 +75,9 @@ struct WebViewWrapper: NSViewRepresentable {
     let browser: BrowserManager
 
     func makeNSView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.preferences.isElementFullscreenEnabled = true
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.allowsBackForwardNavigationGestures = true
-        webView.navigationDelegate = context.coordinator
-
-        Task { @MainActor in
-            browser.webView = webView
-        }
-
-        return webView
+        // Use the shared webView from BrowserManager (created eagerly, always available)
+        browser.webView.navigationDelegate = context.coordinator
+        return browser.webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}

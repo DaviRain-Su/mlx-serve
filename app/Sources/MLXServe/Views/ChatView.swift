@@ -419,6 +419,22 @@ struct ChatDetailView: View {
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             messages.append(contentsOf: history)
 
+            // Debug: dump the exact request body to file for analysis
+            do {
+                let debugBody: [String: Any] = [
+                    "messages": messages,
+                    "tools": AgentPrompt.toolDefinitions,
+                    "max_tokens": appState.maxTokens,
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "stream": true,
+                    "model": "mlx-serve"
+                ]
+                let debugData = try JSONSerialization.data(withJSONObject: debugBody, options: .prettyPrinted)
+                let debugPath = NSString(string: "~/.mlx-serve/last-agent-request.json").expandingTildeInPath
+                try debugData.write(to: URL(fileURLWithPath: debugPath))
+            } catch { /* ignore debug errors */ }
+
             // Add streaming assistant message
             var streamMsg = ChatMessage(role: .assistant, content: "")
             streamMsg.isStreaming = true
@@ -477,12 +493,25 @@ struct ChatDetailView: View {
             // If no tool calls, we're done
             guard !receivedToolCalls.isEmpty else { return }
 
-            // Show tool call summary
+            // Store tool calls on the assistant message for history replay
+            if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+               !appState.chatSessions[sIdx].messages.isEmpty {
+                let mIdx = appState.chatSessions[sIdx].messages.count - 1
+                appState.chatSessions[sIdx].messages[mIdx].toolCalls = receivedToolCalls.map { tc in
+                    let argsJson = (try? JSONSerialization.data(withJSONObject: tc.arguments))
+                        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                    return SerializedToolCall(id: tc.id, name: tc.name, arguments: argsJson)
+                }
+            }
+
+            // Show tool call summary as display-only message (not appended to assistant content)
             let callSummary = receivedToolCalls.map { tc in
                 let args = tc.arguments.map { "\($0.key): \($0.value.prefix(80))" }.joined(separator: ", ")
                 return "**\(tc.name)**(\(args))"
             }.joined(separator: "\n")
-            appState.updateLastMessage(in: sessionId, content: "\n\n" + callSummary)
+            var summaryMsg = ChatMessage(role: .assistant, content: callSummary)
+            summaryMsg.isAgentSummary = true
+            appState.appendMessage(to: sessionId, message: summaryMsg)
 
             // Execute each tool call
             var toolResults: [(id: String, name: String, output: String)] = []
@@ -549,7 +578,28 @@ struct ChatDetailView: View {
                     ]
                 }
                 if msg.role == .system { return nil }
-                if msg.isAgentSummary { return nil } // display-only tool result messages
+                if msg.isAgentSummary { return nil }
+
+                // Assistant messages with tool_calls: include tool_calls in OpenAI format
+                if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
+                    var dict: [String: Any] = ["role": "assistant"]
+                    let content = msg.content
+                        .replacingOccurrences(of: "<pad>", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    dict["content"] = content.isEmpty ? "" : content
+                    dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                        [
+                            "id": tc.id,
+                            "type": "function",
+                            "function": [
+                                "name": tc.name,
+                                "arguments": tc.arguments
+                            ] as [String: Any]
+                        ]
+                    }
+                    return dict
+                }
+
                 if msg.role == .assistant && msg.content.isEmpty { return nil }
                 var content = msg.content
                     .replacingOccurrences(of: "<pad>", with: "")

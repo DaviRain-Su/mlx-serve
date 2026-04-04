@@ -1931,7 +1931,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
             allocator.free(old);
             cached_prompt_ids = null;
         }
-        log.debug("  [cache] invalidated — tools config changed\n", .{});
+        log.info("  [cache] reset — tools config changed\n", .{});
     }
 
     if (cached_prompt_ids) |cached| {
@@ -1947,6 +1947,27 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
             shared = prompt_ids.len - 1;
         }
 
+        // For models with sliding window attention: if the previous prompt exceeded
+        // the window size, sliding window layers have trimmed their buffers and
+        // buffer indices no longer map to sequence positions (buffer[0] != position[0]).
+        // Truncation assumes buffer[i] == position[i], so reuse is invalid.
+        // Fall through to full reset instead.
+        if (shared > 0 and xfm.config.has_sliding_window) {
+            const sw = xfm.config.sliding_window;
+            if (cached.len + 1 > sw and shared < sw) {
+                // Previous prompt was longer than sliding window — buffer positions are shifted.
+                // Truncation would keep K/V with wrong RoPE positions. Full reset is needed.
+                log.info("  [cache] reset — sliding window position shift (cached={d}, shared={d}, sw={d})\n", .{ cached.len, shared, sw });
+                if (cached_prompt_ids) |old| {
+                    allocator.free(old);
+                    cached_prompt_ids = null;
+                }
+                xfm.cache.deinit();
+                xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
+                return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
+            }
+        }
+
         if (shared > 0) {
             // Truncate KV cache to the shared prefix
             try xfm.cache.truncate(shared, xfm.s);
@@ -1959,6 +1980,9 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
     }
 
     // No cache hit — reset completely
+    if (cached_prompt_ids != null) {
+        log.info("  [cache] reset — no shared prefix\n", .{});
+    }
     xfm.cache.deinit();
     xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
     return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
