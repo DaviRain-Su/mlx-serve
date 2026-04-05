@@ -35,7 +35,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 | `app/Sources/MLXServe/Models/ChatModels.swift` | `ChatMessage`, `SerializedToolCall`, `ChatSession` |
 | `app/Sources/MLXServe/Models/AgentModels.swift` | `AgentToolKind`, `AgentPlan`, `StepResult` |
 | `app/Sources/MLXServe/Services/APIClient.swift` | HTTP + SSE streaming client for mlx-serve |
-| `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt + tool definitions (7 tools) |
+| `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt, tool definitions (7 tools), `SkillManager` (prompt-based skills from `~/.mlx-serve/skills/`) |
 | `app/Sources/MLXServe/Services/ToolExecutor.swift` | Tool handlers: shell, readFile, writeFile, editFile, searchFiles, browse, webSearch |
 | `app/Sources/MLXServe/Services/BrowserManager.swift` | WKWebView (headless, created eagerly for background browsing) |
 | `app/Sources/MLXServe/Services/ServerManager.swift` | mlx-serve process lifecycle, stderr capture (`serverLog`) |
@@ -57,11 +57,9 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 
 ## Building
 
-- Zig server: `zig build -Doptimize=ReleaseFast`
-- Swift app: `cd app && swift build -c release`
-- Both binaries must be copied to the app bundle:
-  - `zig-out/bin/mlx-serve` → `app/MLX Claw.app/Contents/MacOS/mlx-serve`
-  - `app/.build/arm64-apple-macosx/release/MLXClaw` → `app/MLX Claw.app/Contents/MacOS/MLXClaw`
+- **Full app bundle**: `cd app && SKIP_NOTARIZE=1 bash build.sh` — builds Zig + Swift, assembles `.app`, signs (requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` env vars)
+- Zig server only: `zig build -Doptimize=ReleaseFast`
+- Swift app only: `cd app && swift build -c release`
 - For tests: `zig build test` (Zig) and `cd app && swift test` (Swift)
 
 ## Conventions
@@ -86,6 +84,39 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 - **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Assistant messages include `tool_calls` array. Tool responses include `role: "tool"` with `tool_call_id`.
 - **SSE parsing** (`APIClient.performStream`): Accumulates streamed tool call deltas (name, arguments chunks). Preserves server-generated tool call IDs. Emits `.toolCalls` event on `finish_reason: "tool_calls"`. Fallback emission if stream drops without finish_reason.
 - **Tool call storage**: `SerializedToolCall` (id, name, arguments as JSON string) stored on `ChatMessage.toolCalls`. Persisted via Codable for history replay. Backwards-compatible with old history files (field is optional).
+
+## Prompt-based Skills
+
+Users can teach the agent new capabilities by dropping `.md` files in `~/.mlx-serve/skills/`. Each file has YAML frontmatter:
+
+```markdown
+---
+name: deploy
+description: Deploy the project to production
+trigger: deploy, release, push to prod, ship it
+---
+When asked to deploy:
+1. Run `git push origin main`
+2. Check CI with `gh run list --limit 1`
+```
+
+- `trigger` — comma-separated keywords; if the user's message contains ANY keyword (case-insensitive substring), the skill body is injected into the system prompt
+- A short skill index (name + description) is always included so the model knows what's available
+- `SkillManager` in `AgentPrompt.swift` scans the directory on each agent loop iteration (re-scans when dir modification date changes)
+- Skills are injected in `ChatView.runAgentLoop()` between the base system prompt and agent memory context
+- UI: folder icon button in menu bar (always) and chat toolbar (agent mode) opens the skills folder in Finder
+
+## Resumable Downloads
+
+Large model downloads (e.g., 26B at ~15 GB) use streaming writes to `.partial` files:
+
+- `DownloadManager` uses `URLSessionDataTask` with `StreamingDelegate` — bytes are written to `<file>.partial` as they arrive
+- If a download is interrupted (network drop, app crash), the `.partial` file survives on disk
+- On retry/resume, sends `Range: bytes=<existingSize>-` header; if server returns 206, only the remainder is downloaded; if 200, truncates and restarts
+- Automatic retry: 3 attempts per file with 2s/4s backoff; status text shows "Connection lost, retrying..."
+- Cancellation preserves `.partial` files for future resume
+- UI shows "Resume" instead of "Download"/"Retry" when `.partial` files exist (`hasPartialDownload()`)
+- Already-completed files are skipped (size check against HuggingFace metadata)
 
 ## Debugging
 

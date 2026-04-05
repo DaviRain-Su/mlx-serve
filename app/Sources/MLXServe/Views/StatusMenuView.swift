@@ -208,6 +208,18 @@ struct StatusMenuView: View {
                 .buttonStyle(.bordered)
 
                 Button {
+                    let path = NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
+                    if !FileManager.default.fileExists(atPath: path) {
+                        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+                    }
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                } label: {
+                    Image(systemName: "folder.badge.gearshape")
+                }
+                .buttonStyle(.bordered)
+                .help("Agent Skills Folder")
+
+                Button {
                     server.stop()
                     NSApplication.shared.terminate(nil)
                 } label: {

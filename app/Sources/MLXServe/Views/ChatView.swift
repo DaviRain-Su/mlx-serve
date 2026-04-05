@@ -251,6 +251,21 @@ struct ChatDetailView: View {
                 }
             }
             ToolbarItem(placement: .automatic) {
+                if isAgentMode {
+                    Button {
+                        let path = NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
+                        if !FileManager.default.fileExists(atPath: path) {
+                            try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+                        }
+                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    } label: {
+                        Image(systemName: "folder.badge.gearshape")
+                            .font(.system(size: 12))
+                    }
+                    .help("Agent Skills Folder")
+                }
+            }
+            ToolbarItem(placement: .automatic) {
                 Circle()
                     .fill(server.status == .running ? .green : .red)
                     .frame(width: 8, height: 8)
@@ -415,7 +430,9 @@ struct ChatDetailView: View {
 
             // Build message history for API
             let history = buildAgentHistory()
-            let systemPrompt = AgentPrompt.systemPrompt + appState.agentMemory.contextSnippet()
+            let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
+            let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
+            let systemPrompt = AgentPrompt.systemPrompt + skills + appState.agentMemory.contextSnippet()
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             messages.append(contentsOf: history)
 

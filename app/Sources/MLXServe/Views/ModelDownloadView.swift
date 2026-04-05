@@ -43,10 +43,20 @@ struct ModelDownloadRow: View {
                         .foregroundStyle(.green)
                         .font(.caption)
                 } else if let state, state.status == .downloading {
-                    ProgressView(value: state.progress)
-                        .frame(width: 50)
+                    // File progress bar
+                    VStack(alignment: .trailing, spacing: 1) {
+                        ProgressView(value: state.fileProgress)
+                            .frame(width: 60)
+                        Text("\(state.percentFormatted) \(state.speedFormatted)")
+                            .font(.system(size: 8).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let state, state.status == .completed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.caption)
                 } else if let state, state.status == .failed {
-                    Button("Retry") {
+                    Button(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry") {
                         Task {
                             await downloads.download(repoId: option.repoId)
                             appState.refreshModels()
@@ -55,7 +65,7 @@ struct ModelDownloadRow: View {
                     .font(.caption)
                     .controlSize(.mini)
                 } else {
-                    Button("Download") {
+                    Button(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download") {
                         Task {
                             await downloads.download(repoId: option.repoId)
                             appState.refreshModels()
@@ -68,7 +78,7 @@ struct ModelDownloadRow: View {
 
             // Status text for active downloads
             if let state, state.status == .downloading, !state.statusText.isEmpty {
-                Text(state.statusText)
+                Text("[\(state.fileIndex)/\(state.fileCount)] \(state.statusText)")
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

@@ -20,3 +20,5 @@ scripts/__pycache__/
 
 # Images (tracked via releases, not git)
 mlx-logo.png
+transformer.o
+test_zig

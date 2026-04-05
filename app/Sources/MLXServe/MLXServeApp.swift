@@ -4,9 +4,9 @@ import AppKit
 @main
 struct MLXClawApp: App {
     private static let menuBarIcon: NSImage = {
-        // Try Bundle.main (works in .app bundles) then Bundle.module (works in dev builds)
+        // Try Bundle.main (works in .app bundles) then SPM bundle (works in dev builds)
         let candidates: [URL?] = [
-            Bundle.main.resourceURL?.appendingPathComponent("Resources/tray.png"),
+            Bundle.main.resourceURL?.appendingPathComponent("tray.png"),
             Bundle.main.bundleURL.appendingPathComponent("MLXClaw_MLXClaw.bundle/Resources/tray.png"),
         ]
         for case let url? in candidates {

@@ -30,7 +30,9 @@ class AppState: ObservableObject {
 
     func refreshModels() {
         localModels = downloads.discoverLocalModels()
-        if selectedModelPath.isEmpty, let first = localModels.first {
+        // Auto-select a model if none selected or current selection is invalid
+        if localModels.first(where: { $0.path == selectedModelPath }) == nil,
+           let first = localModels.first {
             selectedModelPath = first.path
         }
     }

@@ -9,9 +9,27 @@ class DownloadManager: ObservableObject {
         var status: Status = .idle
         var statusText: String = ""
         var error: String?
+        var currentFile: String = ""
+        var fileIndex: Int = 0
+        var fileCount: Int = 0
+        var bytesPerSecond: Double = 0
+        var fileProgress: Double = 0
 
         enum Status: Equatable {
             case idle, downloading, completed, failed
+        }
+
+        var speedFormatted: String {
+            if bytesPerSecond > 1_000_000 {
+                return String(format: "%.1f MB/s", bytesPerSecond / 1_000_000)
+            } else if bytesPerSecond > 1_000 {
+                return String(format: "%.0f KB/s", bytesPerSecond / 1_000)
+            }
+            return ""
+        }
+
+        var percentFormatted: String {
+            String(format: "%.0f%%", fileProgress * 100)
         }
     }
 
@@ -21,21 +39,51 @@ class DownloadManager: ObservableObject {
         return path
     }()
 
-    /// A model is ready to use when it has config.json AND at least one .safetensors file
+    /// Check if a model has all required files for loading.
+    /// Verifies: config.json, tokenizer files, chat template, and ALL safetensors shards.
     func isReady(_ repoId: String) -> Bool {
         let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
         let modelDir = (modelsDir as NSString).appendingPathComponent(name)
-        let configPath = (modelDir as NSString).appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configPath) else { return false }
+        let fm = FileManager.default
 
-        // Must have at least one safetensors file > 1MB
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: modelDir) else { return false }
-        return entries.contains { entry in
-            guard entry.hasSuffix(".safetensors") else { return false }
-            let fullPath = (modelDir as NSString).appendingPathComponent(entry)
-            let size = (try? FileManager.default.attributesOfItem(atPath: fullPath)[.size] as? UInt64) ?? 0
-            return size > 1_000_000
+        // Must have config.json
+        guard fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent("config.json")) else { return false }
+
+        // Must have tokenizer (tokenizer.json or tokenizer.model)
+        let hasTokenizer = fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent("tokenizer.json"))
+            || fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent("tokenizer.model"))
+        guard hasTokenizer else { return false }
+
+        guard let entries = try? fm.contentsOfDirectory(atPath: modelDir) else { return false }
+        let safetensors = entries.filter { $0.hasSuffix(".safetensors") }
+
+        // Must have at least one safetensors file
+        guard !safetensors.isEmpty else { return false }
+
+        // If sharded (model.safetensors.index.json exists), check all shards are present
+        let indexPath = (modelDir as NSString).appendingPathComponent("model.safetensors.index.json")
+        if fm.fileExists(atPath: indexPath) {
+            if let data = fm.contents(atPath: indexPath),
+               let index = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let weightMap = index["weight_map"] as? [String: String] {
+                let requiredShards = Set(weightMap.values)
+                for shard in requiredShards {
+                    let shardPath = (modelDir as NSString).appendingPathComponent(shard)
+                    guard fm.fileExists(atPath: shardPath) else { return false }
+                    // Check it's not a zero-byte stub
+                    let size = (try? fm.attributesOfItem(atPath: shardPath)[.size] as? UInt64) ?? 0
+                    guard size > 0 else { return false }
+                }
+            }
+        } else {
+            // Single-file model — check the safetensors file is non-trivial
+            guard let first = safetensors.first else { return false }
+            let fullPath = (modelDir as NSString).appendingPathComponent(first)
+            let size = (try? fm.attributesOfItem(atPath: fullPath)[.size] as? UInt64) ?? 0
+            guard size > 1_000_000 else { return false }
         }
+
+        return true
     }
 
     func modelPath(for repoId: String) -> String {
@@ -52,7 +100,6 @@ class DownloadManager: ObservableObject {
         do {
             try FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
 
-            // List files from HuggingFace API
             let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main")!
             let (listData, _) = try await URLSession.shared.data(from: listURL)
             guard let files = try JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
@@ -74,8 +121,23 @@ class DownloadManager: ObservableObject {
             let totalSize = neededFiles.reduce(Int64(0)) { $0 + $1.1 }
             var downloadedSize: Int64 = 0
 
+            // Pre-check disk space
+            let destURL = URL(fileURLWithPath: destDir)
+            if let values = try? destURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+               let available = values.volumeAvailableCapacityForImportantUsage,
+               available < totalSize {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError, userInfo: [
+                    NSLocalizedDescriptionKey: "Not enough disk space. Need \(formatBytes(totalSize)) but only \(formatBytes(Int64(available))) available."
+                ])
+            }
+
             for (idx, (filePath, fileSize)) in neededFiles.enumerated() {
                 let destPath = (destDir as NSString).appendingPathComponent(filePath)
+                let partialPath = destPath + ".partial"
+
+                // Create subdirectories if needed
+                let parentDir = (destPath as NSString).deletingLastPathComponent
+                try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
 
                 // Skip if already exists with right size
                 if let attrs = try? FileManager.default.attributesOfItem(atPath: destPath),
@@ -84,47 +146,142 @@ class DownloadManager: ObservableObject {
                     downloadedSize += fileSize
                     downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
                     downloads[repoId]?.statusText = "Skipped \(filePath) (exists)"
+                    downloads[repoId]?.fileIndex = idx + 1
+                    downloads[repoId]?.fileCount = neededFiles.count
                     continue
                 }
 
-                let sizeStr = fileSize > 1_000_000_000
-                    ? String(format: "%.1f GB", Double(fileSize) / 1e9)
-                    : fileSize > 1_000_000
-                        ? String(format: "%.0f MB", Double(fileSize) / 1e6)
-                        : "\(fileSize) B"
-                downloads[repoId]?.statusText = "Downloading \(filePath) (\(sizeStr)) [\(idx+1)/\(neededFiles.count)]"
+                let sizeStr = formatBytes(fileSize)
+                downloads[repoId]?.currentFile = (filePath as NSString).lastPathComponent
+                downloads[repoId]?.fileIndex = idx + 1
+                downloads[repoId]?.fileCount = neededFiles.count
+                downloads[repoId]?.fileProgress = 0
+                downloads[repoId]?.bytesPerSecond = 0
+                downloads[repoId]?.statusText = "\(filePath) (\(sizeStr))"
 
                 let fileURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filePath)")!
+                let maxRetries = 3
 
-                // Use a custom session with longer timeout for large files
-                let config = URLSessionConfiguration.default
-                config.timeoutIntervalForRequest = 3600
-                config.timeoutIntervalForResource = 3600
-                let session = URLSession(configuration: config)
+                for attempt in 0..<maxRetries {
+                    try Task.checkCancellation()
 
-                let (tempURL, response) = try await session.download(from: fileURL)
+                    // Check for existing partial download
+                    let existingBytes: Int64
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: partialPath),
+                       let size = attrs[.size] as? Int64, size > 0 {
+                        existingBytes = size
+                        downloads[repoId]?.statusText = "Resuming \(filePath) from \(formatBytes(existingBytes))..."
+                        downloads[repoId]?.fileProgress = fileSize > 0 ? Double(existingBytes) / Double(fileSize) : 0
+                    } else {
+                        existingBytes = 0
+                    }
 
-                // Verify download succeeded
-                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
-                    throw URLError(.badServerResponse, userInfo: [
-                        NSLocalizedDescriptionKey: "HTTP \(httpResponse.statusCode) for \(filePath)"
-                    ])
+                    // Create or open partial file
+                    let fm = FileManager.default
+                    if !fm.fileExists(atPath: partialPath) {
+                        fm.createFile(atPath: partialPath, contents: nil)
+                    }
+                    guard let fileHandle = FileHandle(forWritingAtPath: partialPath) else {
+                        throw URLError(.cannotCreateFile)
+                    }
+                    try fileHandle.seekToEnd()
+
+                    var request = URLRequest(url: fileURL)
+                    if existingBytes > 0 {
+                        request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
+                    }
+
+                    do {
+                        try await downloadToFile(
+                            request: request,
+                            fileHandle: fileHandle,
+                            repoId: repoId,
+                            fileSize: fileSize,
+                            existingBytes: existingBytes,
+                            baseDownloaded: downloadedSize,
+                            totalSize: totalSize
+                        )
+
+                        // Success — move partial to final destination
+                        try? fm.removeItem(atPath: destPath)
+                        try fm.moveItem(atPath: partialPath, toPath: destPath)
+                        break
+                    } catch is CancellationError {
+                        // Keep partial file for future resume
+                        throw CancellationError()
+                    } catch {
+                        // Partial file stays on disk — next attempt resumes from it
+                        if attempt < maxRetries - 1 {
+                            let delay = Double(attempt + 1) * 2.0
+                            downloads[repoId]?.statusText = "Connection lost, retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
+                            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        } else {
+                            throw error
+                        }
+                    }
                 }
-
-                try? FileManager.default.removeItem(atPath: destPath)
-                try FileManager.default.moveItem(at: tempURL, to: URL(fileURLWithPath: destPath))
 
                 downloadedSize += fileSize
                 downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
+                downloads[repoId]?.fileProgress = 1.0
             }
 
-            downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete")
+            downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
+                                               fileIndex: neededFiles.count, fileCount: neededFiles.count)
         } catch {
             downloads[repoId] = DownloadState(status: .failed, error: error.localizedDescription)
         }
     }
 
-    /// Discover models that are fully downloaded (have config + safetensors)
+    /// Stream download directly to a file on disk (survives interruptions).
+    /// Uses dataTask so bytes are written as they arrive — the .partial file always
+    /// reflects how far we got, enabling Range-header resume on retry.
+    private func downloadToFile(
+        request: URLRequest,
+        fileHandle: FileHandle,
+        repoId: String,
+        fileSize: Int64,
+        existingBytes: Int64,
+        baseDownloaded: Int64,
+        totalSize: Int64
+    ) async throws {
+        let delegate = StreamingDelegate(fileHandle: fileHandle, existingBytes: existingBytes)
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 7200
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                delegate.onProgress = { [weak self] fileBytesTotal, speed in
+                    let fileProgress = fileSize > 0 ? Double(fileBytesTotal) / Double(fileSize) : 0
+                    let overallDownloaded = baseDownloaded + fileBytesTotal
+                    Task { @MainActor [weak self] in
+                        self?.downloads[repoId]?.fileProgress = fileProgress
+                        self?.downloads[repoId]?.bytesPerSecond = speed
+                        self?.downloads[repoId]?.progress = totalSize > 0 ? Double(overallDownloaded) / Double(totalSize) : 0
+                    }
+                }
+                delegate.onComplete = { error in
+                    if let error { continuation.resume(throwing: error) }
+                    else { continuation.resume() }
+                }
+                session.dataTask(with: request).resume()
+            }
+        } onCancel: {
+            session.invalidateAndCancel()
+        }
+    }
+
+    /// Check whether a model has .partial files from an interrupted download.
+    func hasPartialDownload(_ repoId: String) -> Bool {
+        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
+        let modelDir = (modelsDir as NSString).appendingPathComponent(name)
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: modelDir) else { return false }
+        return entries.contains { $0.hasSuffix(".partial") }
+    }
+
     func discoverLocalModels() -> [LocalModel] {
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: modelsDir) else {
             return []
@@ -132,14 +289,11 @@ class DownloadManager: ObservableObject {
         return entries.compactMap { name in
             guard !name.hasPrefix(".") else { return nil }
             var dirPath = (modelsDir as NSString).appendingPathComponent(name)
-
-            // Resolve symlinks
             dirPath = (dirPath as NSString).resolvingSymlinksInPath
 
             let configPath = (dirPath as NSString).appendingPathComponent("config.json")
             guard FileManager.default.fileExists(atPath: configPath) else { return nil }
 
-            // Must have at least one .safetensors file
             let dirEntries = (try? FileManager.default.contentsOfDirectory(atPath: dirPath)) ?? []
             let hasSafetensors = dirEntries.contains { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }
             guard hasSafetensors else { return nil }
@@ -154,7 +308,6 @@ class DownloadManager: ObservableObject {
         }.sorted { $0.name < $1.name }
     }
 
-    /// Remove an incomplete download
     func removeIncomplete(repoId: String) {
         let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
         let destDir = (modelsDir as NSString).appendingPathComponent(name)
@@ -173,5 +326,87 @@ class DownloadManager: ObservableObject {
             }
         }
         return total
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        if bytes > 1_000_000_000 { return String(format: "%.1f GB", Double(bytes) / 1e9) }
+        if bytes > 1_000_000 { return String(format: "%.0f MB", Double(bytes) / 1e6) }
+        return "\(bytes) B"
+    }
+}
+
+// MARK: - Streaming Download Delegate
+
+/// Writes received data directly to a file handle as it arrives.
+/// If the server returns 200 instead of 206, truncates the file (Range was ignored).
+private class StreamingDelegate: NSObject, URLSessionDataDelegate {
+    let fileHandle: FileHandle
+    var existingBytes: Int64
+    var onProgress: ((Int64, Double) -> Void)?   // fileBytesTotal, speed
+    var onComplete: ((Error?) -> Void)?
+    private var bytesReceived: Int64 = 0
+    private var statusCode: Int = 0
+    private var writeError: Error?
+    private let startTime = Date()
+    private var lastProgressUpdate = Date.distantPast
+
+    init(fileHandle: FileHandle, existingBytes: Int64) {
+        self.fileHandle = fileHandle
+        self.existingBytes = existingBytes
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if statusCode == 200 {
+            // Server ignored Range header — sending full file; start over
+            existingBytes = 0
+            do {
+                try fileHandle.truncate(atOffset: 0)
+                try fileHandle.seek(toOffset: 0)
+            } catch {
+                writeError = error
+                completionHandler(.cancel)
+                return
+            }
+            completionHandler(.allow)
+        } else if statusCode == 206 {
+            completionHandler(.allow)
+        } else {
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard writeError == nil else { return }
+        do {
+            try fileHandle.write(contentsOf: data)
+        } catch {
+            writeError = error
+            dataTask.cancel()
+            return
+        }
+        bytesReceived += Int64(data.count)
+        let now = Date()
+        guard now.timeIntervalSince(lastProgressUpdate) > 0.25 else { return }
+        lastProgressUpdate = now
+        let elapsed = now.timeIntervalSince(startTime)
+        let speed = elapsed > 0 ? Double(bytesReceived) / elapsed : 0
+        onProgress?(existingBytes + bytesReceived, speed)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        try? fileHandle.close()
+        let effectiveError = writeError ?? error
+        if effectiveError != nil {
+            onComplete?(effectiveError)
+        } else if statusCode != 0 && statusCode != 200 && statusCode != 206 {
+            onComplete?(URLError(.badServerResponse, userInfo: [
+                NSLocalizedDescriptionKey: "HTTP \(statusCode)"
+            ]))
+        } else {
+            onComplete?(nil)
+        }
     }
 }
