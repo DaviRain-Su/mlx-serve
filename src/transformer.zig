@@ -1094,6 +1094,7 @@ pub const Transformer = struct {
             mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
             mlx.mlx_optional_int.some(@intCast(self.config.quant_bits)),
             "affine",
+            .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
             self.s,
         ));
@@ -1248,6 +1249,7 @@ pub const Transformer = struct {
             mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
             mlx.mlx_optional_int.some(@intCast(self.config.quant_bits)),
             "affine",
+            .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
             self.s,
         ));

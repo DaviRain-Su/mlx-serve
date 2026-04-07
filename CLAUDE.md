@@ -5,7 +5,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 ## Stack
 
 - **Zig** 0.15+
-- **mlx-c** 0.5.0 / MLX 0.30.6 (Apple) via Homebrew; FFI in `src/mlx.zig`. **mlx-c 0.6.0 / MLX 0.31.1 crashes in `mlx_dequantize` — do not upgrade until upstream fix.**
+- **mlx-c** (Apple) via Homebrew; FFI in `src/mlx.zig`.
 - **Jinja engine** (lib/jinja_cpp): llama.cpp's C++17 Jinja2 implementation with nlohmann/json. Pre-compiled as `libjinja.a` (rebuild: see comment in `build.zig`).
 - **safetensors** for weights; BPE tokenizers (SentencePiece / byte-level)
 
@@ -159,8 +159,8 @@ Gemma 4 templates handle `role: "tool"` natively (producing `<|turn>tool`). No t
 ### Streaming with tools and thinking
 When `tools` are present, the server buffers tokens to detect tool call patterns. If thinking is also enabled, `<|channel>thought` tokens are detected and kept buffered (not flushed as content) until the closing `<channel|>` tag. After generation, thinking content is split from visible content and emitted as `reasoning_content`. Channel tags (`<|channel>`, `<channel|>`) are stripped from visible content.
 
-### mlx-c 0.6.0 crash
-mlx-c 0.6.0 (MLX 0.31.1) segfaults in `mlx_dequantize` during embedding lookup. Use mlx-c 0.5.0 (MLX 0.30.6) until upstream fixes this. The source-built 0.5.0 libraries live in `/opt/homebrew/lib/`; brew's 0.6.0 is in `/opt/homebrew/opt/mlx-c/lib/`.
+### mlx-c API changes
+mlx-c 0.6.0 added a `global_scale` parameter (may be null) to `mlx_dequantize` between `mode` and `dtype`. The FFI declaration in `mlx.zig` must match the installed header. When upgrading mlx-c, diff the headers in `/opt/homebrew/include/mlx/c/ops.h` against the `extern "c"` declarations in `src/mlx.zig`.
 
 ### Two binaries in the app bundle
 The MLX Claw `.app` bundle contains TWO binaries: `MLXClaw` (Swift UI) and `mlx-serve` (Zig server). Both must be updated when making changes. The Swift app starts the Zig server as a child process. Forgetting to copy one binary after a rebuild is a common source of "it still doesn't work."
