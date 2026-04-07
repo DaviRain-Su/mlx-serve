@@ -44,49 +44,68 @@ enum TestSSEEvent: Equatable {
 
 /// Matches fixed ChatView.buildAgentHistory()
 func buildAgentHistory(messages: [TestChatMessage]) -> [[String: Any]] {
-    messages
-        .suffix(30)
-        .compactMap { msg -> [String: Any]? in
-            if let callId = msg.toolCallId {
-                return [
-                    "role": "tool",
-                    "tool_call_id": callId,
-                    "content": String(msg.content.prefix(2000))
-                ]
-            }
-            if msg.role == .system { return nil }
-            if msg.isAgentSummary { return nil }
+    let firstUserIdx = messages.firstIndex { $0.role == .user && $0.toolCallId == nil }
+    let windowStart = max(0, messages.count - 28)
+    let window = Array(messages.suffix(28))
+    let needsPin = firstUserIdx != nil && firstUserIdx! < windowStart
 
-            // Assistant with tool_calls: include tool_calls in OpenAI format
-            if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
-                var dict: [String: Any] = ["role": "assistant"]
-                let content = msg.content
-                    .replacingOccurrences(of: "<pad>", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                dict["content"] = content.isEmpty ? "" : content
-                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                    [
-                        "id": tc.id,
-                        "type": "function",
-                        "function": [
-                            "name": tc.name,
-                            "arguments": tc.arguments
-                        ] as [String: Any]
-                    ]
-                }
-                return dict
-            }
+    let totalToolResults = window.filter { $0.toolCallId != nil }.count
+    var toolResultsSeen = 0
 
-            if msg.role == .assistant && msg.content.isEmpty { return nil }
-            var content = msg.content
+    var history: [[String: Any]] = []
+
+    if needsPin, let idx = firstUserIdx {
+        history.append(["role": "user", "content": messages[idx].content])
+    }
+
+    for msg in window {
+        if let callId = msg.toolCallId {
+            let isRecent = toolResultsSeen >= totalToolResults - 2
+            let limit = isRecent ? 2000 : 500
+            toolResultsSeen += 1
+            history.append([
+                "role": "tool",
+                "tool_call_id": callId,
+                "content": String(msg.content.prefix(limit))
+            ])
+            continue
+        }
+        if msg.role == .system { continue }
+        if msg.isAgentSummary { continue }
+
+        // Assistant with tool_calls: include tool_calls in OpenAI format
+        if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
+            var dict: [String: Any] = ["role": "assistant"]
+            let content = msg.content
                 .replacingOccurrences(of: "<pad>", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if msg.role == .assistant && content.count > 500 {
-                content = String(content.prefix(500)) + "..."
+            dict["content"] = content.isEmpty ? "" : content
+            dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                [
+                    "id": tc.id,
+                    "type": "function",
+                    "function": [
+                        "name": tc.name,
+                        "arguments": tc.arguments
+                    ] as [String: Any]
+                ]
             }
-            if content.isEmpty { return nil }
-            return ["role": msg.role.rawValue, "content": content]
+            history.append(dict)
+            continue
         }
+
+        if msg.role == .assistant && msg.content.isEmpty { continue }
+        var content = msg.content
+            .replacingOccurrences(of: "<pad>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if msg.role == .assistant && content.count > 500 {
+            content = String(content.prefix(500)) + "..."
+        }
+        if content.isEmpty { continue }
+        history.append(["role": msg.role.rawValue, "content": content])
+    }
+
+    return history
 }
 
 /// Matches fixed APIClient.performStream() SSE parsing
@@ -889,14 +908,18 @@ final class HistoryEdgeCaseTests: XCTestCase {
         XCTAssertEqual(history[0]["role"] as? String, "tool")
     }
 
-    func testHistory_TruncationAt30Messages() {
+    func testHistory_TruncationAt28PlusPinnedFirst() {
         var messages: [TestChatMessage] = []
         for i in 0..<40 {
             messages.append(TestChatMessage(role: .user, content: "Message \(i)"))
         }
         let history = buildAgentHistory(messages: messages)
-        XCTAssertEqual(history.count, 30)
-        XCTAssertEqual(history[0]["content"] as? String, "Message 10")
+        // 28 from window + 1 pinned first user message = 29
+        XCTAssertEqual(history.count, 29)
+        // First entry is the pinned original user message
+        XCTAssertEqual(history[0]["content"] as? String, "Message 0")
+        // Second entry is the start of the suffix(28) window
+        XCTAssertEqual(history[1]["content"] as? String, "Message 12")
     }
 
     func testHistory_ToolCallIdMatchesAcrossMessages() {
@@ -948,6 +971,55 @@ final class HistoryEdgeCaseTests: XCTestCase {
         let orphans = violations.filter { $0.contains("WITHOUT tool_calls") || $0.contains("no preceding assistant") }
         XCTAssertTrue(orphans.isEmpty,
             "Truncation split tool pairs:\n" + orphans.joined(separator: "\n"))
+    }
+
+    func testHistory_ProgressiveTruncation() {
+        // 4 tool results: older ones should get 500 chars, last 2 get 2000
+        let longContent = String(repeating: "x", count: 3000)
+        var messages: [TestChatMessage] = [
+            TestChatMessage(role: .user, content: "Do things")
+        ]
+        for i in 0..<4 {
+            var toolMsg = TestChatMessage(role: .system, content: longContent)
+            toolMsg.toolCallId = "call_\(i)"
+            messages.append(toolMsg)
+        }
+        let history = buildAgentHistory(messages: messages)
+        let toolEntries = history.filter { ($0["role"] as? String) == "tool" }
+        XCTAssertEqual(toolEntries.count, 4)
+        // First 2 tool results (older): truncated to 500
+        XCTAssertEqual((toolEntries[0]["content"] as! String).count, 500)
+        XCTAssertEqual((toolEntries[1]["content"] as! String).count, 500)
+        // Last 2 tool results (recent): truncated to 2000
+        XCTAssertEqual((toolEntries[2]["content"] as! String).count, 2000)
+        XCTAssertEqual((toolEntries[3]["content"] as! String).count, 2000)
+    }
+
+    func testHistory_FirstUserMessagePinned() {
+        // Create enough messages that the first user message falls outside the window
+        var messages: [TestChatMessage] = [
+            TestChatMessage(role: .user, content: "Original task: build a website")
+        ]
+        for i in 0..<30 {
+            messages.append(TestChatMessage(role: .assistant, content: "Step \(i)"))
+            messages.append(TestChatMessage(role: .user, content: "Continue \(i)"))
+        }
+        let history = buildAgentHistory(messages: messages)
+        // First entry should be the pinned original user message
+        XCTAssertEqual(history[0]["content"] as? String, "Original task: build a website")
+    }
+
+    func testHistory_FirstUserNotDuplicatedWhenInWindow() {
+        // Small conversation — first user message is already in the window
+        let messages: [TestChatMessage] = [
+            TestChatMessage(role: .user, content: "Hello"),
+            TestChatMessage(role: .assistant, content: "Hi there"),
+        ]
+        let history = buildAgentHistory(messages: messages)
+        XCTAssertEqual(history.count, 2)
+        // Only appears once
+        let userEntries = history.filter { ($0["role"] as? String) == "user" }
+        XCTAssertEqual(userEntries.count, 1)
     }
 }
 

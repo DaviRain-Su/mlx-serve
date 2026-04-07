@@ -143,7 +143,7 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "browse",
-                "description": "Browse a URL. Use action 'navigate' to visit, 'readText' to extract page text. Example: {\"action\": \"readText\", \"url\": \"https://example.com\"}",
+                "description": "Browse a URL. Use action 'navigate' to load a page, then 'readText' to extract its text. Example: {\"action\": \"navigate\", \"url\": \"https://example.com\"}",
                 "parameters": [
                     "type": "object",
                     "properties": [

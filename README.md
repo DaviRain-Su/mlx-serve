@@ -131,12 +131,32 @@ Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `t
 
 ## Performance
 
-Benchmarked on Apple M4 (16 GB unified memory), 256-token generation:
+Benchmarked on Apple M4 (16 GB unified memory):
 
 | Model | Prefill | Decode | Memory |
 |---|---|---|---|
-| Gemma-4 E4B (4-bit) | ~298 tok/s | ~27 tok/s | 4.0 GB |
+| Gemma-4 E4B (4-bit) | ~300 tok/s | ~33 tok/s | 4.0 GB |
 | Qwen3-4B (4-bit) | ~220 tok/s | ~37 tok/s | 2.17 GB |
+
+Matches mlx-lm (Python) generation speed while using less memory and starting 3x faster. Key optimizations: fully-lazy async pipeline with reordered eval (submit-first pattern), JIT-compiled activations (GELU, GeGLU, softcap via `mlx_compile`), and GPU memory wiring.
+
+<details>
+<summary>Benchmark reproduction</summary>
+
+```bash
+# Prefill (~840 token prompt):
+./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/gemma-4-e4b-it-4bit \
+  --prompt "$(python3 -c "print('Explain the following topics in extreme detail: ' + ', '.join([f'topic {i} about science and technology and its impact on human civilization throughout history' for i in range(1,50)]))")" \
+  --max-tokens 1
+
+# Decode (256 tokens, temp=0):
+./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/gemma-4-e4b-it-4bit \
+  --prompt "Write a detailed essay about quantum computing" \
+  --max-tokens 256
+```
+
+Run 3 times and take the average of runs 2-3 (run 1 includes model loading from disk).
+</details>
 
 ## License
 

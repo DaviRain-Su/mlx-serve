@@ -20,7 +20,12 @@ class BrowserManager: ObservableObject {
     }
 
     func navigate(to urlString: String) async throws -> String {
-        guard let url = URL(string: urlString) else {
+        // Auto-fix missing scheme — models often omit https://
+        var normalized = urlString
+        if !normalized.hasPrefix("http://") && !normalized.hasPrefix("https://") {
+            normalized = "https://" + normalized
+        }
+        guard let url = URL(string: normalized) else {
             throw ToolError.executionFailed("Invalid URL: \(urlString)")
         }
 

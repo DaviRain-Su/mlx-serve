@@ -396,7 +396,7 @@ class TestServer {
             let systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Process the tool results above and respond."])
+                history.append(["role": "user", "content": "Continue. If the task is done, summarize the result. If not, take the next step."])
             }
             messages.append(contentsOf: history)
 
@@ -479,8 +479,13 @@ class TestServer {
                     effectiveTool = tool
                 }
 
+                // Pre-validate required params
+                let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
                 let output: String
-                if let effectiveTool, let handler = toolHandlers[effectiveTool] {
+                if !missing.isEmpty {
+                    let example = Self.toolExample(for: tc.name)
+                    output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
                     do {
                         output = try await handler.execute(parameters: tc.arguments, workingDirectory: workDir)
                         if effectiveTool == .shell, let cmd = tc.arguments["command"] {
@@ -488,7 +493,7 @@ class TestServer {
                         }
                     } catch {
                         let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Please retry with all required parameters as JSON."
+                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
                     }
                 } else {
                     output = "Error: Unknown tool '\(tc.name)'"
@@ -534,40 +539,86 @@ class TestServer {
     /// Replicates ChatView.buildAgentHistory() exactly
     private func buildAgentHistory(appState: AppState, sessionId: UUID) -> [[String: Any]] {
         guard let session = appState.chatSessions.first(where: { $0.id == sessionId }) else { return [] }
-        return session.messages
-            .suffix(30)
-            .compactMap { msg -> [String: Any]? in
-                if let callId = msg.toolCallId {
-                    return [
-                        "role": "tool",
-                        "tool_call_id": callId,
-                        "content": String(msg.content.prefix(2000))
-                    ]
-                }
-                if msg.role == .system { return nil }
-                if msg.isAgentSummary { return nil }
-                if msg.role == .assistant && msg.content.contains("couldn't generate a response") { return nil }
+        let allMessages = session.messages
 
-                if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
-                    var dict: [String: Any] = ["role": "assistant"]
-                    let content = msg.content.replacingOccurrences(of: "<pad>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    dict["content"] = content.isEmpty ? "" : content
-                    dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                        ["id": tc.id, "type": "function", "function": ["name": tc.name, "arguments": tc.arguments] as [String: Any]]
-                    }
-                    return dict
-                }
+        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
+        let windowStart = max(0, allMessages.count - 28)
+        let window = Array(allMessages.suffix(28))
+        let needsPin = firstUserIdx != nil && firstUserIdx! < windowStart
 
-                if msg.role == .assistant && msg.content.isEmpty { return nil }
-                var content = msg.content
-                    .replacingOccurrences(of: "<pad>", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if msg.role == .assistant && content.count > 500 {
-                    content = String(content.prefix(500)) + "..."
-                }
-                if content.isEmpty { return nil }
-                return ["role": msg.role.rawValue, "content": content]
+        let totalToolResults = window.filter { $0.toolCallId != nil }.count
+        var toolResultsSeen = 0
+
+        var history: [[String: Any]] = []
+
+        if needsPin, let idx = firstUserIdx {
+            history.append(["role": "user", "content": allMessages[idx].content])
+        }
+
+        for msg in window {
+            if let callId = msg.toolCallId {
+                let isRecent = toolResultsSeen >= totalToolResults - 2
+                let limit = isRecent ? 2000 : 500
+                toolResultsSeen += 1
+                history.append([
+                    "role": "tool",
+                    "tool_call_id": callId,
+                    "content": String(msg.content.prefix(limit))
+                ])
+                continue
             }
+            if msg.role == .system { continue }
+            if msg.isAgentSummary { continue }
+            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+
+            if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
+                var dict: [String: Any] = ["role": "assistant"]
+                let content = msg.content.replacingOccurrences(of: "<pad>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                dict["content"] = content.isEmpty ? "" : content
+                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                    ["id": tc.id, "type": "function", "function": ["name": tc.name, "arguments": tc.arguments] as [String: Any]]
+                }
+                history.append(dict)
+                continue
+            }
+
+            if msg.role == .assistant && msg.content.isEmpty { continue }
+            var content = msg.content
+                .replacingOccurrences(of: "<pad>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if msg.role == .assistant && content.count > 500 {
+                content = String(content.prefix(500)) + "..."
+            }
+            if content.isEmpty { continue }
+            history.append(["role": msg.role.rawValue, "content": content])
+        }
+
+        return history
+    }
+
+    private static func missingRequiredParams(for toolName: String, arguments: [String: String]) -> [String] {
+        for def in AgentPrompt.toolDefinitions {
+            guard let fn = def["function"] as? [String: Any],
+                  fn["name"] as? String == toolName,
+                  let params = fn["parameters"] as? [String: Any],
+                  let required = params["required"] as? [String] else { continue }
+            return required.filter { key in
+                guard let val = arguments[key] else { return true }
+                return val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+        return []
+    }
+
+    private static func toolExample(for toolName: String) -> String {
+        for def in AgentPrompt.toolDefinitions {
+            guard let fn = def["function"] as? [String: Any],
+                  fn["name"] as? String == toolName,
+                  let desc = fn["description"] as? String,
+                  let range = desc.range(of: "Example: ") else { continue }
+            return String(desc[range.upperBound...])
+        }
+        return "{}"
     }
 
     private func isServerHealthy(appState: AppState) async -> Bool {

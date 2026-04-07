@@ -361,6 +361,9 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize) u32 {
     const prompt: u32 = @intCast(@min(prompt_len, max_context_size));
     if (prompt >= max_context_size) return 1; // at least 1 token
     const remaining = max_context_size - prompt;
+    if (remaining < max_tokens / 4) {
+        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, max_context_size });
+    }
     if (max_tokens > remaining) {
         log.debug("  max_tokens clamped: {d} -> {d} (ctx_size={d}, prompt={d})\n", .{ max_tokens, remaining, max_context_size, prompt });
         return remaining;
@@ -941,6 +944,7 @@ fn handleChatCompletions(
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+    log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     // Prompt caching: reuse KV cache for shared prefix
     const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, has_tools);
@@ -976,15 +980,10 @@ fn handleChatCompletions(
 
     // Store prompt IDs for next request's cache comparison — but NOT if generation
     // produced pad-only output, which indicates corrupted KV cache state.
-    // Also invalidate after tool-calling requests: the generated tool call tokens
-    // are in the KV cache but not in cached_prompt_ids, so the next request
-    // (which includes tool results) would reuse a cache with stale attention state.
-    if (last_generation_was_pad or has_tools) {
-        if (last_generation_was_pad) {
-            log.info("  [cache] invalidating cache after pad-only generation\n", .{});
-        } else {
-            log.info("  [cache] invalidating cache after tool-calling request\n", .{});
-        }
+    // Tool-calling requests no longer invalidate: reuseKVCache() truncates the cache
+    // to the shared prefix, correctly discarding stale generated-token entries.
+    if (last_generation_was_pad) {
+        log.info("  [cache] invalidating cache after pad-only generation\n", .{});
         try xfm.resetCache();
         if (cached_prompt_ids) |old| {
             allocator.free(old);
@@ -1411,6 +1410,7 @@ fn handleNonStreamingGeneration(
 
     // Check for tool calls in the output
     if (has_tools) {
+        log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
         if (try chat_mod.parseToolCalls(allocator, final_text)) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1801,6 +1801,7 @@ fn handleStreamingGeneration(
     // After generation: check for tool calls in accumulated text
     var finish_reason: []const u8 = if (stopped) "stop" else gen.finish_reason;
     if (has_tools) {
+        log.debug("  checking {d} bytes of streamed text for tool calls\n", .{text_buf.items.len});
         if (try chat_mod.parseToolCalls(allocator, text_buf.items)) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {

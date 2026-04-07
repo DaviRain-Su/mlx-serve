@@ -561,7 +561,8 @@ struct ChatDetailView: View {
             // Show tool call summary as display-only message (not appended to assistant content)
             let callSummary = receivedToolCalls.map { tc in
                 let args = tc.arguments.map { "\($0.key): \($0.value.prefix(80))" }.joined(separator: ", ")
-                return "**\(tc.name)**(\(args))"
+                let display = args.isEmpty ? tc.rawArguments.prefix(200) : args[...]
+                return "**\(tc.name)**(\(display))"
             }.joined(separator: "\n")
             var summaryMsg = ChatMessage(role: .assistant, content: callSummary)
             summaryMsg.isAgentSummary = true
@@ -581,8 +582,13 @@ struct ChatDetailView: View {
                     effectiveTool = tool
                 }
 
+                // Pre-validate required params — give the model the expected format on failure
+                let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
                 let output: String
-                if let effectiveTool, let handler = toolHandlers[effectiveTool] {
+                if !missing.isEmpty {
+                    let example = Self.toolExample(for: tc.name)
+                    output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
                     do {
                         output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
                         // Record shell commands
@@ -590,9 +596,8 @@ struct ChatDetailView: View {
                             appState.agentMemory.recordCommand(cmd)
                         }
                     } catch {
-                        // Include the args the model sent so it can see what went wrong
                         let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Please retry with all required parameters as JSON."
+                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
                     }
                 } else {
                     output = "Error: Unknown tool '\(tc.name)'"
@@ -622,52 +627,107 @@ struct ChatDetailView: View {
     }
 
     private func buildAgentHistory() -> [[String: Any]] {
-        (session?.messages ?? [])
-            .suffix(30)
-            .compactMap { msg -> [String: Any]? in
-                // Tool response messages
-                if let callId = msg.toolCallId {
-                    return [
-                        "role": "tool",
-                        "tool_call_id": callId,
-                        "content": String(msg.content.prefix(2000))
-                    ]
-                }
-                if msg.role == .system { return nil }
-                if msg.isAgentSummary { return nil }
-                // Skip error messages from failed generations — they confuse the model
-                if msg.role == .assistant && msg.content.contains("couldn't generate a response") { return nil }
+        let allMessages = session?.messages ?? []
 
-                // Assistant messages with tool_calls: include tool_calls in OpenAI format
-                if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
-                    var dict: [String: Any] = ["role": "assistant"]
-                    let content = msg.content
-                        .replacingOccurrences(of: "<pad>", with: "")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    dict["content"] = content.isEmpty ? "" : content
-                    dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                        [
-                            "id": tc.id,
-                            "type": "function",
-                            "function": [
-                                "name": tc.name,
-                                "arguments": tc.arguments
-                            ] as [String: Any]
-                        ]
-                    }
-                    return dict
-                }
+        // Always include the first user message (the original task) so the model
+        // never loses context even in deep agent loops.
+        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
 
-                if msg.role == .assistant && msg.content.isEmpty { return nil }
-                var content = msg.content
+        // Take the last 28 messages (reserving room for the pinned first user message)
+        let windowStart = max(0, allMessages.count - 28)
+        let window = Array(allMessages.suffix(28))
+
+        let needsPin = firstUserIdx != nil && firstUserIdx! < windowStart
+
+        // Count tool results in window for progressive truncation
+        let totalToolResults = window.filter { $0.toolCallId != nil }.count
+        var toolResultsSeen = 0
+
+        var history: [[String: Any]] = []
+
+        // Pin the first user message if it fell outside the window
+        if needsPin, let idx = firstUserIdx {
+            history.append(["role": "user", "content": allMessages[idx].content])
+        }
+
+        for msg in window {
+            // Tool response messages — truncate older results more aggressively
+            if let callId = msg.toolCallId {
+                let isRecent = toolResultsSeen >= totalToolResults - 2
+                let limit = isRecent ? 2000 : 500
+                toolResultsSeen += 1
+                history.append([
+                    "role": "tool",
+                    "tool_call_id": callId,
+                    "content": String(msg.content.prefix(limit))
+                ])
+                continue
+            }
+            if msg.role == .system { continue }
+            if msg.isAgentSummary { continue }
+            // Skip error messages from failed generations — they confuse the model
+            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+
+            // Assistant messages with tool_calls: include tool_calls in OpenAI format
+            if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
+                var dict: [String: Any] = ["role": "assistant"]
+                let content = msg.content
                     .replacingOccurrences(of: "<pad>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if msg.role == .assistant && content.count > 500 {
-                    content = String(content.prefix(500)) + "..."
+                dict["content"] = content.isEmpty ? "" : content
+                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                    [
+                        "id": tc.id,
+                        "type": "function",
+                        "function": [
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        ] as [String: Any]
+                    ]
                 }
-                if content.isEmpty { return nil }
-                return ["role": msg.role.rawValue, "content": content]
+                history.append(dict)
+                continue
             }
+
+            if msg.role == .assistant && msg.content.isEmpty { continue }
+            var content = msg.content
+                .replacingOccurrences(of: "<pad>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if msg.role == .assistant && content.count > 500 {
+                content = String(content.prefix(500)) + "..."
+            }
+            if content.isEmpty { continue }
+            history.append(["role": msg.role.rawValue, "content": content])
+        }
+
+        return history
+    }
+
+    /// Check which required params are missing for a tool call.
+    private static func missingRequiredParams(for toolName: String, arguments: [String: String]) -> [String] {
+        for def in AgentPrompt.toolDefinitions {
+            guard let fn = def["function"] as? [String: Any],
+                  fn["name"] as? String == toolName,
+                  let params = fn["parameters"] as? [String: Any],
+                  let required = params["required"] as? [String] else { continue }
+            return required.filter { key in
+                guard let val = arguments[key] else { return true }
+                return val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+        return []
+    }
+
+    /// Get the example JSON format from a tool's description.
+    private static func toolExample(for toolName: String) -> String {
+        for def in AgentPrompt.toolDefinitions {
+            guard let fn = def["function"] as? [String: Any],
+                  fn["name"] as? String == toolName,
+                  let desc = fn["description"] as? String,
+                  let range = desc.range(of: "Example: ") else { continue }
+            return String(desc[range.upperBound...])
+        }
+        return "{}"
     }
 
     private var toolHandlers: [AgentToolKind: any ToolHandler] {

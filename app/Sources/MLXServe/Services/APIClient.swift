@@ -80,6 +80,7 @@ class APIClient {
         let id: String
         let name: String
         let arguments: [String: String]
+        let rawArguments: String
     }
 
     /// Non-streaming chat completion with tool definitions.
@@ -146,7 +147,7 @@ class APIClient {
                         args[k] = "\(v)"
                     }
                 }
-                calls.append(ToolCall(id: id, name: name, arguments: args))
+                calls.append(ToolCall(id: id, name: name, arguments: args, rawArguments: argsStr))
             }
             let content = message["content"] as? String
             return ToolCallResult(content: content, toolCalls: calls.isEmpty ? nil : calls, usage: usage)
@@ -319,7 +320,7 @@ class APIClient {
                 var calls: [ToolCall] = []
                 for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                     let args = Self.parseToolCallArgs(tc.args, toolName: tc.name)
-                    calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args))
+                    calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args, rawArguments: tc.args))
                 }
                 if !calls.isEmpty {
                     continuation.yield(.toolCalls(calls))
@@ -334,7 +335,7 @@ class APIClient {
             for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                 if tc.name.isEmpty { continue }
                 let args = Self.parseToolCallArgs(tc.args, toolName: tc.name)
-                calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args))
+                calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args, rawArguments: tc.args))
             }
             if !calls.isEmpty {
                 continuation.yield(.toolCalls(calls))
