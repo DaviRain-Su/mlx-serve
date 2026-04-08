@@ -52,7 +52,7 @@ struct StatusMenuView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
 
-                    ContextSizeSection(contextSize: $appState.contextSize, isRunning: server.status == .running || server.status == .starting)
+                    ContextSizeSection(contextSize: $appState.contextSize, isRunning: server.status == .running || server.status == .starting, maxSafeContext: server.memoryInfo?.maxSafeContext ?? 0)
 
                     HStack(spacing: 6) {
                         Button {
@@ -386,8 +386,10 @@ struct MaxTokensSection: View {
 struct ContextSizeSection: View {
     @Binding var contextSize: Int
     var isRunning: Bool
+    var maxSafeContext: Int
 
     private let presets: [(String, Int)] = [
+        ("Auto", 0),
         ("16K", 16384),
         ("32K", 32768),
         ("64K", 65536),
@@ -415,6 +417,11 @@ struct ContextSizeSection: View {
                     .disabled(isRunning)
                 }
             }
+            if maxSafeContext > 0 {
+                Text("GPU safe max: \(Self.formatTokens(maxSafeContext))")
+                    .font(.caption2)
+                    .foregroundColor(contextSize > 0 && contextSize > maxSafeContext ? .orange : .secondary)
+            }
             if isRunning {
                 Text("Restart server to apply")
                     .font(.caption2)
@@ -424,10 +431,15 @@ struct ContextSizeSection: View {
     }
 
     private var formatted: String {
-        if contextSize >= 1024 {
-            return "\(contextSize / 1024)K"
+        if contextSize == 0 {
+            return maxSafeContext > 0 ? "Auto (\(Self.formatTokens(maxSafeContext)))" : "Auto"
         }
-        return "\(contextSize)"
+        return Self.formatTokens(contextSize)
+    }
+
+    static func formatTokens(_ tokens: Int) -> String {
+        if tokens >= 1024 { return "\(tokens / 1024)K" }
+        return "\(tokens)"
     }
 }
 

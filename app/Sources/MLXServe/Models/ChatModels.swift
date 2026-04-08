@@ -116,6 +116,7 @@ struct ModelInfo {
 struct MemoryInfo {
     var activeBytes: Int64
     var peakBytes: Int64
+    var maxSafeContext: Int
 
     var activeFormatted: String { Self.format(activeBytes) }
     var peakFormatted: String { Self.format(peakBytes) }

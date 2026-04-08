@@ -35,8 +35,7 @@ class AppState: ObservableObject {
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
         self.maxTokens = stored > 0 ? stored : 8192
-        let storedCtx = UserDefaults.standard.integer(forKey: "contextSize")
-        self.contextSize = storedCtx > 0 ? storedCtx : 16384
+        self.contextSize = UserDefaults.standard.integer(forKey: "contextSize") // 0 = auto
         refreshModels()
         loadChatHistory()
         testServer.start(appState: self)

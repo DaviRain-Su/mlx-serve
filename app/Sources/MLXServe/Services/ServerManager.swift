@@ -38,13 +38,16 @@ class ServerManager: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binaryPath)
-        proc.arguments = [
+        var args = [
             "--model", resolvedModel,
             "--serve",
             "--port", "\(port)",
-            "--ctx-size", "\(contextSize)",
             "--log-level", "info"
         ]
+        if contextSize > 0 {
+            args += ["--ctx-size", "\(contextSize)"]
+        }
+        proc.arguments = args
 
         // Inherit environment + add framework paths for dylib loading
         var env = ProcessInfo.processInfo.environment

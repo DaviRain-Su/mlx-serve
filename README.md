@@ -2,13 +2,16 @@
 
 **[ddalcu.github.io/mlx-serve](https://ddalcu.github.io/mlx-serve/)**
 
-Native Zig server that runs MLX-format language models on Apple Silicon and exposes an OpenAI-compatible HTTP API. No Python. Comes with **MLX Claw**, a macOS menu bar app with built-in chat, agent mode, and model management.
+Native Zig server that runs MLX-format language models on Apple Silicon and exposes OpenAI-compatible and Anthropic-compatible HTTP APIs. No Python. Comes with **MLX Claw**, a macOS menu bar app with built-in chat, agent mode, and model management.
 
 ![MLX Claw](docs/mlxclaw-screenshot-1.png)
+
+[<img src="docs/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Claw.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
 
 ## Features
 
 - OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
+- Anthropic-compatible API (`/v1/messages`) — works with Claude Code
 - Streaming and non-streaming responses
 - Tool calling (function calling) with automatic detection
 - KV cache reuse across requests for fast multi-turn conversations
@@ -102,7 +105,7 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--prompt TEXT` | `"Hello"` | Prompt for interactive mode |
 | `--max-tokens N` | `100` | Maximum tokens to generate |
 | `--temp F` | `0.0` | Sampling temperature (0 = greedy) |
-| `--ctx-size N` | `4096` | Context window size |
+| `--ctx-size N` | auto | Context window size (auto = computed from GPU memory) |
 | `--timeout N` | `300` | Request timeout in seconds |
 | `--reasoning-budget N` | `0` | Thinking token budget (0 = disabled) |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
@@ -123,11 +126,27 @@ curl http://localhost:8080/v1/chat/completions \
 
 Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `repetition_penalty`, `presence_penalty`, and `logprobs`.
 
+### POST /v1/messages (Anthropic)
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "mlx-serve",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Write a haiku about programming."}]
+  }'
+```
+
+Compatible with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:8080 claude`) and Anthropic SDKs. Supports streaming, tool calling, and extended thinking.
+
 ### Other endpoints
 
 - `GET /health` -- health check
 - `GET /v1/models` -- list loaded models
 - `POST /v1/completions` -- text completions
+- `POST /v1/messages` -- Anthropic Messages API
 
 ## Performance
 

@@ -207,9 +207,6 @@ pub fn main() !void {
         xfm.compileSoftcap(); // tanh(x/cap) * cap → 1 kernel
     }
 
-    if (ctx_size > 0) {
-        log.info("Context size: {d} tokens\n", .{ctx_size});
-    }
     log.info("Model ready.\n", .{});
 
     if (serve_mode) {

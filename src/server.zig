@@ -124,6 +124,14 @@ pub fn serve(
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
 
+    // Log context size (auto-computed or explicit)
+    const safe_ctx = computeMaxSafeContext(config);
+    if (max_context_size > 0) {
+        log.info("Context size: {d} tokens (manual)\n", .{max_context_size});
+    } else {
+        log.info("Context size: {d} tokens (auto, from GPU memory)\n", .{safe_ctx});
+    }
+
     if (request_timeout_sec > 0) {
         log.info("Request timeout: {d}s\n", .{request_timeout_sec});
     }
@@ -368,12 +376,95 @@ fn handleConnection(
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     if (max_context_size > 0) return max_context_size;
-    // Cap at 16K by default to prevent GPU OOM on consumer hardware.
-    // The model may advertise 128K+ but that requires more VRAM than most Macs have.
-    // Use --ctx-size to override if you have enough memory.
-    const safe_default: u32 = 16384;
-    if (config.max_position_embeddings == 0) return safe_default;
-    return @min(config.max_position_embeddings, safe_default);
+    // Compute safe default from available GPU memory instead of a fixed 16K cap.
+    return computeMaxSafeContext(config);
+}
+
+/// Compute the maximum safe context length based on available GPU memory.
+/// Solves: (heads × seq² × 4 + layers × 2 × seq × kv_heads × head_dim × 2) × 1.25 ≤ available
+fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
+    const heads: u64 = config.num_attention_heads;
+    if (heads == 0) return 16384;
+
+    const layers: u64 = config.num_hidden_layers;
+    const kv_heads: u64 = config.num_key_value_heads;
+    const hdim: u64 = config.head_dim;
+
+    const total_limit = getMetalBufferLimit();
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const available: u64 = if (total_limit > active_mem) total_limit - active_mem else 0;
+
+    // Quadratic: a × seq² + b × seq ≤ budget, where budget = available × 4/5
+    const a: f64 = @floatFromInt(heads * 4);
+    const b: f64 = @floatFromInt(layers * 2 * kv_heads * hdim * 2);
+    const budget: f64 = @floatFromInt(available * 4 / 5);
+
+    const disc = b * b + 4.0 * a * budget;
+    if (disc <= 0) return 1024;
+    const max_seq: f64 = (-b + @sqrt(disc)) / (2.0 * a);
+    if (max_seq <= 0) return 1024;
+
+    var result: u32 = @intFromFloat(max_seq);
+    // Cap at model's max position embeddings
+    if (config.max_position_embeddings > 0) {
+        result = @min(result, config.max_position_embeddings);
+    }
+    return result;
+}
+
+/// Estimate peak GPU memory for attention and reject if it would exceed Metal buffer limit.
+/// The attention matrix for one layer is: num_heads × seq_len² × sizeof(float32).
+/// Metal has a max buffer size (~75% of unified memory). If this is exceeded, the Metal
+/// runtime throws an uncatchable C++ exception that crashes the process.
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: std.net.Stream, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
+    const heads = config.num_attention_heads;
+    if (heads == 0) return true; // unknown architecture, skip check
+
+    const seq: u64 = @intCast(prompt_len);
+    const layers: u64 = config.num_hidden_layers;
+    const kv_heads: u64 = config.num_key_value_heads;
+    const hdim: u64 = config.head_dim;
+
+    // Attention matrix (one layer, reused): num_heads × seq² × 4 bytes (float32)
+    const attn_bytes: u64 = @as(u64, heads) * seq * seq * 4;
+    // KV cache (all layers): layers × 2(K+V) × seq × kv_heads × head_dim × 2 bytes (float16)
+    const kv_bytes: u64 = layers * 2 * seq * kv_heads * hdim * 2;
+    // Total estimate with 20% safety margin for intermediate buffers
+    const needed: u64 = (attn_bytes + kv_bytes) * 5 / 4;
+
+    // Available = Metal limit minus current GPU usage (model weights etc.)
+    const total_limit: u64 = getMetalBufferLimit();
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+
+    if (needed > available) {
+        const needed_mb = needed / (1024 * 1024);
+        const avail_mb = available / (1024 * 1024);
+        log.warn("  prompt {d} tokens needs ~{d}MB (attn+KV+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
+        const msg = try std.fmt.allocPrint(allocator,
+            "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+        defer allocator.free(msg);
+        if (is_anthropic) {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        } else {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        }
+        return false;
+    }
+    return true;
+}
+
+extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+
+/// Get the Metal max buffer allocation limit (~75% of system unified memory).
+fn getMetalBufferLimit() u64 {
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
+    return mem * 75 / 100;
 }
 
 /// Clamp max_tokens so prompt + completion doesn't exceed context length.
@@ -413,6 +504,8 @@ fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *co
     } else try std.fmt.allocPrint(allocator, "0", .{});
     defer allocator.free(ctx_str);
 
+    const safe_ctx = computeMaxSafeContext(config);
+
     // Query MLX memory usage
     var active_mem: usize = 0;
     var peak_mem: usize = 0;
@@ -424,7 +517,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *co
     defer allocator.free(escaped_template);
 
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":{s},"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":{s},"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"max_safe_context":{d}}}}}
     , .{
         config.model_type,        ctx_str,
         escaped_template,
@@ -434,6 +527,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *co
         config.quant_bits,        config.quant_group_size,
         config.max_position_embeddings,
         active_mem,               peak_mem,
+        safe_ctx,
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
@@ -963,6 +1057,9 @@ fn handleChatCompletions(
         return;
     }
 
+    // Check if attention computation would exceed GPU memory
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -1139,6 +1236,9 @@ fn handleCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
         return;
     }
+
+    // Check if attention computation would exceed GPU memory
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
@@ -2049,29 +2149,11 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
             shared = prompt_ids.len - 1;
         }
 
-        // For models with sliding window attention: if the previous prompt exceeded
-        // the window size, local-attention layers have trimmed their KV buffers.
-        // After trimming, buffer[i] no longer maps to position[i] — the RoPE
-        // embeddings baked into the cached K vectors are at the ORIGINAL positions,
-        // not the buffer indices. Truncating to a shared prefix would produce
-        // garbage attention because the position encoding is wrong.
-        // Additionally, if the NEW prompt exceeds the window, we must reset because
-        // the shared prefix tokens will be at different buffer positions after trimming.
-        // Safe rule: if either prompt exceeds the sliding window, don't reuse cache.
-        if (shared > 0 and xfm.config.has_sliding_window) {
-            const sw = xfm.config.sliding_window;
-            const prev_exceeded = cached.len > sw;
-            const next_will_exceed = prompt_ids.len > sw;
-            if (prev_exceeded or next_will_exceed) {
-                log.info("  [cache] reset — sliding window exceeded (cached={d}, new={d}, sw={d})\n", .{ cached.len, prompt_ids.len, sw });
-                if (cached_prompt_ids) |old| {
-                    allocator.free(old);
-                    cached_prompt_ids = null;
-                }
-                try xfm.resetCache();
-                return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
-            }
-        }
+        // Sliding window models (e.g. Gemma 4) interleave global and local attention layers.
+        // The KV cache buffers store ALL tokens regardless of window size — only the
+        // *views* returned during decode are windowed. Since truncate() just updates
+        // offsets and re-slices from the intact buffer, prefix reuse is safe: the cached
+        // K vectors retain their original RoPE position embeddings at the correct indices.
 
         if (shared > 0) {
             // Truncate KV cache to the shared prefix
@@ -2756,6 +2838,10 @@ fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", "Prompt exceeds maximum context length", 400);
         return;
     }
+
+    // Check if attention computation would exceed GPU memory
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true)) return;
+
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -3571,17 +3657,23 @@ test "getEffectiveContextLength uses ctx_size override" {
     try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
 }
 
-test "getEffectiveContextLength caps at safe default" {
+test "getEffectiveContextLength computes safe default from GPU memory" {
     const original = max_context_size;
     defer max_context_size = original;
 
     max_context_size = 0;
     var config = model_mod.ModelConfig{};
-    config.max_position_embeddings = 32768;
-    // Capped at 16K safe default
-    try testing.expectEqual(@as(u32, 16384), getEffectiveContextLength(&config));
+    config.max_position_embeddings = 131072;
+    config.num_attention_heads = 8;
+    config.num_hidden_layers = 42;
+    config.num_key_value_heads = 2;
+    config.head_dim = 256;
+    // Should compute a value based on GPU memory, not hardcoded 16K
+    const computed = getEffectiveContextLength(&config);
+    try testing.expect(computed > 0);
+    try testing.expect(computed <= config.max_position_embeddings);
 
-    // Explicit --ctx-size overrides the cap
+    // Explicit --ctx-size overrides the computed default
     max_context_size = 32768;
     try testing.expectEqual(@as(u32, 32768), getEffectiveContextLength(&config));
 }

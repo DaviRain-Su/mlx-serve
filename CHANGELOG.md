@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026.4.11 — Anthropic API, Claude Code, KV Cache Fix
+
+### Anthropic Messages API
+- **`POST /v1/messages`**: Full Anthropic API compatibility layer — Claude Code and other Anthropic SDK clients can use local models
+- **Request conversion**: Anthropic content blocks (`text`, `tool_use`, `tool_result`, `thinking`) converted to internal format; `system` as top-level field; tools `input_schema` converted to OpenAI `parameters` for chat template compatibility
+- **Streaming SSE**: Named events (`message_start`, `content_block_start/delta/stop`, `message_delta`, `message_stop`) with `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta` delta types
+- **Non-streaming**: Anthropic response format with content block arrays, `stop_reason` mapping (`stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`)
+- **`HEAD /` handler**: Claude Code sends a connectivity check before API calls — now returns 200
+- **Query string stripping**: `POST /v1/messages?beta=true` now correctly routes (Claude Code appends `?beta=true`)
+
+### Claude Code Integration
+- **Launch button**: "Launch Claude Code" button in MLX Claw menu bar (visible when server is running) — opens Terminal with `claude` CLI configured to use the local server via `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, model tier overrides
+- **Binary detection**: Finds `claude` via login shell PATH (`/bin/zsh -l -c "which claude"`) with fallback to `~/.local/bin/claude`
+- **`.command` file approach**: Uses `NSWorkspace.open()` on a temp `.command` file — no AppleScript permissions needed
+
+### GPU Memory Safety
+- **Attention memory preflight check**: Estimates peak GPU memory (attention matrix + KV cache + 20% margin) before prefill and rejects with a 400 error instead of crashing the server with an uncatchable Metal C++ exception
+- **Dynamic Metal limit**: Queries actual system memory via `sysctl hw.memsize` × 75% (not hardcoded) — works correctly on 16GB and 128GB machines
+- **Context size auto-detection**: Default context size computed from GPU memory at startup (replaces hardcoded 16K cap). Logged as `Context size: N tokens (auto, from GPU memory)`
+
+### Context Size UI
+- **Context size selector**: New UI in MLX Claw server block with Auto/16K/32K/64K/128K presets
+- **Auto mode**: When set to Auto (default), server computes safe max from model architecture + available GPU memory
+- **GPU safe max indicator**: Shows "GPU safe max: XXK" under buttons; turns orange when selected size exceeds safe limit
+- **`--ctx-size` passed to server**: Only when manually selected (Auto = no flag, server computes)
+- **`/props` endpoint**: New `max_safe_context` field in memory info
+
+### KV Cache Sliding Window Fix
+- **Removed incorrect cache invalidation**: The old code reset the entire KV cache when prompts exceeded the sliding window size (512 for Gemma 4), causing full re-encoding of the entire prompt on every request
+- **Root cause**: The comment claimed sliding window layers "trimmed their KV buffers" — but `KVCache.update()` stores ALL tokens in the buffer and only creates windowed views for decode. `truncate()` is safe since it only updates offsets
+- **Impact**: Claude Code agent loop requests with shared 24K-token prefix go from full prefill (~2s) to prefix reuse (~0.5s) — **3-4x faster per iteration**
+
+### Testing
+- **`tests/test_anthropic_api.sh`**: 40 integration tests — non-streaming, streaming, tool calling, tool result round-trip, error handling, streaming event order, model name echo, stop_sequences, Anthropic headers
+- **`tests/test_kv_cache_sliding_window.sh`**: KV cache reuse validation for sliding window models — measures cache-hit vs cache-miss timing, verifies prefix reuse across multi-turn tool-calling conversations
+
+---
+
 ## 2026.4.10 — Deep Agent Loop Reliability
 
 ### Tool Call Argument Fixes
