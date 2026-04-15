@@ -79,11 +79,25 @@ pub const VisionEncoder = struct {
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         const s = mlx.mlx_default_gpu_stream_new();
 
+        var name_buf: [256]u8 = undefined;
+
+        // Check for essential vision weights before allocating layers.
+        // Models like Qwen 3.5 have vision_config in config.json but ship
+        // without vision weights when quantized text-only.
+        const patch_w = getWeight(weights, &name_buf, "vision_tower.patch_embedder.input_proj.weight") orelse {
+            log.warn("MISSING WEIGHT: vision_tower.patch_embedder.input_proj.weight\n", .{});
+            return error.MissingVisionWeights;
+        };
+        const pos_emb = getWeight(weights, &name_buf, "vision_tower.patch_embedder.position_embedding_table") orelse {
+            log.warn("MISSING WEIGHT: vision_tower.patch_embedder.position_embedding_table\n", .{});
+            return error.MissingVisionWeights;
+        };
+
+        // Vision weights confirmed present — load all layers
         const num_layers = config.vision_num_layers;
         var layers = try allocator.alloc(VisionLayerWeights, num_layers);
         errdefer allocator.free(layers);
 
-        var name_buf: [256]u8 = undefined;
         const clipped = config.vision_use_clipped_linears;
 
         for (0..num_layers) |i| {
@@ -103,16 +117,6 @@ pub const VisionEncoder = struct {
                 .down_proj = loadLinearWeight(weights, &name_buf, i, "mlp.down_proj", clipped),
             };
         }
-
-        // Patch embedder
-        const patch_w = getWeight(weights, &name_buf, "vision_tower.patch_embedder.input_proj.weight") orelse {
-            log.err("MISSING WEIGHT: vision_tower.patch_embedder.input_proj.weight\n", .{});
-            return error.MissingVisionWeights;
-        };
-        const pos_emb = getWeight(weights, &name_buf, "vision_tower.patch_embedder.position_embedding_table") orelse {
-            log.err("MISSING WEIGHT: vision_tower.patch_embedder.position_embedding_table\n", .{});
-            return error.MissingVisionWeights;
-        };
 
         // Embedding projection: embed_vision.embedding_projection
         const proj_w = getWeight(weights, &name_buf, "embed_vision.embedding_projection.weight") orelse

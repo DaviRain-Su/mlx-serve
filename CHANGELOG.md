@@ -7,10 +7,15 @@
 - **RAM fitness indicator**: Color-coded dot (green/yellow/red) shows whether a model fits in system RAM
 - **Capability badges**: Vision (eye) and tool calling (wrench) icons based on pipeline tag and model family heuristics
 - **Compatibility filtering**: Incompatible pipeline types (e.g. `text-to-image`) shown grayed out with reason
+- **Architecture detection**: Models with unsupported architectures (LFM2, Nemotron-H, etc.) flagged with red "Unsupported architecture" label — HF tags checked via prefix matching (`gemma`, `qwen`, `llama`, `mistral`), local models checked via `model_type` from `config.json`. Download still allowed.
 - **Download integration**: Download button with progress tracking, resume support for interrupted downloads
 - **Downloaded models view**: "Downloaded" toggle switches to local filesystem view — shows models from `~/.mlx-serve/models/` with size on disk, filter field, no HuggingFace API calls
+- **Active downloads in Downloaded tab**: Downloading and failed downloads appear above local models with progress bars, speed indicators, and Resume/Retry buttons
 - **Delete models**: Trash button with confirmation alert on both HuggingFace and local views — removes all downloaded files and refreshes model picker
 - **"Browse All MLX Models" button**: Added to tray menu Models section for quick access
+
+### Vision Encoder Crash Fix
+- **Graceful fallback for text-only quantized models**: Models like Qwen 3.5 have `vision_config` in config.json but ship without vision weights — previously crashed with `unreachable` in `getVisionWeight()`. Now checks for essential patch embedder weights before allocating layer arrays, returning `MissingVisionWeights` which disables vision gracefully
 
 ### Menu Bar Status Icon
 - **Tinted tray icon**: Menu bar icon color reflects server status — red when stopped, orange when starting, normal system tint when running
@@ -19,6 +24,9 @@
 ### Other Changes
 - **Model download list**: Quick-download section in tray menu now shows 8-bit models only (filtered from full list)
 - **Window focus handling**: `openAndFocus()` updated for Model Browser window routing
+
+### Testing
+- **`tests/test_vision_moe_regression.sh`**: 25-test regression script covering basic forward pass, vision pipeline, `--no-vision` restart, MoE-specific paths, and crash detection. Auto-detects model capabilities from config.json. Self-contained: builds, starts server, runs tests, cleans up
 
 ---
 

@@ -48,14 +48,25 @@ Menu bar app that wraps the server with a full UI:
 
 ## Supported Models
 
-| Architecture | Examples | Chat Format |
-|---|---|---|
-| **Gemma 4** | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns |
-| **Gemma 3** | `gemma-3-12b-it-qat-4bit` | Gemma turns |
-| **Qwen 3 / 3.5** | `Qwen3-4B`, `Qwen3.5-MoE`, `Qwen3-next` | ChatML |
-| **Llama / Mistral** | Llama 3, Mistral | ChatML / Llama-3 |
+| Architecture | `model_type` | Examples | Chat Format | Vision |
+|---|---|---|---|---|
+| **Gemma 4** | `gemma4` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns | SigLIP |
+| **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
+| **Qwen 3 / 3.5** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.5-MoE-A3B` | ChatML | -- |
+| **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
+| **Mistral** | `mistral` | Mistral 7B | ChatML | -- |
 
-Any quantized MLX model using one of the above architectures should work.
+Any quantized MLX model using one of the above architectures should work. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.
+
+### Not Yet Supported
+
+| Architecture | `model_type` | Examples | Reason |
+|---|---|---|---|
+| **LFM2 / LFM2-VL** | `lfm2`, `lfm2-vl` | LFM2.5-350M, LFM2.5-VL-450M | State-space (Liquid) architecture, not transformer-based |
+| **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | Hybrid transformer + Mamba (SSM) layers |
+| **Phi** | `phi`, `phi3` | Phi-3, Phi-4 | Different attention/MLP layout, untested |
+| **Cohere** | `command-r` | Command R+ | Different architecture, untested |
+| **BERT** (partial) | `bert` | -- | Encoder-only, config parsing exists but no serving endpoint |
 
 ## Prerequisites
 

@@ -17,7 +17,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 |------|------|
 | `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--log-level`, `--version`, `--help`) |
 | `src/mlx.zig` | mlx-c FFI |
-| `src/model.zig` | Config + safetensors loading; supports Gemma-3, Gemma-4, Qwen3, Qwen3.5 MoE, Qwen3-next, Llama, Mistral |
+| `src/model.zig` | Config + safetensors loading; see **Supported Architectures** below |
 | `src/tokenizer.zig` | BPE tokenizer |
 | `src/transformer.zig` | Forward pass (embedding, attention, MLP, MoE, GatedDeltaNet); architecture dispatch |
 | `src/generate.zig` | Autoregressive generation, sampling (temperature, top-k, top-p, repeat penalty, presence penalty, logprobs) |
@@ -78,6 +78,34 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 - KV cache reuse across requests via prompt prefix matching; invalidated after tool-calling requests and pad-only generations.
 - Tests go at the bottom of each source file (Zig convention).
 - Jinja static library must be rebuilt with system clang++ after changing `lib/jinja_cpp/*.cpp` (see build command in `build.zig`).
+
+## Supported Architectures
+
+Model support is determined by `model_type` in the model's `config.json`. The server dispatches to architecture-specific code paths in `model.zig` (config parsing, weight prefix) and `transformer.zig` (forward pass).
+
+### Working
+
+| `model_type` | Family | Weight prefix | Vision | MoE | Notes |
+|---|---|---|---|---|---|
+| `gemma4`, `gemma4_text` | Gemma 4 | `language_model.model` | SigLIP | -- | Full support incl. vision, clipped linears, PLE |
+| `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
+| `qwen3` | Qwen 3 | `model` | -- | -- | QK norm enabled |
+| `qwen3_5`, `qwen3_5_moe`, `qwen3_5_moe_text` | Qwen 3.5 | `language_model.model` | -- | Shared expert | PLE weights, MoE routing |
+| `qwen3_next` | Qwen 3-next | `model` | -- | Optional | DeltaNet (GatedDeltaNet layers) |
+| `llama` | Llama | `model` | -- | -- | |
+| `mistral` | Mistral | `model` | -- | -- | |
+
+### Not Yet Supported (TODO)
+
+| `model_type` | Family | Blocked by | Effort |
+|---|---|---|---|
+| `lfm2` | Liquid LFM2.5 | State-space (non-transformer) architecture — needs new forward pass | High |
+| `lfm2-vl` | Liquid LFM2.5-VL | Same as lfm2 + vision encoder | High |
+| `nemotron_h` | NVIDIA Nemotron-H | Hybrid transformer + Mamba (SSM) layers — needs Mamba forward pass | High |
+| `phi`, `phi3` | Microsoft Phi | Different attention/MLP layout, different weight names | Medium |
+| `command-r` | Cohere Command R | Different architecture | Medium |
+
+Models with `vision_config` in config.json but no vision weights (e.g., text-only quantized Qwen 3.5) are handled gracefully — the vision encoder init detects missing weights early and disables vision. The Swift app flags unsupported architectures in the Model Browser via `supportedModelTypes` in `HFModels.swift`.
 
 ## Anthropic Messages API
 

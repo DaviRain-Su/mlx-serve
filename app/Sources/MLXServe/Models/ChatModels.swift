@@ -175,6 +175,11 @@ struct LocalModel: Identifiable, Hashable {
     let name: String
     let path: String
     let sizeFormatted: String
+    let modelType: String
+
+    var isSupportedArchitecture: Bool {
+        supportedModelTypes.contains(modelType)
+    }
 }
 
 struct GemmaModelOption: Identifiable {

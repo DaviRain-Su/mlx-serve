@@ -7,6 +7,24 @@ private let compatiblePipelineTags: Set<String> = [
     "any-to-any",  // Gemma 4 uses this
 ]
 
+/// Architecture tag prefixes from HuggingFace that correspond to supported model families.
+/// A model is supported if any of its tags starts with one of these prefixes.
+/// HF tags vary (gemma3, gemma4, gemma3n, qwen3_5, qwen3.5, etc.) so prefix matching is needed.
+private let supportedArchitectureTagPrefixes: [String] = [
+    "gemma",   // gemma, gemma2, gemma3, gemma3n, gemma4
+    "qwen",    // qwen2, qwen3, qwen3_5, qwen3.5
+    "llama",
+    "mistral",
+]
+
+/// model_type values from config.json that the Zig server can load.
+let supportedModelTypes: Set<String> = [
+    "gemma3", "gemma4", "gemma4_text",
+    "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
+    "qwen2",
+    "llama", "mistral",
+]
+
 struct HFModel: Identifiable, Codable {
     let id: String
     let downloads: Int?
@@ -31,10 +49,25 @@ struct HFModel: Identifiable, Codable {
         return compatiblePipelineTags.contains(tag)
     }
 
+    /// Whether this model's architecture is known to work with mlx-serve.
+    /// Checks HF tags for supported family prefixes (gemma, qwen, llama, mistral).
+    /// Models with no tags get benefit of the doubt.
+    var isSupportedArchitecture: Bool {
+        guard let tags, !tags.isEmpty else { return true }
+        return tags.contains { tag in
+            supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
+        }
+    }
+
     /// Human-readable reason why this model isn't compatible.
     var incompatibleReason: String? {
-        guard !isCompatible, let tag = pipelineTag else { return nil }
-        return "Not supported (\(tag))"
+        if !isCompatible, let tag = pipelineTag {
+            return "Not supported (\(tag))"
+        }
+        if !isSupportedArchitecture {
+            return "Unsupported architecture"
+        }
+        return nil
     }
 
     /// Whether this model supports vision (image input).

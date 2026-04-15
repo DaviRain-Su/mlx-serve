@@ -12,6 +12,13 @@ struct ModelBrowserView: View {
         return appState.localModels.filter { $0.name.localizedCaseInsensitiveContains(localFilter) }
     }
 
+    private var activeDownloads: [(repoId: String, state: DownloadManager.DownloadState)] {
+        downloads.downloads
+            .filter { $0.value.status == .downloading || $0.value.status == .failed }
+            .sorted { $0.key < $1.key }
+            .map { (repoId: $0.key, state: $0.value) }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Search bar
@@ -32,18 +39,18 @@ struct ModelBrowserView: View {
                 .background(.quaternary.opacity(0.5))
                 .cornerRadius(8)
 
-                Toggle(isOn: $showDownloadedOnly) {
-                    Label("Downloaded", systemImage: "internaldrive")
-                }
-                .toggleStyle(.button)
-                .controlSize(.regular)
-
                 if !showDownloadedOnly {
                     Button("Search") {
                         Task { await searchService.search() }
                     }
                     .controlSize(.regular)
                 }
+
+                Toggle(isOn: $showDownloadedOnly) {
+                    Label("Downloaded", systemImage: "internaldrive")
+                }
+                .toggleStyle(.button)
+                .controlSize(.regular)
             }
             .padding(12)
 
@@ -67,15 +74,20 @@ struct ModelBrowserView: View {
 
                 Divider()
 
-                // Local model list
+                // Local model list + active downloads
                 ScrollView {
                     LazyVStack(spacing: 0) {
+                        ForEach(activeDownloads, id: \.repoId) { item in
+                            ActiveDownloadRow(repoId: item.repoId, state: item.state)
+                            Divider().padding(.horizontal, 12)
+                        }
+
                         ForEach(filteredLocalModels) { model in
                             LocalModelRow(model: model)
                             Divider().padding(.horizontal, 12)
                         }
 
-                        if filteredLocalModels.isEmpty {
+                        if activeDownloads.isEmpty && filteredLocalModels.isEmpty {
                             Text("No downloaded models")
                                 .foregroundStyle(.secondary)
                                 .padding(40)
@@ -86,7 +98,7 @@ struct ModelBrowserView: View {
                 Divider()
 
                 HStack {
-                    Text("\(filteredLocalModels.count) downloaded models")
+                    Text("\(filteredLocalModels.count) downloaded\(activeDownloads.isEmpty ? "" : ", \(activeDownloads.count) in progress")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -433,10 +445,18 @@ private struct LocalModelRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(model.name)
-                .font(.callout.weight(.medium))
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(model.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                if !model.isSupportedArchitecture {
+                    Text("Unsupported architecture (\(model.modelType))")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red.opacity(0.8))
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(model.sizeFormatted)
                 .font(.callout.monospacedDigit())
@@ -461,6 +481,66 @@ private struct LocalModelRow: View {
                 }
             } message: {
                 Text("Delete \(model.name)? This will remove all downloaded files.")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+}
+
+// MARK: - Active Download Row
+
+private struct ActiveDownloadRow: View {
+    let repoId: String
+    let state: DownloadManager.DownloadState
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+
+    private var modelName: String {
+        repoId.components(separatedBy: "/").last ?? repoId
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(modelName)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+
+                if state.status == .downloading, !state.statusText.isEmpty {
+                    Text("[\(state.fileIndex)/\(state.fileCount)] \(state.statusText)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else if state.status == .failed, let error = state.error {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if state.status == .downloading {
+                VStack(alignment: .trailing, spacing: 1) {
+                    ProgressView(value: state.fileProgress)
+                        .frame(width: 80)
+                    Text("\(state.percentFormatted) \(state.speedFormatted)")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 90, alignment: .trailing)
+            } else if state.status == .failed {
+                Button(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry") {
+                    Task {
+                        await downloads.download(repoId: repoId)
+                        appState.refreshModels()
+                    }
+                }
+                .font(.callout)
+                .controlSize(.small)
+                .frame(width: 90, alignment: .trailing)
             }
         }
         .padding(.horizontal, 12)

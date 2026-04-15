@@ -300,12 +300,21 @@ class DownloadManager: ObservableObject {
             let hasSafetensors = dirEntries.contains { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }
             guard hasSafetensors else { return nil }
 
+            // Read model_type from config.json
+            var modelType = "unknown"
+            if let configData = FileManager.default.contents(atPath: configPath),
+               let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+               let mt = config["model_type"] as? String {
+                modelType = mt
+            }
+
             let size = directorySize(dirPath)
             return LocalModel(
                 id: name,
                 name: name,
                 path: dirPath,
-                sizeFormatted: MemoryInfo.format(Int64(size))
+                sizeFormatted: MemoryInfo.format(Int64(size)),
+                modelType: modelType
             )
         }.sorted { $0.name < $1.name }
     }
