@@ -114,7 +114,7 @@ jobs:
               "$STAGING/lib/libwebp.dylib" 2>/dev/null || true
           fi
 
-          for lib in "$STAGING/lib/"*.dylib "$STAGING/lib/"*.metallib; do
+          for lib in "$STAGING/lib/"*.dylib; do
             [ -f "$lib" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$lib"
           done
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
