@@ -6,13 +6,16 @@ const log = @import("log.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 
-// ── Clipped Linear Weight ──
-// Gemma 4 vision uses "clipped linears": bf16 dense weights with input/output clamping.
+// ── Linear Weight (optionally clipped) ──
+// Gemma 4 E4B vision uses "clipped linears": bf16 dense weights with input/output clamping.
 // Forward: clip(x, in_min, in_max) → matmul(x, w.T) → clip(y, out_min, out_max)
+// Gemma 4 26B/31B use plain linears (no clipping): matmul(x, w.T)
+// When `has_clip` is false, the min/max arrays are unused placeholders.
 
-const ClippedLinearWeight = struct {
+const LinearWeight = struct {
     weight: mlx.mlx_array, // [out_dim, in_dim] bf16
-    input_min: mlx.mlx_array,
+    has_clip: bool,
+    input_min: mlx.mlx_array, // unused when has_clip == false
     input_max: mlx.mlx_array,
     output_min: mlx.mlx_array,
     output_max: mlx.mlx_array,
@@ -27,17 +30,17 @@ const VisionLayerWeights = struct {
     post_feedforward_layernorm: mlx.mlx_array,
 
     // Attention
-    q_proj: ClippedLinearWeight,
-    k_proj: ClippedLinearWeight,
-    v_proj: ClippedLinearWeight,
-    out_proj: ClippedLinearWeight,
+    q_proj: LinearWeight,
+    k_proj: LinearWeight,
+    v_proj: LinearWeight,
+    out_proj: LinearWeight,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
 
     // MLP
-    gate_proj: ClippedLinearWeight,
-    up_proj: ClippedLinearWeight,
-    down_proj: ClippedLinearWeight,
+    gate_proj: LinearWeight,
+    up_proj: LinearWeight,
+    down_proj: LinearWeight,
 };
 
 // ── Vision Encoder ──
@@ -63,6 +66,11 @@ pub const VisionEncoder = struct {
     proj_quant_bits: u32,
     proj_quant_group_size: u32,
 
+    // Gemma-4 26B/31B: learned pre-encoder standardization (scale * h + bias on last dim).
+    // null for E4B which uses clipped linears and no standardization.
+    std_scale: ?mlx.mlx_array,
+    std_bias: ?mlx.mlx_array,
+
     // Constants
     rms_eps: f32,
     half: mlx.mlx_array,
@@ -76,6 +84,7 @@ pub const VisionEncoder = struct {
         errdefer allocator.free(layers);
 
         var name_buf: [256]u8 = undefined;
+        const clipped = config.vision_use_clipped_linears;
 
         for (0..num_layers) |i| {
             layers[i] = .{
@@ -83,15 +92,15 @@ pub const VisionEncoder = struct {
                 .post_attention_layernorm = getVisionWeight(weights, &name_buf, i, "post_attention_layernorm.weight"),
                 .pre_feedforward_layernorm = getVisionWeight(weights, &name_buf, i, "pre_feedforward_layernorm.weight"),
                 .post_feedforward_layernorm = getVisionWeight(weights, &name_buf, i, "post_feedforward_layernorm.weight"),
-                .q_proj = loadClippedLinear(weights, &name_buf, i, "self_attn.q_proj"),
-                .k_proj = loadClippedLinear(weights, &name_buf, i, "self_attn.k_proj"),
-                .v_proj = loadClippedLinear(weights, &name_buf, i, "self_attn.v_proj"),
-                .out_proj = loadClippedLinear(weights, &name_buf, i, "self_attn.o_proj"),
+                .q_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.q_proj", clipped),
+                .k_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.k_proj", clipped),
+                .v_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.v_proj", clipped),
+                .out_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.o_proj", clipped),
                 .q_norm = getVisionWeight(weights, &name_buf, i, "self_attn.q_norm.weight"),
                 .k_norm = getVisionWeight(weights, &name_buf, i, "self_attn.k_norm.weight"),
-                .gate_proj = loadClippedLinear(weights, &name_buf, i, "mlp.gate_proj"),
-                .up_proj = loadClippedLinear(weights, &name_buf, i, "mlp.up_proj"),
-                .down_proj = loadClippedLinear(weights, &name_buf, i, "mlp.down_proj"),
+                .gate_proj = loadLinearWeight(weights, &name_buf, i, "mlp.gate_proj", clipped),
+                .up_proj = loadLinearWeight(weights, &name_buf, i, "mlp.up_proj", clipped),
+                .down_proj = loadLinearWeight(weights, &name_buf, i, "mlp.down_proj", clipped),
             };
         }
 
@@ -118,6 +127,11 @@ pub const VisionEncoder = struct {
 
         const proj_bits = detectProjBits(proj_w, proj_s, config.quant_group_size);
 
+        // Gemma-4 26B/31B learned standardization (per-channel scale + bias).
+        // Applied once after patch + position embedding, before the transformer stack.
+        const std_scale_opt = getWeight(weights, &name_buf, "vision_tower.std_scale");
+        const std_bias_opt = getWeight(weights, &name_buf, "vision_tower.std_bias");
+
         // Batch eval all vision weights
         {
             var eval_list = std.ArrayList(mlx.mlx_array).empty;
@@ -127,6 +141,8 @@ pub const VisionEncoder = struct {
             try eval_list.append(allocator, proj_w);
             if (mlx.mlx_array_ndim(proj_s) > 0) try eval_list.append(allocator, proj_s);
             if (mlx.mlx_array_ndim(proj_b) > 0) try eval_list.append(allocator, proj_b);
+            if (std_scale_opt) |a| try eval_list.append(allocator, a);
+            if (std_bias_opt) |a| try eval_list.append(allocator, a);
             for (layers) |lw| {
                 try eval_list.append(allocator, lw.input_layernorm);
                 try eval_list.append(allocator, lw.post_attention_layernorm);
@@ -147,8 +163,10 @@ pub const VisionEncoder = struct {
             _ = mlx.mlx_eval(vec);
         }
 
-        log.info("Vision encoder: {d} layers, hidden={d}, heads={d}, pool→{d} tokens\n", .{
+        log.info("Vision encoder: {d} layers, hidden={d}, heads={d}, pool→{d} tokens{s}{s}\n", .{
             num_layers, config.vision_hidden_size, config.vision_num_heads, config.vision_soft_tokens,
+            if (clipped) ", clipped" else "",
+            if (std_scale_opt != null) ", std" else "",
         });
 
         return .{
@@ -163,6 +181,8 @@ pub const VisionEncoder = struct {
             .proj_b = proj_b,
             .proj_quant_bits = proj_bits,
             .proj_quant_group_size = config.quant_group_size,
+            .std_scale = std_scale_opt,
+            .std_bias = std_bias_opt,
             .rms_eps = 1e-6,
             .half = bf16Scalar(0.5, s),
             .one = bf16Scalar(1.0, s),
@@ -234,13 +254,57 @@ pub const VisionEncoder = struct {
             h = h_new;
         }
 
-        // 3. Build 2D position indices for RoPE: [B, num_patches, 2]
-        const positions = try self.buildPositionGrid(batch, grid_h, grid_w, num_patches);
+        // 2c. Pad the patch sequence out to `max_patches` with zero embeddings so transformer
+        //     blocks see the fixed shape they were trained on. Reference (vision.py:459-464).
+        //     max_patches = default_output_length * pooling_kernel^2. For Gemma-4: 280 * 9 = 2520.
+        const max_patches: c_int = @intCast(cfg.vision_soft_tokens * kernel * kernel);
+        const num_padding: c_int = max_patches - num_patches;
+        if (num_padding > 0) {
+            const pad_shape = [_]c_int{ batch, num_padding, hidden };
+            var pad_emb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_emb);
+            try mlx.check(mlx.mlx_zeros(&pad_emb, &pad_shape, 3, .bfloat16, self.s));
+            const arrs = [_]mlx.mlx_array{ h, pad_emb };
+            const vec = mlx.mlx_vector_array_new_data(&arrs, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var h_padded = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(&h_padded, vec, 1, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h_padded;
+        }
+
+        // 3. Build 2D position indices for RoPE: [B, max_patches, 2]
+        //    Real patches get (x, y) on the grid; padded patches get (-1, -1) per reference.
+        const positions = try self.buildPositionGridPadded(batch, grid_h, grid_w, num_patches, max_patches);
         defer _ = mlx.mlx_array_free(positions);
 
-        // 4. Transformer layers
+        // 4. Attention mask [B, 1, L, L]: 0 where both Q and K are valid, -inf otherwise.
+        //    Broadcast on head dim. Matches reference vision.py:466-473.
+        const attn_mask_opt: ?mlx.mlx_array = if (num_padding > 0)
+            try self.buildAttentionMask(batch, max_patches, num_patches)
+        else
+            null;
+        defer {
+            if (attn_mask_opt) |m| _ = mlx.mlx_array_free(m);
+        }
+
+        // 5. Transformer layers (now over `max_patches` with optional mask)
+        const seq_len_for_transformer = max_patches;
         for (self.layers) |lw| {
-            h = try self.transformerLayer(h, lw, positions, batch, num_patches, num_heads, head_dim);
+            h = try self.transformerLayer(h, lw, positions, attn_mask_opt, batch, seq_len_for_transformer, num_heads, head_dim);
+        }
+
+        // 6. Slice back to real patches before pooling. The padded rows are zero (masked in
+        //    attention throughout), and our positionPool below operates on the real grid;
+        //    this avoids a second, more complex einsum-style pool path.
+        if (num_padding > 0) {
+            const s_start = [_]c_int{ 0, 0, 0 };
+            const s_stop = [_]c_int{ batch, num_patches, hidden };
+            const s_strides = [_]c_int{ 1, 1, 1 };
+            var h_real = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&h_real, h, &s_start, 3, &s_stop, 3, &s_strides, 3, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h_real;
         }
 
         // 5. Pooling: reduce patches via position-based averaging
@@ -254,18 +318,44 @@ pub const VisionEncoder = struct {
         _ = mlx.mlx_array_free(h);
 
         // Scale by sqrt(hidden_size) — reference: hidden_states * self.root_hidden_size
+        // (done inside VisionPooler in the Python reference; we do it right after pooling).
         const root_hidden = bf16Scalar(@sqrt(@as(f32, @floatFromInt(cfg.vision_hidden_size))), self.s);
         defer _ = mlx.mlx_array_free(root_hidden);
         var pooled_scaled = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_multiply(&pooled_scaled, pooled, root_hidden, self.s));
         _ = mlx.mlx_array_free(pooled);
 
-        // 6. Embedding projection: vision_hidden → text_hidden
-        var projected: mlx.mlx_array = undefined;
+        // 5b. Gemma-4 26B/31B: learned standardization applied AFTER the sqrt(hidden) scaling.
+        //     Reference (mlx-vlm vision.py:502): `hidden_states = (hidden_states - std_bias) * std_scale`.
+        //     Verified against dumped weights: std_bias holds large (~train mean) values while
+        //     std_scale is tiny (~1/train_std), confirming the "subtract-then-scale" formula.
+        var post_std: mlx.mlx_array = pooled_scaled;
+        if (self.std_scale) |scale| {
+            const bias = self.std_bias orelse unreachable;
+            var centered = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_subtract(&centered, post_std, bias, self.s));
+            _ = mlx.mlx_array_free(post_std);
+            var scaled_out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&scaled_out, centered, scale, self.s));
+            _ = mlx.mlx_array_free(centered);
+            post_std = scaled_out;
+        }
+
+        // 6. Pre-projection parameter-free RMS norm → embedding projection.
+        //    Reference (mlx-vlm gemma4.py:32-34, language.py:18-26):
+        //      normed = mx.fast.rms_norm(x, None, eps)   # RMSNormNoScale, no learned weight
+        //      return embedding_projection(normed)        # dense linear, no bias
+        //    Historical port did projection-then-norm; that's wrong (different magnitudes because
+        //    RMS-normalizing a 2560/2816/5376-dim text-space vector is not the same as
+        //    normalizing the 1152-dim vision-space vector).
+        const pre_proj_normed = try self.rmsNormNoScale(post_std);
+        _ = mlx.mlx_array_free(post_std);
+
+        var post_normed: mlx.mlx_array = undefined;
         if (mlx.mlx_array_ndim(self.proj_s) > 0) {
-            projected = mlx.mlx_array_new();
+            post_normed = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_quantized_matmul(
-                &projected, pooled_scaled, self.proj_w, self.proj_s, self.proj_b,
+                &post_normed, pre_proj_normed, self.proj_w, self.proj_s, self.proj_b,
                 true, mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
                 mlx.mlx_optional_int.some(@intCast(self.proj_quant_bits)), "affine", self.s,
             ));
@@ -273,15 +363,10 @@ pub const VisionEncoder = struct {
             var proj_wt = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(proj_wt);
             try mlx.check(mlx.mlx_transpose(&proj_wt, self.proj_w, self.s));
-            projected = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_matmul(&projected, pooled_scaled, proj_wt, self.s));
+            post_normed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&post_normed, pre_proj_normed, proj_wt, self.s));
         }
-        _ = mlx.mlx_array_free(pooled_scaled);
-
-        // 7. Post-projection norm: parameter-free RMS norm (no learned weight)
-        //    Reference: RMSNormNoScale — norm = x / sqrt(mean(x^2) + eps)
-        const post_normed = try self.rmsNormNoScale(projected);
-        _ = mlx.mlx_array_free(projected);
+        _ = mlx.mlx_array_free(pre_proj_normed);
 
         // Output: [B, n_pooled, text_hidden]
         // The caller inserts exactly n_pooled image tokens into the prompt.
@@ -384,6 +469,53 @@ pub const VisionEncoder = struct {
         return mlx.mlx_array_new_data(pos_data.ptr, &shape, 3, .int32);
     }
 
+    /// Like `buildPositionGrid`, but pads the tail with (-1, -1) positions up to `max_patches`.
+    /// Matches reference vision.py:432 — padding coords are -1.
+    fn buildPositionGridPadded(self: *VisionEncoder, batch: c_int, grid_h: c_int, grid_w: c_int, num_patches: c_int, max_patches: c_int) !mlx.mlx_array {
+        _ = self;
+        _ = batch;
+        _ = grid_h;
+        const n_real: usize = @intCast(num_patches);
+        const n_total: usize = @intCast(max_patches);
+        const gw: usize = @intCast(grid_w);
+        var pos_data = try std.heap.page_allocator.alloc(i32, n_total * 2);
+        defer std.heap.page_allocator.free(pos_data);
+        for (0..n_real) |i| {
+            pos_data[i * 2] = @intCast(i % gw);
+            pos_data[i * 2 + 1] = @intCast(i / gw);
+        }
+        for (n_real..n_total) |i| {
+            pos_data[i * 2] = -1;
+            pos_data[i * 2 + 1] = -1;
+        }
+        const shape = [_]c_int{ 1, max_patches, 2 };
+        return mlx.mlx_array_new_data(pos_data.ptr, &shape, 3, .int32);
+    }
+
+    /// Build an attention mask [1, 1, 1, L] with 0 for valid keys (j < num_real) and -inf for
+    /// padding keys. Broadcasts across heads AND queries — each query row then has a non-empty
+    /// set of valid keys, so softmax never produces NaN (a symmetric Q×K mask would make
+    /// padding-row softmax sum to zero → NaN, which corrupts the slice-back into real tokens).
+    /// Padding queries' output becomes a weighted sum over valid keys; it's ignored after the
+    /// slice-back to real patches, so the values don't matter.
+    fn buildAttentionMask(self: *VisionEncoder, batch: c_int, max_patches: c_int, num_real: c_int) !mlx.mlx_array {
+        _ = batch;
+        const L: usize = @intCast(max_patches);
+        const R: usize = @intCast(num_real);
+        var mask_data = try std.heap.page_allocator.alloc(f32, L);
+        defer std.heap.page_allocator.free(mask_data);
+        const neg_inf: f32 = -std.math.inf(f32);
+        for (0..L) |j| {
+            mask_data[j] = if (j < R) 0.0 else neg_inf;
+        }
+        const shape = [_]c_int{ 1, 1, 1, max_patches };
+        const arr = mlx.mlx_array_new_data(mask_data.ptr, &shape, 4, .float32);
+        defer _ = mlx.mlx_array_free(arr);
+        var bf = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&bf, arr, .bfloat16, self.s));
+        return bf;
+    }
+
     // ── Transformer Layer (correct residual pattern) ──
 
     fn transformerLayer(
@@ -391,6 +523,7 @@ pub const VisionEncoder = struct {
         input: mlx.mlx_array,
         lw: VisionLayerWeights,
         positions: mlx.mlx_array,
+        mask: ?mlx.mlx_array,
         batch: c_int,
         seq_len: c_int,
         num_heads: c_int,
@@ -414,7 +547,7 @@ pub const VisionEncoder = struct {
             const normed = try self.rmsNorm(h, lw.input_layernorm);
             defer _ = mlx.mlx_array_free(normed);
 
-            const attn_out = try self.selfAttention(normed, lw, positions, batch, seq_len, num_heads, head_dim);
+            const attn_out = try self.selfAttention(normed, lw, positions, mask, batch, seq_len, num_heads, head_dim);
             defer _ = mlx.mlx_array_free(attn_out);
 
             // Post-norm on attention output only (NOT residual)
@@ -457,17 +590,18 @@ pub const VisionEncoder = struct {
         x: mlx.mlx_array,
         lw: VisionLayerWeights,
         positions: mlx.mlx_array,
+        mask: ?mlx.mlx_array,
         batch: c_int,
         seq_len: c_int,
         num_heads: c_int,
         head_dim: c_int,
     ) !mlx.mlx_array {
-        // Q, K, V projections (clipped linear)
-        const q_raw = try self.clippedLinear(x, lw.q_proj);
+        // Q, K, V projections
+        const q_raw = try self.linearForward(x, lw.q_proj);
         defer _ = mlx.mlx_array_free(q_raw);
-        const k_raw = try self.clippedLinear(x, lw.k_proj);
+        const k_raw = try self.linearForward(x, lw.k_proj);
         defer _ = mlx.mlx_array_free(k_raw);
-        const v_raw = try self.clippedLinear(x, lw.v_proj);
+        const v_raw = try self.linearForward(x, lw.v_proj);
         defer _ = mlx.mlx_array_free(v_raw);
 
         // Reshape to [B, seq, heads, head_dim]
@@ -526,7 +660,16 @@ pub const VisionEncoder = struct {
         var attn_weights = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_weights);
         try mlx.check(mlx.mlx_matmul(&attn_weights, q_t, k_tp, self.s));
-        // No scaling (scale=1.0)
+        // No scaling (scale=1.0); QK-norm replaces the usual 1/sqrt(d_k).
+
+        // Apply bidirectional attention mask (0 for valid-valid, -inf for padding pairs).
+        // Broadcasts along the head dim since mask is [1, 1, L, L].
+        if (mask) |m| {
+            var masked = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&masked, attn_weights, m, self.s));
+            _ = mlx.mlx_array_free(attn_weights);
+            attn_weights = masked;
+        }
 
         var attn_probs = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_probs);
@@ -548,7 +691,7 @@ pub const VisionEncoder = struct {
         defer _ = mlx.mlx_array_free(attn_flat);
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_tp, &out_shape, 3, self.s));
 
-        return self.clippedLinear(attn_flat, lw.out_proj);
+        return self.linearForward(attn_flat, lw.out_proj);
     }
 
     // ── 2D RoPE ──
@@ -710,25 +853,37 @@ pub const VisionEncoder = struct {
 
     /// MLP: down_proj(gelu(gate_proj(x)) * up_proj(x))
     fn mlpForward(self: *VisionEncoder, x: mlx.mlx_array, lw: VisionLayerWeights) !mlx.mlx_array {
-        const gate = try self.clippedLinear(x, lw.gate_proj);
+        const gate = try self.linearForward(x, lw.gate_proj);
         defer _ = mlx.mlx_array_free(gate);
 
         const gate_act = try self.geluApprox(gate);
         defer _ = mlx.mlx_array_free(gate_act);
 
-        const up = try self.clippedLinear(x, lw.up_proj);
+        const up = try self.linearForward(x, lw.up_proj);
         defer _ = mlx.mlx_array_free(up);
 
         var gated = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gated);
         try mlx.check(mlx.mlx_multiply(&gated, gate_act, up, self.s));
 
-        return self.clippedLinear(gated, lw.down_proj);
+        return self.linearForward(gated, lw.down_proj);
     }
 
     // ── Core Operations ──
 
-    fn clippedLinear(self: *VisionEncoder, x: mlx.mlx_array, cl: ClippedLinearWeight) !mlx.mlx_array {
+    fn linearForward(self: *VisionEncoder, x: mlx.mlx_array, cl: LinearWeight) !mlx.mlx_array {
+        var w_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w_t);
+        try mlx.check(mlx.mlx_transpose(&w_t, cl.weight, self.s));
+
+        if (!cl.has_clip) {
+            // Plain linear: matmul(x, w.T)
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&result, x, w_t, self.s));
+            return result;
+        }
+
+        // Clipped linear: clip(x) → matmul → clip(y)
         var clipped_in = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(clipped_in);
         try mlx.check(mlx.mlx_maximum(&clipped_in, x, cl.input_min, self.s));
@@ -736,9 +891,6 @@ pub const VisionEncoder = struct {
         defer _ = mlx.mlx_array_free(clipped_in2);
         try mlx.check(mlx.mlx_minimum(&clipped_in2, clipped_in, cl.input_max, self.s));
 
-        var w_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(w_t);
-        try mlx.check(mlx.mlx_transpose(&w_t, cl.weight, self.s));
         var y = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_matmul(&y, clipped_in2, w_t, self.s));
 
@@ -954,13 +1106,25 @@ fn getWeight(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx.mlx_
     return weights.get(n);
 }
 
-fn loadClippedLinear(weights: *const Weights, buf: *[256]u8, layer: usize, prefix: []const u8) ClippedLinearWeight {
+fn loadLinearWeight(weights: *const Weights, buf: *[256]u8, layer: usize, prefix: []const u8, clipped: bool) LinearWeight {
+    const weight = getClippedWeight(weights, buf, layer, prefix, ".linear.weight");
+    if (clipped) {
+        return .{
+            .weight = weight,
+            .has_clip = true,
+            .input_min = getClippedWeight(weights, buf, layer, prefix, ".input_min"),
+            .input_max = getClippedWeight(weights, buf, layer, prefix, ".input_max"),
+            .output_min = getClippedWeight(weights, buf, layer, prefix, ".output_min"),
+            .output_max = getClippedWeight(weights, buf, layer, prefix, ".output_max"),
+        };
+    }
     return .{
-        .weight = getClippedWeight(weights, buf, layer, prefix, ".linear.weight"),
-        .input_min = getClippedWeight(weights, buf, layer, prefix, ".input_min"),
-        .input_max = getClippedWeight(weights, buf, layer, prefix, ".input_max"),
-        .output_min = getClippedWeight(weights, buf, layer, prefix, ".output_min"),
-        .output_max = getClippedWeight(weights, buf, layer, prefix, ".output_max"),
+        .weight = weight,
+        .has_clip = false,
+        .input_min = mlx.mlx_array_new(),
+        .input_max = mlx.mlx_array_new(),
+        .output_min = mlx.mlx_array_new(),
+        .output_max = mlx.mlx_array_new(),
     };
 }
 
