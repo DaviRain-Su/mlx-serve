@@ -6,7 +6,7 @@ struct ModelDownloadView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach(gemmaModelOptions) { option in
+            ForEach(gemmaModelOptions8BitOnly) { option in
                 ModelDownloadRow(option: option)
             }
         }

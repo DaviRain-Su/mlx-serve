@@ -1,5 +1,27 @@
 # Changelog
 
+## v26.4.22 — Model Browser, Menu Bar Status Icon
+
+### Model Browser
+- **HuggingFace model search**: New "Model Browser" window searches HuggingFace Hub for MLX-format models with sortable columns (downloads, likes, RAM estimate, last updated)
+- **RAM fitness indicator**: Color-coded dot (green/yellow/red) shows whether a model fits in system RAM
+- **Capability badges**: Vision (eye) and tool calling (wrench) icons based on pipeline tag and model family heuristics
+- **Compatibility filtering**: Incompatible pipeline types (e.g. `text-to-image`) shown grayed out with reason
+- **Download integration**: Download button with progress tracking, resume support for interrupted downloads
+- **Downloaded models view**: "Downloaded" toggle switches to local filesystem view — shows models from `~/.mlx-serve/models/` with size on disk, filter field, no HuggingFace API calls
+- **Delete models**: Trash button with confirmation alert on both HuggingFace and local views — removes all downloaded files and refreshes model picker
+- **"Browse All MLX Models" button**: Added to tray menu Models section for quick access
+
+### Menu Bar Status Icon
+- **Tinted tray icon**: Menu bar icon color reflects server status — red when stopped, orange when starting, normal system tint when running
+- **Nested ObservableObject fix**: `AppState` forwards `ServerManager.objectWillChange` via Combine subscription so `MenuBarExtra` label reacts to server status changes
+
+### Other Changes
+- **Model download list**: Quick-download section in tray menu now shows 8-bit models only (filtered from full list)
+- **Window focus handling**: `openAndFocus()` updated for Model Browser window routing
+
+---
+
 ## v26.4.21 — Vision Pipeline, Prefill/Decode Metrics, AgentEngine, UX Polish
 
 ### Vision Encoder (Gemma 4 SigLIP)

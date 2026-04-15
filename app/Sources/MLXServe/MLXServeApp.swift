@@ -20,14 +20,39 @@ struct MLXCoreApp: App {
     }()
 
     @StateObject private var appState = AppState()
+    @StateObject private var hfSearch = HFSearchService()
     @Environment(\.openWindow) private var openWindow
+
+    private func menuBarIcon(for status: ServerStatus) -> NSImage {
+        let color: NSColor?
+        switch status {
+        case .running: color = nil
+        case .starting: color = .systemOrange
+        case .stopped, .error: color = .systemRed
+        }
+        guard let color else { return Self.menuBarIcon }
+        let base = Self.menuBarIcon
+        let tinted = NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.isTemplate = false
+        return tinted
+    }
 
     private func openAndFocus(_ id: String) {
         openWindow(id: id)
         NSApplication.shared.activate(ignoringOtherApps: true)
         // Bring the specific window to front
         DispatchQueue.main.async {
-            let title = id == "chat" ? "MLX Core" : "Browser"
+            let title: String
+            switch id {
+            case "chat": title = "MLX Core"
+            case "modelBrowser": title = "Model Browser"
+            default: title = "Browser"
+            }
             NSApplication.shared.windows
                 .first { $0.title == title }?
                 .makeKeyAndOrderFront(nil)
@@ -36,12 +61,12 @@ struct MLXCoreApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            StatusMenuView(openChat: { openAndFocus("chat") }, openBrowser: { openAndFocus("browser") })
+            StatusMenuView(openChat: { openAndFocus("chat") }, openBrowser: { openAndFocus("browser") }, openModelBrowser: { openAndFocus("modelBrowser") })
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
         } label: {
-            Image(nsImage: Self.menuBarIcon)
+            Image(nsImage: menuBarIcon(for: appState.server.status))
         }
         .menuBarExtraStyle(.window)
 
@@ -59,6 +84,15 @@ struct MLXCoreApp: App {
             BrowserView()
         }
         .defaultSize(width: 1024, height: 768)
+
+        Window("Model Browser", id: "modelBrowser") {
+            ModelBrowserView()
+                .environmentObject(hfSearch)
+                .environmentObject(appState)
+                .environmentObject(appState.downloads)
+                .frame(minWidth: 700, minHeight: 400)
+        }
+        .defaultSize(width: 900, height: 600)
         .commands {
             CommandMenu("Agent") {
                 Button("Edit System Prompt") {

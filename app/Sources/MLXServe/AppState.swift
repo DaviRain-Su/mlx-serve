@@ -1,9 +1,11 @@
+import Combine
 import Foundation
 import SwiftUI
 
 @MainActor
 class AppState: ObservableObject {
     @Published var server = ServerManager()
+    private var cancellables = Set<AnyCancellable>()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
     @Published var selectedModelPath: String = "" {
@@ -40,6 +42,10 @@ class AppState: ObservableObject {
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
         self.maxTokens = stored > 0 ? stored : 32768
         self.contextSize = UserDefaults.standard.integer(forKey: "contextSize") // 0 = auto
+        server.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
         refreshModels()
         loadChatHistory()
         if ProcessInfo.processInfo.environment["TESTING_MODE"] != nil {

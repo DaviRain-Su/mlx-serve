@@ -198,3 +198,5 @@ let gemmaModelOptions: [GemmaModelOption] = [
     GemmaModelOption(id: "31b-4bit", displayName: "Gemma 4 31B (4-bit)", repoId: "mlx-community/gemma-4-31b-it-4bit", sizeEstimate: "~18.4 GB, needs 36 GB+ RAM"),
     GemmaModelOption(id: "31b-8bit", displayName: "Gemma 4 31B (8-bit)", repoId: "mlx-community/gemma-4-31b-it-8bit", sizeEstimate: "~33.8 GB, needs 48 GB+ RAM"),
 ]
+
+let gemmaModelOptions8BitOnly = gemmaModelOptions.filter { $0.id.contains("8bit") }

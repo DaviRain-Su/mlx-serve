@@ -97,6 +97,7 @@ struct StatusMenuView: View {
     @State private var showLog = false
     let openChat: () -> Void
     let openBrowser: () -> Void
+    let openModelBrowser: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -277,6 +278,19 @@ struct StatusMenuView: View {
                     ModelDownloadView()
                         .environmentObject(downloads)
                         .environmentObject(appState)
+
+                    Button {
+                        openModelBrowser()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "magnifyingglass")
+                            Text("Browse All MLX Models")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .padding(.top, 4)
                 }
             }
             .padding(.horizontal, 16)

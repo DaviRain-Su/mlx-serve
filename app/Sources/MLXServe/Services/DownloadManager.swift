@@ -311,6 +311,14 @@ class DownloadManager: ObservableObject {
     }
 
     func removeIncomplete(repoId: String) {
+        removeFromDisk(repoId: repoId)
+    }
+
+    func deleteModel(repoId: String) {
+        removeFromDisk(repoId: repoId)
+    }
+
+    private func removeFromDisk(repoId: String) {
         let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
         let destDir = (modelsDir as NSString).appendingPathComponent(name)
         try? FileManager.default.removeItem(atPath: destDir)
