@@ -146,6 +146,7 @@ struct ChatDetailView: View {
     @State private var generationTask: Task<Void, Never>?
     @State private var isNearBottom = true
     @State private var scrollViewHeight: CGFloat = 0
+    @State private var contentBottom: CGFloat = 0
     @State private var scrollMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @FocusState private var inputFocused: Bool
@@ -168,17 +169,19 @@ struct ChatDetailView: View {
                                     .id(message.id)
                             }
                         }
+                        // Bottom anchor — its position relative to the scroll viewport
+                        // tells us whether the user has scrolled to the bottom.
                         Color.clear.frame(height: 1).id("bottom")
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: ContentBottomKey.self,
+                                        value: geo.frame(in: .named("chatScroll")).maxY
+                                    )
+                                }
+                            )
                     }
                     .padding(16)
-                    .background(
-                        GeometryReader { content in
-                            Color.clear.preference(
-                                key: ContentBottomKey.self,
-                                value: content.frame(in: .named("chatScroll")).maxY
-                            )
-                        }
-                    )
                 }
                 .coordinateSpace(name: "chatScroll")
                 .background(
@@ -190,17 +193,26 @@ struct ChatDetailView: View {
                     }
                 )
                 .onPreferenceChange(ScrollViewHeightKey.self) { scrollViewHeight = $0 }
-                .onPreferenceChange(ContentBottomKey.self) { contentBottom in
+                .onPreferenceChange(ContentBottomKey.self) { bottom in
+                    contentBottom = bottom
                     guard scrollViewHeight > 0 else { return }
-                    let overshoot = contentBottom - scrollViewHeight
-                    // Re-engage auto-scroll only when user scrolls back to bottom
-                    if overshoot < 60 { isNearBottom = true }
+                    // Re-engage auto-scroll when content bottom is near viewport bottom
+                    if bottom - scrollViewHeight < 60 { isNearBottom = true }
                 }
                 .onChange(of: session?.messages.count) { _, _ in
                     if isNearBottom { scrollToBottom(proxy) }
                 }
                 .onChange(of: session?.messages.last?.content) { _, _ in
                     if isNearBottom { scrollToBottom(proxy) }
+                }
+                .overlay(alignment: .trailing) {
+                    // Right-edge strip: accent tint when auto-scroll is on, fades out when off.
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.accentColor.opacity(isNearBottom ? 0.4 : 0))
+                        .frame(width: 4)
+                        .padding(.vertical, 4)
+                        .animation(.easeInOut(duration: 0.3), value: isNearBottom)
+                        .allowsHitTesting(false)
                 }
             }
 
@@ -263,13 +275,15 @@ struct ChatDetailView: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .focused($inputFocused)
-                        .disabled(server.status != .running || isGenerating)
-                        .onKeyPress(.return, phases: .down) { press in
+                        .disabled(server.status != .running)
+                        .onKeyPress(keys: [.return, .init("\u{03}")], phases: .down) { press in
                             if press.modifiers.contains(.shift) {
                                 inputText += "\n"
                                 return .handled
                             }
-                            sendMessage()
+                            if !isGenerating {
+                                sendMessage()
+                            }
                             return .handled
                         }
                         .onAppear {
@@ -378,10 +392,16 @@ struct ChatDetailView: View {
             inputFocused = true
             isAgentMode = session?.mode == .agent
             scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-                // Only disengage on upward scroll (viewing earlier messages).
-                // Scrolling down toward the bottom lets the preference handler re-engage.
                 if event.scrollingDeltaY > 0 {
+                    // Scrolling up — disengage auto-scroll
                     isNearBottom = false
+                } else if event.scrollingDeltaY < -1 {
+                    // Scrolling down — re-engage if content bottom is near viewport bottom.
+                    // The preference handler catches this when content changes, but during
+                    // generation pauses the user needs scroll events to re-engage.
+                    if scrollViewHeight > 0 && contentBottom - scrollViewHeight < 80 {
+                        isNearBottom = true
+                    }
                 }
                 return event
             }
@@ -479,16 +499,11 @@ struct ChatDetailView: View {
     /// Latest context usage from the most recent assistant message with token data.
     private var contextUsage: (promptTokens: Int, contextLength: Int)? {
         guard let messages = session?.messages else { return nil }
-        // Find last message with prompt token data
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
-            let ctxLen: Int
-            if appState.contextSize > 0 {
-                ctxLen = appState.contextSize
-            } else if let modelCtx = server.modelInfo?.contextLength, modelCtx > 0 {
-                ctxLen = modelCtx
-            } else {
-                ctxLen = 32768
-            }
+            let ctxLen = AgentEngine.effectiveContextLength(
+                appContextSize: appState.contextSize,
+                modelContextLength: server.modelInfo?.contextLength
+            )
             return (promptTokens: last.promptTokens!, contextLength: ctxLen)
         }
         return nil
@@ -640,20 +655,28 @@ struct ChatDetailView: View {
         let maxIterations = 150
         var padRetries = 0
         let padRetryPolicy = RetryPolicy.aggressive
-        var recentToolNames: [String] = [] // sliding window for repetition detection
-        var permanentlyBlocked: Set<String> = [] // tools blocked for the rest of this loop
+        let repetition = AgentEngine.RepetitionTracker()
         var truncationRetries = 0
 
-        for _ in 0..<maxIterations {
+        for iteration in 0..<maxIterations {
             try Task.checkCancellation()
 
             // Build message history for API
-            var history = buildAgentHistory()
+            let contextLength = AgentEngine.effectiveContextLength(
+                appContextSize: appState.contextSize,
+                modelContextLength: server.modelInfo?.contextLength
+            )
+            var history = AgentEngine.buildAgentHistory(
+                messages: session?.messages ?? [],
+                contextLength: contextLength,
+                maxTokens: appState.maxTokens,
+                buildMultimodalContent: Self.buildMultimodalContent
+            )
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
             var systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             if let wd = workingDirectory {
-                systemPrompt += "\n\n# Working Directory\nYour working directory is `\(wd)`. All file tool operations are confined to this directory — paths that resolve outside it will be rejected. Use relative paths. Shell commands run here by default."
+                systemPrompt += AgentEngine.workingDirectoryContext(wd)
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
@@ -663,15 +686,7 @@ struct ChatDetailView: View {
             }
             messages.append(contentsOf: history)
 
-            // Debug: dump the exact request body to file for analysis
-            // Uses pre-serialized tools JSON to preserve property key order (path before content)
-            do {
-                let debugPath = NSString(string: "~/.mlx-serve/last-agent-request.json").expandingTildeInPath
-                let messagesData = try JSONSerialization.data(withJSONObject: messages, options: .prettyPrinted)
-                let messagesStr = String(data: messagesData, encoding: .utf8) ?? "[]"
-                let debugJSON = "{\n  \"model\": \"mlx-serve\",\n  \"max_tokens\": \(appState.maxTokens),\n  \"temperature\": 0.7,\n  \"stream\": true,\n  \"messages\": \(messagesStr),\n  \"tools\": \(AgentPrompt.toolDefinitionsJSON)\n}"
-                try debugJSON.data(using: .utf8)?.write(to: URL(fileURLWithPath: debugPath))
-            } catch { /* ignore debug errors */ }
+            AgentEngine.dumpDebugRequest(messages: messages, maxTokens: appState.maxTokens)
 
             // Add streaming assistant message
             var streamMsg = ChatMessage(role: .assistant, content: "")
@@ -714,12 +729,10 @@ struct ChatDetailView: View {
             // drop the broken message, tell the model what happened, and retry.
             if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
                 truncationRetries += 1
-                // Remove the broken assistant message
                 if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                    !appState.chatSessions[sIdx].messages.isEmpty {
                     appState.chatSessions[sIdx].messages.removeLast()
                 }
-                // Add a user nudge so the model adapts its approach
                 let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
                 appState.appendMessage(to: sessionId, message: nudge)
                 continue
@@ -733,7 +746,6 @@ struct ChatDetailView: View {
                     .replacingOccurrences(of: "<pad>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if cleaned.isEmpty {
-                    // Remove the empty/pad message
                     if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                        !appState.chatSessions[sIdx].messages.isEmpty {
                         appState.chatSessions[sIdx].messages.removeLast()
@@ -742,9 +754,8 @@ struct ChatDetailView: View {
                     if padRetries <= padRetryPolicy.maxRetries {
                         let delay = padRetryPolicy.delay(for: padRetries)
                         try? await Task.sleep(nanoseconds: delay)
-                        continue // retry with backoff
+                        continue
                     }
-                    // Give up — show error
                     let errorMsg = ChatMessage(role: .assistant, content: "The model couldn't generate a response. Try rephrasing or starting a new chat.")
                     appState.appendMessage(to: sessionId, message: errorMsg)
                     return
@@ -754,25 +765,8 @@ struct ChatDetailView: View {
             // If no tool calls, we're done
             guard !receivedToolCalls.isEmpty else { return }
 
-            // Repetition detection: track tool names per round (deduplicated).
-            // If same read-only tool appears too often in the sliding window, permanently block it.
-            // Write tools (writeFile, editFile, shell) are never blocked — they make progress.
-            // Browse/webSearch get a higher threshold (8 in 12) since they're inherently multi-step.
-            // Other read-only tools use a tight threshold (4 in 6).
-            let writeTools: Set<String> = ["writeFile", "editFile", "shell"]
-            let browseTools: Set<String> = ["browse", "webSearch"]
-            let uniqueNames = Set(receivedToolCalls.map { $0.name })
-            recentToolNames.append(contentsOf: uniqueNames)
-            if recentToolNames.count > 12 { recentToolNames = Array(recentToolNames.suffix(12)) }
-            for name in uniqueNames {
-                if writeTools.contains(name) { continue }
-                let count = recentToolNames.filter({ $0 == name }).count
-                let threshold = browseTools.contains(name) ? 8 : 4
-                if count >= threshold {
-                    permanentlyBlocked.insert(name)
-                }
-            }
-            let blockedTools = permanentlyBlocked
+            // Track repetition for this round
+            repetition.track(toolCalls: receivedToolCalls)
 
             // Store tool calls on the assistant message for history replay
             if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
@@ -785,7 +779,7 @@ struct ChatDetailView: View {
                 }
             }
 
-            // Show tool call summary as display-only message (not appended to assistant content)
+            // Show tool call summary as display-only message
             let callSummary = receivedToolCalls.map { tc in
                 let args = tc.arguments.map { "\($0.key): \($0.value.prefix(80))" }.joined(separator: ", ")
                 let display = args.isEmpty ? tc.rawArguments.prefix(200) : args[...]
@@ -796,87 +790,28 @@ struct ChatDetailView: View {
             appState.appendMessage(to: sessionId, message: summaryMsg)
 
             // Execute each tool call
-            var toolResults: [(id: String, name: String, output: String)] = []
             for tc in receivedToolCalls {
                 try Task.checkCancellation()
-                let tool = AgentToolKind(rawValue: tc.name)
+                let result = await AgentEngine.executeToolCall(
+                    tc, workingDirectory: &workingDirectory,
+                    repetition: repetition, iteration: iteration,
+                    agentMemory: appState.agentMemory
+                )
 
-                // Smart fallback: editFile with content but no find → writeFile
-                let effectiveTool: AgentToolKind?
-                if tool == .editFile && tc.arguments["content"] != nil && tc.arguments["find"] == nil {
-                    effectiveTool = .writeFile
-                } else {
-                    effectiveTool = tool
-                }
-
-                // Handle cwd tool: change working directory for subsequent calls
-                let output: String
-                if effectiveTool == .cwd {
-                    if let path = tc.arguments["path"] {
-                        let resolved: String
-                        if path.hasPrefix("/") || path.hasPrefix("~") {
-                            resolved = NSString(string: path).expandingTildeInPath
-                        } else if let wd = workingDirectory {
-                            resolved = (wd as NSString).appendingPathComponent(path)
-                        } else {
-                            resolved = path
-                        }
-                        let normalized = (resolved as NSString).standardizingPath
-                        var isDir: ObjCBool = false
-                        if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
-                            workingDirectory = normalized
-                            output = "Changed working directory to \(normalized)"
-                        } else {
-                            output = "Error: '\(normalized)' is not a directory"
-                        }
-                    } else {
-                        output = "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
-                    }
-                } else if blockedTools.contains(tc.name) {
-                    output = "BLOCKED: \(tc.name) has been called too many times in a row. This tool is now disabled for this task. Use writeFile to create files, readFile to read them, editFile to modify them, and shell for commands."
-                } else {
-                    // Pre-validate required params
-                    let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
-                    if !missing.isEmpty {
-                        if (tc.name == "writeFile" || tc.name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
-                            output = "Error: \(tc.name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
-                        } else {
-                            let example = Self.toolExample(for: tc.name)
-                            output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
-                        }
-                    } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
-                        do {
-                            output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
-                            if effectiveTool == .shell, let cmd = tc.arguments["command"] {
-                                appState.agentMemory.recordCommand(cmd)
-                            }
-                        } catch {
-                            let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                            output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
-                        }
-                    } else {
-                        output = "Error: Unknown tool '\(tc.name)'"
-                    }
-                }
-                toolResults.append((id: tc.id, name: tc.name, output: output))
-
-                // Show result in chat (display-only, marked so it's excluded from API history)
-                var resultMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → \(String(output.prefix(500)))")
-                resultMsg.isAgentSummary = true // reuse flag to mark as display-only
+                // Show result in chat (display-only)
+                var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")
+                resultMsg.isAgentSummary = true
                 appState.appendMessage(to: sessionId, message: resultMsg)
-            }
 
-            // Add tool results as tool role messages to the session
-            for tr in toolResults {
+                // Store tool result as tool role message
                 var toolMsg = ChatMessage(role: .system, content: "")
-                toolMsg.toolCallId = tr.id
-                toolMsg.toolName = tr.name
+                toolMsg.toolCallId = result.id
+                toolMsg.toolName = result.name
 
                 // Extract screenshot image data and attach as vision input
-                if tr.name == "browse" && tr.output.contains("data:image/jpeg;base64,") {
-                    if let range = tr.output.range(of: "data:image/jpeg;base64,") {
-                        // Take only the base64 portion — stop at newline or end of string
-                        let remainder = tr.output[range.upperBound...]
+                if result.name == "browse" && result.output.contains("data:image/jpeg;base64,") {
+                    if let range = result.output.range(of: "data:image/jpeg;base64,") {
+                        let remainder = result.output[range.upperBound...]
                         let b64End = remainder.firstIndex(of: "\n") ?? remainder.endIndex
                         let b64 = String(remainder[..<b64End])
                         if let jpegData = Data(base64Encoded: b64),
@@ -884,13 +819,13 @@ struct ChatDetailView: View {
                             toolMsg.images = [chatImage]
                             toolMsg.content = "[screenshot captured]"
                         } else {
-                            toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                            toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                         }
                     } else {
-                        toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                        toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                     }
                 } else {
-                    toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                    toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                 }
                 appState.appendMessage(to: sessionId, message: toolMsg)
             }
@@ -901,288 +836,6 @@ struct ChatDetailView: View {
         appState.appendMessage(to: sessionId, message: msg)
     }
 
-    // MARK: - Tool Result Overflow
-
-    /// Per-tool context caps (chars). Oversized results are saved to disk.
-    static let toolResultCaps: [String: Int] = [
-        "shell": 6000,
-        "readFile": 8000,
-        "searchFiles": 4000,
-        "listFiles": 4000,
-        "webSearch": 2000,
-        "browse": 3000,
-        "editFile": 2000,
-        "writeFile": 2000,
-        "saveMemory": 500,
-    ]
-
-    /// Truncate tool output, saving full result to disk if oversized.
-    /// Returns the (possibly truncated) output for context inclusion.
-    static func truncateWithOverflow(_ output: String, toolCallId: String, toolName: String) -> String {
-        let maxChars = toolResultCaps[toolName] ?? 4000
-        guard output.count > maxChars else { return output }
-
-        // Save full output to disk for debugging, but don't tell the model to read it
-        // (the file is outside the workspace so readFile would be blocked by confinement)
-        let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
-        let path = (dir as NSString).appendingPathComponent("\(toolCallId).txt")
-        try? output.write(toFile: path, atomically: true, encoding: .utf8)
-
-        let preview = String(output.prefix(maxChars))
-        return "\(preview)\n\n[... truncated at \(maxChars) of \(output.count) chars]"
-    }
-
-    /// Clean up overflow files older than 24 hours. Called on session start.
-    static func cleanupOverflowFiles() {
-        let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return }
-        let cutoff = Date().addingTimeInterval(-86400)
-        for file in files {
-            let path = (dir as NSString).appendingPathComponent(file)
-            if let attrs = try? fm.attributesOfItem(atPath: path),
-               let modified = attrs[.modificationDate] as? Date,
-               modified < cutoff {
-                try? fm.removeItem(atPath: path)
-            }
-        }
-    }
-
-    // MARK: - Token-Aware Context Management
-
-    /// Rough token estimation: ~4 bytes per token (no tokenizer needed).
-    private func roughTokenCount(_ s: String) -> Int {
-        max(1, s.utf8.count / 4)
-    }
-
-    /// Estimate token cost for a message including role/format overhead.
-    private func tokenCostForMessage(_ msg: ChatMessage) -> Int {
-        var cost = 4  // role + formatting envelope
-        cost += roughTokenCount(msg.content)
-        if let tcs = msg.toolCalls {
-            for tc in tcs {
-                cost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
-            }
-        }
-        return cost
-    }
-
-    /// Determine effective context length from user config or model metadata.
-    private var effectiveContextLength: Int {
-        if appState.contextSize > 0 { return appState.contextSize }
-        if let modelCtx = server.modelInfo?.contextLength, modelCtx > 0 { return modelCtx }
-        return 32768  // safe default
-    }
-
-    private func buildAgentHistory() -> [[String: Any]] {
-        let allMessages = session?.messages ?? []
-
-        // Compute token budget for history
-        let contextLength = effectiveContextLength
-        let safetyBuffer = 1024
-        // System prompt is assembled in runAgentLoop; estimate its cost here
-        let systemPromptCost = roughTokenCount(AgentPrompt.systemPrompt + AgentPrompt.memory)
-        let budget = max(1024, contextLength - appState.maxTokens - safetyBuffer - systemPromptCost)
-
-        // Always pin the first user message (the original task) AND the first
-        // assistant response (the plan). Without pinning the plan, context pressure
-        // drops the assistant's intent and the model re-interprets the original
-        // message literally (e.g. "say hi" → just replies "hi" mid-task).
-        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
-        let firstAssistantIdx: Int? = {
-            guard let uIdx = firstUserIdx else { return nil }
-            let afterUser = allMessages.index(after: uIdx)
-            guard afterUser < allMessages.count else { return nil }
-            return allMessages[afterUser...].firstIndex {
-                $0.role == .assistant && !$0.isAgentSummary && !$0.content.isEmpty
-            }
-        }()
-        var pinnedCost = 0
-        if let idx = firstUserIdx {
-            pinnedCost += roughTokenCount(allMessages[idx].content) + 4
-        }
-        if let idx = firstAssistantIdx {
-            let content = allMessages[idx].content
-            // Truncate the plan to 500 chars to avoid blowing the budget on a long first response
-            pinnedCost += roughTokenCount(String(content.prefix(500))) + 4
-            if let tcs = allMessages[idx].toolCalls {
-                for tc in tcs {
-                    pinnedCost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
-                }
-            }
-        }
-
-        // Walk backward from newest message, accumulating token costs
-        var remainingBudget = budget - pinnedCost
-        var includeStartIdx = allMessages.count  // exclusive start (will walk backward)
-
-        for i in stride(from: allMessages.count - 1, through: 0, by: -1) {
-            let msg = allMessages[i]
-            // Skip messages that won't be included in history
-            if msg.role == .system && msg.toolCallId == nil { continue }
-            if msg.isAgentSummary { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
-
-            let cost = tokenCostForMessage(msg)
-            if cost > remainingBudget { break }
-            remainingBudget -= cost
-            includeStartIdx = i
-        }
-
-        // Determine if first user/assistant messages need pinning (fell outside included range)
-        let needsPin = firstUserIdx != nil && firstUserIdx! < includeStartIdx
-        let needsPinAssistant = firstAssistantIdx != nil && firstAssistantIdx! < includeStartIdx
-
-        // Auto-compact: when context is squeezed, truncate tool results harder.
-        // Normal: recent=2000, older=500. Squeezed (<25% free): recent=500, older=100.
-        let freeRatio = Double(remainingBudget + pinnedCost) / Double(budget + pinnedCost)
-        let squeezed = freeRatio < 0.25
-        let recentLimit = squeezed ? 500 : 2000
-        let olderLimit = squeezed ? 100 : 500
-
-        // Count tool results in included range for progressive truncation
-        let window = Array(allMessages[includeStartIdx..<allMessages.count])
-        let totalToolResults = window.filter { $0.toolCallId != nil }.count
-        var toolResultsSeen = 0
-
-        var history: [[String: Any]] = []
-
-        // Pin the first user message + assistant plan if they fell outside the window.
-        // Strip images from pinned messages — server only processes last user message's images.
-        if needsPin, let idx = firstUserIdx {
-            history.append(["role": "user", "content": allMessages[idx].content])
-        }
-        if needsPinAssistant, let idx = firstAssistantIdx {
-            let msg = allMessages[idx]
-            var content = msg.content
-                .replacingOccurrences(of: "<pad>", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if content.count > 500 {
-                content = String(content.prefix(500)) + "..."
-            }
-            var dict: [String: Any] = ["role": "assistant"]
-            if !content.isEmpty { dict["content"] = content }
-            // Include tool_calls if present so the model remembers its initial actions
-            if let tcs = msg.toolCalls, !tcs.isEmpty {
-                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                    [
-                        "id": tc.id,
-                        "type": "function",
-                        "function": [
-                            "name": tc.name,
-                            "arguments": tc.arguments
-                        ] as [String: Any]
-                    ]
-                }
-            }
-            history.append(dict)
-        }
-
-        // Find the last user message in the window — only IT gets image content blocks.
-        // Server only processes images from the last user message; re-sending old images
-        // wastes bandwidth and confuses the vision encoder with stale features.
-        let lastUserMsgId = window.last(where: { $0.role == .user && $0.toolCallId == nil })?.id
-
-        for msg in window {
-            // Tool response messages — truncate older results more aggressively
-            if let callId = msg.toolCallId {
-                let isRecent = toolResultsSeen >= totalToolResults - 2
-                let limit = isRecent ? recentLimit : olderLimit
-                toolResultsSeen += 1
-                history.append([
-                    "role": "tool",
-                    "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit)),
-                ])
-                continue
-            }
-            if msg.role == .system { continue }
-            if msg.isAgentSummary { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
-
-            // Assistant messages with tool_calls: include tool_calls in OpenAI format
-            if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
-                var dict: [String: Any] = ["role": "assistant"]
-                let content = msg.content
-                    .replacingOccurrences(of: "<pad>", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                dict["content"] = content.isEmpty ? "" : content
-                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                    [
-                        "id": tc.id,
-                        "type": "function",
-                        "function": [
-                            "name": tc.name,
-                            "arguments": tc.arguments
-                        ] as [String: Any]
-                    ]
-                }
-                history.append(dict)
-                continue
-            }
-
-            if msg.role == .assistant && msg.content.isEmpty { continue }
-            var content = msg.content
-                .replacingOccurrences(of: "<pad>", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if msg.role == .assistant && content.count > 500 {
-                content = String(content.prefix(500)) + "..."
-            }
-            if content.isEmpty { continue }
-            var dict: [String: Any] = ["role": msg.role.rawValue]
-            // Only include images for the last user message
-            if msg.id == lastUserMsgId, let imgs = msg.images, !imgs.isEmpty {
-                dict["content"] = Self.buildMultimodalContent(text: content, images: imgs)
-            } else {
-                dict["content"] = content
-            }
-            history.append(dict)
-        }
-
-        return history
-    }
-
-    /// Check which required params are missing for a tool call.
-    private static func missingRequiredParams(for toolName: String, arguments: [String: String]) -> [String] {
-        for def in AgentPrompt.toolDefinitions {
-            guard let fn = def["function"] as? [String: Any],
-                  fn["name"] as? String == toolName,
-                  let params = fn["parameters"] as? [String: Any],
-                  let required = params["required"] as? [String] else { continue }
-            return required.filter { key in
-                guard let val = arguments[key] else { return true }
-                return val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        }
-        return []
-    }
-
-    /// Get the example JSON format from a tool's description.
-    private static func toolExample(for toolName: String) -> String {
-        for def in AgentPrompt.toolDefinitions {
-            guard let fn = def["function"] as? [String: Any],
-                  fn["name"] as? String == toolName,
-                  let desc = fn["description"] as? String,
-                  let range = desc.range(of: "Example: ") else { continue }
-            return String(desc[range.upperBound...])
-        }
-        return "{}"
-    }
-
-    private var toolHandlers: [AgentToolKind: any ToolHandler] {
-        [
-            .shell: ShellHandler(),
-            .readFile: ReadFileHandler(),
-            .writeFile: WriteFileHandler(),
-            .editFile: EditFileHandler(),
-            .searchFiles: SearchFilesHandler(),
-            .listFiles: ListFilesHandler(),
-            .browse: BrowseHandler(),
-            .webSearch: WebSearchHandler(),
-            .saveMemory: SaveMemoryHandler(),
-        ]
-    }
 }
 
 // MARK: - Context Monitor
@@ -1233,6 +886,160 @@ struct ContextMonitor: View {
         }
         .padding(.horizontal, 12)
         .padding(.top, 4)
+    }
+}
+
+// MARK: - Generating Indicator
+
+/// Animated indicator shown while the model is generating, with live GPU and memory stats.
+struct GeneratingIndicator: View {
+    @State private var gpuPercent: Int = 0
+    @State private var memPercent: Int = 0
+    @State private var whimsy: String = Self.randomWhimsy()
+    @State private var timer: Timer?
+    @State private var startDate = Date()
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let elapsed = context.date.timeIntervalSince(startDate)
+            let outerAngle = elapsed * 120  // degrees per second
+            let innerAngle = -elapsed * 168 // counter-rotate, slightly faster
+
+            HStack(spacing: 8) {
+                // Spinning arcs — continuous, no reset
+                ZStack {
+                    // Outer arc — GPU usage mapped to arc length
+                    Circle()
+                        .trim(from: 0, to: max(0.1, Double(gpuPercent) / 100.0))
+                        .stroke(gpuColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .frame(width: 18, height: 18)
+                        .rotationEffect(.degrees(outerAngle))
+
+                    // Inner arc — memory
+                    Circle()
+                        .trim(from: 0, to: max(0.1, Double(memPercent) / 100.0))
+                        .stroke(memColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .frame(width: 10, height: 10)
+                        .rotationEffect(.degrees(innerAngle))
+
+                    // Center dot pulses with GPU activity
+                    Circle()
+                        .fill(gpuColor)
+                        .frame(width: 3, height: 3)
+                        .scaleEffect(1.0 + 0.3 * sin(elapsed * 4))
+                }
+                .frame(width: 20, height: 20)
+
+                // Stats + whimsy
+                Text("GPU \(gpuPercent)%")
+                    .foregroundStyle(gpuColor)
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text("Mem \(memPercent)%")
+                    .foregroundStyle(memColor)
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text(whimsy)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+        }
+        .onAppear {
+            startDate = Date()
+            pollMetrics()
+            timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+                pollMetrics()
+            }
+        }
+        .onDisappear {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+
+    private var gpuColor: Color {
+        if gpuPercent > 80 { return .orange }
+        if gpuPercent > 50 { return .green }
+        return .blue
+    }
+
+    private var memColor: Color {
+        if memPercent > 85 { return .red }
+        if memPercent > 70 { return .orange }
+        return .secondary
+    }
+
+    private func pollMetrics() {
+        gpuPercent = Int(SystemMetrics.gpuUtilization())
+        memPercent = Int(SystemMetrics.memoryPressure())
+        // Rotate whimsy every ~3 seconds
+        if Int(Date().timeIntervalSince(startDate)) % 3 == 0 {
+            withAnimation(.easeInOut(duration: 0.3)) {
+                whimsy = Self.randomWhimsy()
+            }
+        }
+    }
+
+    private static let whimsies = [
+        "marinating", "boondoggling", "razzle-dazzling", "percolating",
+        "simmering", "noodling", "cogitating", "ruminating",
+        "brainstorming", "daydreaming", "scheming", "concocting",
+        "fermenting", "hatching", "brewing", "stewing",
+        "tinkering", "finagling", "wrangling", "bamboozling",
+        "gallivanting", "meandering", "pondering", "mulling",
+        "churning", "synthesizing", "vibing", "manifesting",
+        "jazz-handing", "shimmer-thinking", "pixel-wrangling",
+        "quantum-leaping", "brain-tickling", "thought-juggling",
+    ]
+
+    private static func randomWhimsy() -> String {
+        whimsies.randomElement() ?? "thinking"
+    }
+}
+
+/// Reads macOS GPU utilization and memory pressure via IOKit/Mach (same APIs as status.zig).
+enum SystemMetrics {
+
+    /// GPU utilization percentage (0–100) via IOKit AGXAccelerator.
+    static func gpuUtilization() -> UInt32 {
+        var iter: io_iterator_t = 0
+        guard let matching = IOServiceMatching("AGXAccelerator") else { return 0 }
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == KERN_SUCCESS else { return 0 }
+        defer { IOObjectRelease(iter) }
+
+        let entry = IOIteratorNext(iter)
+        guard entry != 0 else { return 0 }
+        defer { IOObjectRelease(entry) }
+
+        var propsRef: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(entry, &propsRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = propsRef?.takeRetainedValue() as? [String: Any],
+              let perf = props["PerformanceStatistics"] as? [String: Any],
+              let util = perf["Device Utilization %"] as? Int else { return 0 }
+        return UInt32(min(max(util, 0), 100))
+    }
+
+    /// System memory pressure as percentage (0–100) via Mach host_statistics64.
+    static func memoryPressure() -> UInt32 {
+        var totalMem: UInt64 = 0
+        var len = MemoryLayout<UInt64>.size
+        guard sysctlbyname("hw.memsize", &totalMem, &len, nil, 0) == 0, totalMem > 0 else { return 0 }
+
+        var pageSize: vm_size_t = 0
+        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS, pageSize > 0 else { return 0 }
+
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<Int32>.size)
+        let result = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+
+        let used = (UInt64(stats.active_count) + UInt64(stats.wire_count) + UInt64(stats.compressor_page_count)) * UInt64(pageSize)
+        return UInt32(used * 100 / totalMem)
     }
 }
 
@@ -1295,8 +1102,7 @@ struct MessageBubble: View {
                                 .textSelection(.enabled)
                         }
                         if message.isStreaming {
-                            ProgressView()
-                                .controlSize(.mini)
+                            GeneratingIndicator()
                         }
                     }
                     .padding(.horizontal, 12)
@@ -1336,6 +1142,13 @@ struct MessageBubble: View {
 struct MarkdownText: View {
     let source: String
 
+    /// Tags emitted by models (thinking, planning, etc.) — rendered as XML blocks.
+    /// Standard HTML tags (head, div, meta, etc.) are NOT included — they render as text.
+    private static let modelTags: Set<String> = [
+        "pad", "plan", "thinking", "thought", "reflection", "output",
+        "step", "result", "answer", "reasoning", "tool_call", "tool_response",
+    ]
+
     init(_ source: String) {
         self.source = source
     }
@@ -1370,9 +1183,17 @@ struct MarkdownText: View {
         while i < lines.count {
             let line = lines[i]
 
-            // XML-like tag block (<plan>...</plan>, <pad>, etc.)
+            // XML-like tag block for model-specific tags (<plan>, <pad>, <thinking>, etc.)
+            // Only match known model tags — NOT standard HTML tags like <head>, <div>, <meta>.
             if let match = line.range(of: "^<([a-zA-Z_]+)>", options: .regularExpression) {
                 let tag = String(line[match]).dropFirst().dropLast() // extract tag name
+                guard Self.modelTags.contains(String(tag)) else {
+                    // Not a model tag — fall through to normal paragraph handling
+                    i += 1
+                    let text = line.trimmingCharacters(in: .whitespaces)
+                    if !text.isEmpty { blocks.append(.paragraph(text)) }
+                    continue
+                }
                 let closeTag = "</\(tag)>"
                 if line.contains(closeTag) {
                     // Single-line tag block
@@ -1395,13 +1216,19 @@ struct MarkdownText: View {
                 continue
             }
 
-            // Standalone tags like <pad><pad><pad>
+            // Standalone model tags like <pad><pad><pad>
             if line.hasPrefix("<") && line.contains(">") && !line.hasPrefix("<http") {
                 let stripped = line.trimmingCharacters(in: .whitespaces)
                 if stripped.range(of: "^(<[a-zA-Z_/]+>\\s*)+$", options: .regularExpression) != nil {
-                    blocks.append(.xmlBlock(stripped))
-                    i += 1
-                    continue
+                    // Only treat as XML block if ALL tags are model tags
+                    let tagNames = stripped.components(separatedBy: ">")
+                        .compactMap { $0.components(separatedBy: "<").last?.replacingOccurrences(of: "/", with: "") }
+                        .filter { !$0.isEmpty }
+                    if tagNames.allSatisfy({ Self.modelTags.contains($0) }) {
+                        blocks.append(.xmlBlock(stripped))
+                        i += 1
+                        continue
+                    }
                 }
             }
 

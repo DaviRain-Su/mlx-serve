@@ -14,6 +14,9 @@ class AppState: ObservableObject {
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
     let testServer = TestServer()
+    @Published var hasSeenWelcome: Bool {
+        didSet { UserDefaults.standard.set(hasSeenWelcome, forKey: "hasSeenWelcome") }
+    }
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
     }
@@ -31,6 +34,7 @@ class AppState: ObservableObject {
     }()
 
     init() {
+        self.hasSeenWelcome = UserDefaults.standard.bool(forKey: "hasSeenWelcome")
         self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
@@ -41,7 +45,16 @@ class AppState: ObservableObject {
         if ProcessInfo.processInfo.environment["TESTING_MODE"] != nil {
             testServer.start(appState: self)
         }
-        ChatDetailView.cleanupOverflowFiles()
+        AgentEngine.cleanupOverflowFiles()
+
+        // Show welcome window on first launch
+        if !hasSeenWelcome {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                Self.showWelcomeWindow {
+                    self?.hasSeenWelcome = true
+                }
+            }
+        }
 
         // Auto-start server if enabled and a model is available
         if autoStartServer, !selectedModelPath.isEmpty {
@@ -168,4 +181,35 @@ class AppState: ObservableObject {
         chatSessions = (try? decoder.decode([ChatSession].self, from: data)) ?? []
         activeChatId = chatSessions.first?.id
     }
+
+    // MARK: - Welcome Window
+
+    private static func showWelcomeWindow(onDismiss: @escaping () -> Void) {
+        let view = WelcomeView(onDismiss: onDismiss)
+        let hostingView = NSHostingView(rootView: view)
+
+        // Let SwiftUI compute the intrinsic size
+        let fittingSize = hostingView.fittingSize
+        hostingView.frame = NSRect(origin: .zero, size: fittingSize)
+
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: fittingSize),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        _welcomeWindow = window
+    }
+
+    private static var _welcomeWindow: NSWindow?
 }

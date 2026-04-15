@@ -112,6 +112,16 @@ pub fn main() !void {
         }
     }
 
+    // In serve mode, check if the port is already in use before loading the model
+    // (model loading takes seconds — fail fast instead of wasting time)
+    if (serve_mode) {
+        if (portInUse(port)) {
+            log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
+            log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
+            std.process.exit(1);
+        }
+    }
+
     // Print MLX version
     var ver = mlx.mlx_string_new();
     defer _ = mlx.mlx_string_free(ver);
@@ -313,4 +323,15 @@ pub fn main() !void {
         const msg2 = std.fmt.bufPrint(&stat_buf2, "Peak memory: {d:.3} GB\n", .{peak_gb}) catch unreachable;
         try stdout.writeAll(msg2);
     }
+}
+
+/// Check if a port is already in use by trying to connect to it.
+fn portInUse(port: u16) bool {
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
+    defer std.posix.close(sock);
+
+    // If connect succeeds, something is already listening
+    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+    return true;
 }

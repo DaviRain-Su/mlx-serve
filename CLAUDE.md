@@ -39,13 +39,14 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `app/Sources/MLXServe/Models/AgentModels.swift` | `AgentToolKind`, `AgentPlan`, `StepResult` |
 | `app/Sources/MLXServe/Services/APIClient.swift` | HTTP + SSE streaming client for mlx-serve |
 | `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt, tool definitions (10 tools), `SkillManager` (prompt-based skills from `~/.mlx-serve/skills/`) |
+| `app/Sources/MLXServe/Services/AgentEngine.swift` | Shared agent logic: history building, tool execution, repetition tracking, token estimation, overflow management |
 | `app/Sources/MLXServe/Services/ToolExecutor.swift` | Tool handlers: shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory |
 | `app/Sources/MLXServe/Services/ImagePreprocessor.swift` | Image preprocessing for vision encoder (resize, float32 CHW conversion) |
 | `app/Sources/MLXServe/Services/BrowserManager.swift` | WKWebView (headless, created eagerly for background browsing) |
 | `app/Sources/MLXServe/Services/ServerManager.swift` | mlx-serve process lifecycle, stderr capture (`serverLog`), auto-start |
-| `app/Sources/MLXServe/Services/TestServer.swift` | Embedded HTTP server (port 8090) for test automation — same code path as UI |
+| `app/Sources/MLXServe/Services/TestServer.swift` | Embedded HTTP server (port 8090) for test automation — uses AgentEngine for shared logic |
 | `app/Sources/MLXServe/Services/AgentMemory.swift` | Agent context memory (recent dirs, commands) |
-| `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + `buildAgentHistory()` + image attachment + context monitor |
+| `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + image attachment + context monitor |
 | `app/Sources/MLXServe/Views/StatusMenuView.swift` | Menu bar UI, server log viewer, Claude Code launcher |
 | `app/Sources/MLXServe/Views/BrowserView.swift` | Browser window (uses shared WKWebView) |
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.4.21 — Vision Pipeline, Prefill/Decode Metrics, 3x Prefill Speedup
+## v26.4.21 — Vision Pipeline, Prefill/Decode Metrics, AgentEngine, UX Polish
 
 ### Vision Encoder (Gemma 4 SigLIP)
 - **Full vision pipeline**: Gemma 4 models can now process images end-to-end — SigLIP vision encoder with patch embedding, 2D RoPE, clipped linears, position pooling, and embedding projection
@@ -82,6 +82,51 @@
 ### Testing
 - **`tests/test_vision.sh`**: Vision pipeline integration tests
 - **`tests/fixtures/`**: Test image fixtures for vision tests
+
+### AgentEngine — Shared Agent Logic (DRY refactor)
+- **New `AgentEngine.swift`**: Extracted ~350 lines of duplicated agent logic from `ChatView.swift` and `TestServer.swift` into a single shared module — history building, tool execution, repetition tracking, token estimation, overflow management, debug dump
+- **`RepetitionTracker` class**: Encapsulates three-phase tool repetition state (warn → soft block → escalation) with arg-aware tracking — `listFiles("src")` and `listFiles("lib")` are now different entries
+- **`executeToolCall()`**: Single entry point for tool execution — handles cwd, smart editFile→writeFile fallback, validation, blocking, and warning injection
+- **`buildAgentHistory()`**: Unified history builder with budget-aware truncation, all-user-message pinning, first-assistant pinning, optional multimodal content via closure
+- **TestServer now uses AgentEngine**: Eliminated all duplicated functions — also gained first-assistant pinning that TestServer was previously missing
+
+### Tool Blocking Overhaul
+- **Arg-aware tracking**: Repetition keys are `"name:primaryArg"` (e.g. `"listFiles:src"`) instead of just tool name — different directories/queries are tracked separately
+- **Three-phase system**: Warning at 5 in 12 (tool executes, result prefixed with warning), soft block at 8 in 12 (blocked for 3 iterations), escalation (calling during cooldown extends by 5)
+- **Tool-specific messages**: Block/warning messages suggest relevant alternatives (`listFiles` → `ls`, `readFile` → `cat`, `searchFiles` → `grep -r`)
+- **Write tools exempt**: `writeFile`, `editFile`, `shell`, `cwd` are never warned or blocked
+
+### History Budget Fix
+- **Cap maxTokens for budget math**: Generation reservation capped to 40% of context — fixes negative budget on small-context models (E2B: budget went from 1024 → ~7363 tokens)
+- **Pin all user messages**: User messages carry critical facts (name, preferences, task instructions) and are now always pinned, with safety cap at 30% of budget falling back to first + last
+
+### Workspace Context Injection
+- **Directory listing in system prompt**: Working directory contents auto-injected into system prompt each iteration — model always knows what files exist without calling `listFiles`
+- **Refreshes on `cwd` change**: When agent changes directory, next iteration shows the new directory's contents
+- **`listFiles` tool description updated**: Tells model the root listing is already in the system prompt
+
+### JPEG Vision Fix
+- **`CGImageSource` with EXIF orientation**: Replaced `NSImage.cgImage(forProposedRect:)` with `CGImageSourceCreateThumbnailAtIndex` + `kCGImageSourceCreateThumbnailWithTransform` — camera JPEGs now render correctly instead of sideways
+- **Explicit byte order**: Added `CGBitmapInfo.byteOrder32Big` to CGContext — guarantees `[R, G, B, X]` memory layout regardless of platform endianness (ARM defaults to little-endian which scrambles to `[X, B, G, R]`)
+- **Y-axis flip**: CGContext origin is bottom-left, vision encoder expects top-left — added `translateBy/scaleBy` transform
+- **Dual fallback path**: CGImageSource → NSImage fallback ensures all image formats are handled
+
+### Duplicate Instance Guard (Zig)
+- **Port check before model loading**: In `--serve` mode, tries connecting to the target port before loading the model — exits immediately with a clear error if another instance is already running
+- **Fail-fast**: No GPU memory wasted on model loading when the port is taken
+
+### Welcome Window
+- **First-launch onboarding**: `WelcomeView` shows app icon, feature cards (menu bar operation, local models, agent tools), and animated hint pointing to the tray icon
+- **NSWindow-based**: Menu bar apps don't auto-open SwiftUI `Window` scenes — uses direct `NSWindow` + `NSHostingView` from `AppState.init()`
+- **One-time display**: Tracked via `hasSeenWelcome` in UserDefaults
+
+### Chat UX Polish
+- **Numpad Enter support**: Both Return and numpad Enter (`\u{03}`) now send messages
+- **Type while generating**: Input field stays enabled during generation — Enter blocked until complete
+- **Generating indicator**: Replaced spinner with animated dual-arc GPU/memory visualization + live `GPU X% · Mem Y%` stats + rotating whimsical status text
+- **Auto-scroll re-engage**: GeometryReader moved to bottom anchor element for reliable position tracking; downward scroll events check proximity to bottom and re-engage
+- **Auto-scroll indicator**: 4px accent-colored right-edge strip, visible when auto-scroll is active, fades on disengage
+- **Markdown HTML fix**: Parser now whitelists model-specific tags (`plan`, `thinking`, `pad`, etc.) — standard HTML tags (`head`, `div`, `meta`) render as text instead of being swallowed into XML block styling
 
 ---
 

@@ -445,7 +445,8 @@ class TestServer {
         }
 
         let enableThinking = json["thinking"] as? Bool ?? false
-        var workDir = json["working_directory"] as? String ?? NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+        var workDir: String? = json["working_directory"] as? String
+            ?? NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
 
         // Ensure we have an active session in agent mode
         let sessionId: UUID
@@ -458,38 +459,35 @@ class TestServer {
             appState.chatSessions[idx].mode = .agent
         }
 
-        // Add user message
         let userMsg = ChatMessage(role: .user, content: message)
         appState.appendMessage(to: sessionId, message: userMsg)
 
-        // Run the agent loop — same code path as ChatView.runAgentLoop
         let api = APIClient()
         let maxIterations = json["max_rounds"] as? Int ?? 10
         var padRetries = 0
         let maxPadRetries = 2
         var roundResults: [[String: Any]] = []
-
-        let toolHandlers: [AgentToolKind: any ToolHandler] = [
-            .shell: ShellHandler(),
-            .readFile: ReadFileHandler(),
-            .writeFile: WriteFileHandler(),
-            .editFile: EditFileHandler(),
-            .searchFiles: SearchFilesHandler(),
-            .listFiles: ListFilesHandler(),
-            .browse: BrowseHandler(),
-            .webSearch: WebSearchHandler(),
-            .saveMemory: SaveMemoryHandler(),
-        ]
-
-        var recentToolNames: [String] = []
-        var permanentlyBlocked: Set<String> = []
+        let repetition = AgentEngine.RepetitionTracker()
         var truncationRetries = 0
+
         for iteration in 0..<maxIterations {
-            // Build history — same as ChatView.buildAgentHistory()
-            var history = buildAgentHistory(appState: appState, sessionId: sessionId)
+            // Build history using shared engine
+            let contextLength = AgentEngine.effectiveContextLength(
+                appContextSize: appState.contextSize,
+                modelContextLength: appState.server.modelInfo?.contextLength
+            )
+            let session = appState.chatSessions.first(where: { $0.id == sessionId })
+            var history = AgentEngine.buildAgentHistory(
+                messages: session?.messages ?? [],
+                contextLength: contextLength,
+                maxTokens: appState.maxTokens
+            )
             let userContent = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userContent)
-            let systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
+            var systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
+            if let wd = workDir {
+                systemPrompt += AgentEngine.workingDirectoryContext(wd)
+            }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
                 history.append(["role": "user", "content": "Continue. If the task is done, summarize the result. If not, take the next step."])
@@ -537,8 +535,7 @@ class TestServer {
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
 
-            // Truncation recovery: if max_tokens was hit AND tool calls were received,
-            // the tool call args are likely truncated. Don't execute them — retry.
+            // Truncation recovery
             if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
                 truncationRetries += 1
                 if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
@@ -565,7 +562,6 @@ class TestServer {
                     roundResults.append(["round": iteration + 1, "type": "pad_failure"])
                     break
                 }
-                // No tool calls, model gave a text response — done
                 roundResults.append(["round": iteration + 1, "type": "content", "content": String(cleaned.prefix(500))])
                 break
             }
@@ -581,95 +577,26 @@ class TestServer {
                 }
             }
 
-            // Repetition detection: track tool names over sliding window
-            // Write tools (writeFile, editFile, shell) are never blocked — they make progress.
-            // Browse/webSearch get a higher threshold (8 in 12) since they're inherently multi-step.
-            // Other read-only tools use a tight threshold (4 in 6).
-            let writeTools: Set<String> = ["writeFile", "editFile", "shell"]
-            let browseTools: Set<String> = ["browse", "webSearch"]
-            let uniqueNames = Set(receivedToolCalls.map { $0.name })
-            recentToolNames.append(contentsOf: uniqueNames)
-            if recentToolNames.count > 12 { recentToolNames = Array(recentToolNames.suffix(12)) }
-            for name in uniqueNames {
-                if writeTools.contains(name) { continue }
-                let count = recentToolNames.filter({ $0 == name }).count
-                let threshold = browseTools.contains(name) ? 8 : 4
-                if count >= threshold {
-                    permanentlyBlocked.insert(name)
-                }
-            }
-            let blockedTools = permanentlyBlocked
+            // Track repetition
+            repetition.track(toolCalls: receivedToolCalls)
 
-            // Execute tools — same as ChatView
-            var toolResults: [(id: String, name: String, output: String)] = []
+            // Execute tools using shared engine
             for tc in receivedToolCalls {
-                let tool = AgentToolKind(rawValue: tc.name)
-                let effectiveTool: AgentToolKind?
-                if tool == .editFile && tc.arguments["content"] != nil && tc.arguments["find"] == nil {
-                    effectiveTool = .writeFile
-                } else {
-                    effectiveTool = tool
-                }
+                let result = await AgentEngine.executeToolCall(
+                    tc, workingDirectory: &workDir,
+                    repetition: repetition, iteration: iteration,
+                    agentMemory: appState.agentMemory
+                )
 
-                // Handle cwd tool: change working directory for subsequent calls
-                let output: String
-                if effectiveTool == .cwd {
-                    if let path = tc.arguments["path"] {
-                        let resolved: String
-                        if path.hasPrefix("/") || path.hasPrefix("~") {
-                            resolved = NSString(string: path).expandingTildeInPath
-                        } else {
-                            resolved = (workDir as NSString).appendingPathComponent(path)
-                        }
-                        let normalized = (resolved as NSString).standardizingPath
-                        var isDir: ObjCBool = false
-                        if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
-                            workDir = normalized
-                            output = "Changed working directory to \(normalized)"
-                        } else {
-                            output = "Error: '\(normalized)' is not a directory"
-                        }
-                    } else {
-                        output = "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
-                    }
-                } else if blockedTools.contains(tc.name) {
-                    output = "BLOCKED: \(tc.name) has been called too many times in a row. This tool is now disabled for this task. Use writeFile to create files, readFile to read them, editFile to modify them, and shell for commands."
-                } else {
-                    let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
-                    if !missing.isEmpty {
-                        if (tc.name == "writeFile" || tc.name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
-                            output = "Error: \(tc.name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
-                        } else {
-                            let example = Self.toolExample(for: tc.name)
-                            output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
-                        }
-                    } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
-                        do {
-                            output = try await handler.execute(parameters: tc.arguments, workingDirectory: workDir)
-                            if effectiveTool == .shell, let cmd = tc.arguments["command"] {
-                                appState.agentMemory.recordCommand(cmd)
-                            }
-                        } catch {
-                            let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                            output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
-                        }
-                    } else {
-                        output = "Error: Unknown tool '\(tc.name)'"
-                    }
-                }
-                toolResults.append((id: tc.id, name: tc.name, output: output))
-
-                var resultMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → \(String(output.prefix(500)))")
+                var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")
                 resultMsg.isAgentSummary = true
                 appState.appendMessage(to: sessionId, message: resultMsg)
-            }
 
-            // Add tool results to history with overflow-to-disk truncation
-            for tr in toolResults {
+                // Store tool result
                 var toolMsg = ChatMessage(role: .system, content: "")
-                toolMsg.toolCallId = tr.id
-                toolMsg.toolName = tr.name
-                toolMsg.content = ChatDetailView.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                toolMsg.toolCallId = result.id
+                toolMsg.toolName = result.name
+                toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                 appState.appendMessage(to: sessionId, message: toolMsg)
             }
 
@@ -679,7 +606,6 @@ class TestServer {
 
         appState.saveChatHistory()
 
-        // Return summary
         let finalContent = appState.chatSessions
             .first(where: { $0.id == sessionId })?.messages
             .last(where: { $0.role == .assistant && !$0.isAgentSummary })?.content ?? ""
@@ -691,127 +617,6 @@ class TestServer {
             "final_content": String(cleaned.prefix(1000)),
             "message_count": appState.chatSessions.first(where: { $0.id == sessionId })?.messages.count ?? 0,
         ])
-    }
-
-    // MARK: - Helpers
-
-    /// Budget-aware history builder — matches ChatView.buildAgentHistory().
-    private func buildAgentHistory(appState: AppState, sessionId: UUID) -> [[String: Any]] {
-        guard let session = appState.chatSessions.first(where: { $0.id == sessionId }) else { return [] }
-        let allMessages = session.messages
-
-        // Token budget
-        let contextLength: Int
-        if appState.contextSize > 0 { contextLength = appState.contextSize }
-        else if let modelCtx = appState.server.modelInfo?.contextLength, modelCtx > 0 { contextLength = modelCtx }
-        else { contextLength = 32768 }
-        let systemCost = max(1, (AgentPrompt.systemPrompt + AgentPrompt.memory).utf8.count / 4)
-        let budget = max(1024, contextLength - appState.maxTokens - 1024 - systemCost)
-
-        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
-        var pinnedCost = 0
-        if let idx = firstUserIdx {
-            pinnedCost = max(1, allMessages[idx].content.utf8.count / 4) + 4
-        }
-
-        // Walk backward, accumulating costs
-        var remainingBudget = budget - pinnedCost
-        var includeStartIdx = allMessages.count
-        for i in stride(from: allMessages.count - 1, through: 0, by: -1) {
-            let msg = allMessages[i]
-            if msg.role == .system && msg.toolCallId == nil { continue }
-            if msg.isAgentSummary { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
-            var cost = 4 + max(1, msg.content.utf8.count / 4)
-            if let tcs = msg.toolCalls {
-                for tc in tcs { cost += max(1, tc.name.utf8.count / 4) + max(1, tc.arguments.utf8.count / 4) + 8 }
-            }
-            if cost > remainingBudget { break }
-            remainingBudget -= cost
-            includeStartIdx = i
-        }
-
-        let needsPin = firstUserIdx != nil && firstUserIdx! < includeStartIdx
-
-        // Auto-compact: squeeze tool results when budget is tight
-        let freeRatio = Double(remainingBudget + pinnedCost) / Double(budget + pinnedCost)
-        let recentLimit = freeRatio < 0.25 ? 500 : 2000
-        let olderLimit = freeRatio < 0.25 ? 100 : 500
-
-        let window = Array(allMessages[includeStartIdx..<allMessages.count])
-        let totalToolResults = window.filter { $0.toolCallId != nil }.count
-        var toolResultsSeen = 0
-
-        var history: [[String: Any]] = []
-
-        if needsPin, let idx = firstUserIdx {
-            history.append(["role": "user", "content": allMessages[idx].content])
-        }
-
-        for msg in window {
-            if let callId = msg.toolCallId {
-                let isRecent = toolResultsSeen >= totalToolResults - 2
-                let limit = isRecent ? recentLimit : olderLimit
-                toolResultsSeen += 1
-                history.append([
-                    "role": "tool",
-                    "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit))
-                ])
-                continue
-            }
-            if msg.role == .system { continue }
-            if msg.isAgentSummary { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
-
-            if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
-                var dict: [String: Any] = ["role": "assistant"]
-                let content = msg.content.replacingOccurrences(of: "<pad>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                dict["content"] = content.isEmpty ? "" : content
-                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                    ["id": tc.id, "type": "function", "function": ["name": tc.name, "arguments": tc.arguments] as [String: Any]]
-                }
-                history.append(dict)
-                continue
-            }
-
-            if msg.role == .assistant && msg.content.isEmpty { continue }
-            var content = msg.content
-                .replacingOccurrences(of: "<pad>", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if msg.role == .assistant && content.count > 500 {
-                content = String(content.prefix(500)) + "..."
-            }
-            if content.isEmpty { continue }
-            history.append(["role": msg.role.rawValue, "content": content])
-        }
-
-        return history
-    }
-
-    private static func missingRequiredParams(for toolName: String, arguments: [String: String]) -> [String] {
-        for def in AgentPrompt.toolDefinitions {
-            guard let fn = def["function"] as? [String: Any],
-                  fn["name"] as? String == toolName,
-                  let params = fn["parameters"] as? [String: Any],
-                  let required = params["required"] as? [String] else { continue }
-            return required.filter { key in
-                guard let val = arguments[key] else { return true }
-                return val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        }
-        return []
-    }
-
-    private static func toolExample(for toolName: String) -> String {
-        for def in AgentPrompt.toolDefinitions {
-            guard let fn = def["function"] as? [String: Any],
-                  fn["name"] as? String == toolName,
-                  let desc = fn["description"] as? String,
-                  let range = desc.range(of: "Example: ") else { continue }
-            return String(desc[range.upperBound...])
-        }
-        return "{}"
     }
 
     private func isServerHealthy(appState: AppState) async -> Bool {

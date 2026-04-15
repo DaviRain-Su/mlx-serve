@@ -1,0 +1,605 @@
+import Foundation
+
+/// Shared agent engine — history building, tool execution, repetition tracking.
+/// Used by both ChatView (production UI) and TestServer (test automation).
+/// Eliminates duplication between the two, ensuring bug fixes apply everywhere.
+@MainActor
+enum AgentEngine {
+
+    // MARK: - Token Estimation
+
+    /// Rough token estimation: ~4 bytes per token (no tokenizer needed).
+    static func roughTokenCount(_ s: String) -> Int {
+        max(1, s.utf8.count / 4)
+    }
+
+    /// Estimate token cost for a message including role/format overhead.
+    static func tokenCostForMessage(_ msg: ChatMessage) -> Int {
+        var cost = 4  // role + formatting envelope
+        cost += roughTokenCount(msg.content)
+        if let tcs = msg.toolCalls {
+            for tc in tcs {
+                cost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
+            }
+        }
+        return cost
+    }
+
+    // MARK: - Context Helpers
+
+    /// Determine effective context length from user config or model metadata.
+    static func effectiveContextLength(appContextSize: Int, modelContextLength: Int?) -> Int {
+        if appContextSize > 0 { return appContextSize }
+        if let modelCtx = modelContextLength, modelCtx > 0 { return modelCtx }
+        return 32768  // safe default
+    }
+
+    // MARK: - History Building
+
+    /// Build API-ready message history from chat messages with budget-aware truncation.
+    ///
+    /// Pins all user messages (they carry critical facts — name, preferences, task
+    /// instructions) and the first assistant response (the plan). Walks backward from
+    /// newest messages to fill the remaining budget. Progressively truncates older
+    /// tool results when context is tight.
+    ///
+    /// - Parameters:
+    ///   - messages: All chat messages in the session.
+    ///   - contextLength: Effective context window size.
+    ///   - maxTokens: Max generation tokens (capped to 40% of context for budget math).
+    ///   - buildMultimodalContent: Optional closure to build image content blocks for the
+    ///     last user message. Pass nil to skip image handling (e.g. in TestServer).
+    static func buildAgentHistory(
+        messages allMessages: [ChatMessage],
+        contextLength: Int,
+        maxTokens: Int,
+        buildMultimodalContent: ((String, [ChatImage]) -> Any)? = nil
+    ) -> [[String: Any]] {
+
+        // --- Budget calculation ---
+
+        let safetyBuffer = 1024
+        let systemPromptCost = roughTokenCount(AgentPrompt.systemPrompt + AgentPrompt.memory)
+        // Cap generation reservation to 40% of context so history always gets ≥60%.
+        // The actual max_tokens sent to the API is unchanged — this only affects budget math.
+        let effectiveMaxTokens = min(maxTokens, contextLength * 2 / 5)
+        let budget = max(1024, contextLength - effectiveMaxTokens - safetyBuffer - systemPromptCost)
+
+        // --- Pinning ---
+
+        // Find the first user message and first assistant response (the plan).
+        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
+        let firstAssistantIdx: Int? = {
+            guard let uIdx = firstUserIdx else { return nil }
+            let afterUser = allMessages.index(after: uIdx)
+            guard afterUser < allMessages.count else { return nil }
+            return allMessages[afterUser...].firstIndex {
+                $0.role == .assistant && !$0.isAgentSummary && !$0.content.isEmpty
+            }
+        }()
+
+        // Pin ALL user messages — they're short but carry critical context.
+        let allUserIndices = allMessages.indices.filter {
+            allMessages[$0].role == .user && allMessages[$0].toolCallId == nil
+        }
+
+        var userPinCost = 0
+        for idx in allUserIndices {
+            userPinCost += roughTokenCount(allMessages[idx].content) + 4
+        }
+
+        // Safety cap: if user messages exceed 30% of budget, pin only first + last
+        let userBudgetCap = budget * 3 / 10
+        let pinnedUserIndices: [Int]
+        if userPinCost > userBudgetCap && allUserIndices.count > 2 {
+            pinnedUserIndices = [allUserIndices.first!, allUserIndices.last!]
+            userPinCost = pinnedUserIndices.reduce(0) {
+                $0 + roughTokenCount(allMessages[$1].content) + 4
+            }
+        } else {
+            pinnedUserIndices = allUserIndices
+        }
+
+        // Include first assistant response (plan) in pinned cost
+        var pinnedCost = userPinCost
+        if let idx = firstAssistantIdx {
+            let content = allMessages[idx].content
+            pinnedCost += roughTokenCount(String(content.prefix(500))) + 4
+            if let tcs = allMessages[idx].toolCalls {
+                for tc in tcs {
+                    pinnedCost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
+                }
+            }
+        }
+
+        // --- Backward walk ---
+
+        var remainingBudget = budget - pinnedCost
+        var includeStartIdx = allMessages.count
+
+        for i in stride(from: allMessages.count - 1, through: 0, by: -1) {
+            let msg = allMessages[i]
+            if msg.role == .system && msg.toolCallId == nil { continue }
+            if msg.isAgentSummary { continue }
+            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+
+            let cost = tokenCostForMessage(msg)
+            if cost > remainingBudget { break }
+            remainingBudget -= cost
+            includeStartIdx = i
+        }
+
+        // Which pinned messages fell outside the backward-walk window?
+        let pinnedUserOutside = pinnedUserIndices.filter { $0 < includeStartIdx }
+        let needsPinAssistant = firstAssistantIdx != nil && firstAssistantIdx! < includeStartIdx
+
+        // --- Auto-compact ---
+
+        // When context is squeezed, truncate tool results more aggressively.
+        let freeRatio = Double(remainingBudget + pinnedCost) / Double(budget + pinnedCost)
+        let squeezed = freeRatio < 0.25
+        let recentLimit = squeezed ? 500 : 2000
+        let olderLimit = squeezed ? 100 : 500
+
+        let window = Array(allMessages[includeStartIdx..<allMessages.count])
+        let totalToolResults = window.filter { $0.toolCallId != nil }.count
+        var toolResultsSeen = 0
+
+        // --- Assemble history ---
+
+        var history: [[String: Any]] = []
+
+        // Emit pinned user messages that fell outside the window (in original order).
+        // Strip images — server only processes the last user message's images.
+        for idx in pinnedUserOutside {
+            history.append(["role": "user", "content": allMessages[idx].content])
+        }
+
+        // Emit pinned first assistant response (the plan) if it fell outside.
+        if needsPinAssistant, let idx = firstAssistantIdx {
+            let msg = allMessages[idx]
+            var content = msg.content
+                .replacingOccurrences(of: "<pad>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if content.count > 500 {
+                content = String(content.prefix(500)) + "..."
+            }
+            var dict: [String: Any] = ["role": "assistant"]
+            if !content.isEmpty { dict["content"] = content }
+            if let tcs = msg.toolCalls, !tcs.isEmpty {
+                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                    [
+                        "id": tc.id,
+                        "type": "function",
+                        "function": [
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        ] as [String: Any]
+                    ]
+                }
+            }
+            history.append(dict)
+        }
+
+        // Only the last user message gets image content blocks.
+        let lastUserMsgId: UUID? = buildMultimodalContent != nil
+            ? window.last(where: { $0.role == .user && $0.toolCallId == nil })?.id
+            : nil
+
+        // Emit messages from the backward-walk window.
+        for msg in window {
+            // Tool responses — progressive truncation
+            if let callId = msg.toolCallId {
+                let isRecent = toolResultsSeen >= totalToolResults - 2
+                let limit = isRecent ? recentLimit : olderLimit
+                toolResultsSeen += 1
+                history.append([
+                    "role": "tool",
+                    "tool_call_id": callId,
+                    "content": String(msg.content.prefix(limit)),
+                ])
+                continue
+            }
+            if msg.role == .system { continue }
+            if msg.isAgentSummary { continue }
+            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+
+            // Assistant messages with tool_calls
+            if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
+                var dict: [String: Any] = ["role": "assistant"]
+                let content = msg.content
+                    .replacingOccurrences(of: "<pad>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                dict["content"] = content.isEmpty ? "" : content
+                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                    [
+                        "id": tc.id,
+                        "type": "function",
+                        "function": [
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        ] as [String: Any]
+                    ]
+                }
+                history.append(dict)
+                continue
+            }
+
+            // Regular messages
+            if msg.role == .assistant && msg.content.isEmpty { continue }
+            var content = msg.content
+                .replacingOccurrences(of: "<pad>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if msg.role == .assistant && content.count > 500 {
+                content = String(content.prefix(500)) + "..."
+            }
+            if content.isEmpty { continue }
+
+            var dict: [String: Any] = ["role": msg.role.rawValue]
+            if let multimodal = buildMultimodalContent,
+               msg.id == lastUserMsgId,
+               let imgs = msg.images, !imgs.isEmpty {
+                dict["content"] = multimodal(content, imgs)
+            } else {
+                dict["content"] = content
+            }
+            history.append(dict)
+        }
+
+        return history
+    }
+
+    // MARK: - Tool Validation
+
+    /// Check which required params are missing for a tool call.
+    static func missingRequiredParams(for toolName: String, arguments: [String: String]) -> [String] {
+        for def in AgentPrompt.toolDefinitions {
+            guard let fn = def["function"] as? [String: Any],
+                  fn["name"] as? String == toolName,
+                  let params = fn["parameters"] as? [String: Any],
+                  let required = params["required"] as? [String] else { continue }
+            return required.filter { key in
+                guard let val = arguments[key] else { return true }
+                return val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+        return []
+    }
+
+    /// Get the example JSON format from a tool's description.
+    static func toolExample(for toolName: String) -> String {
+        for def in AgentPrompt.toolDefinitions {
+            guard let fn = def["function"] as? [String: Any],
+                  fn["name"] as? String == toolName,
+                  let desc = fn["description"] as? String,
+                  let range = desc.range(of: "Example: ") else { continue }
+            return String(desc[range.upperBound...])
+        }
+        return "{}"
+    }
+
+    // MARK: - Tool Repetition
+
+    /// Write/control tools are never warned or blocked — they make forward progress.
+    static let exemptTools: Set<String> = ["writeFile", "editFile", "shell", "cwd"]
+
+    /// Tracks tool repetition across agent loop iterations.
+    ///
+    /// Three-phase system:
+    /// 1. **Warning at 5 in 12**: Tool executes normally, result prefixed with warning.
+    /// 2. **Soft block at 8 in 12**: Tool blocked for 3 iterations, then available again.
+    /// 3. **Escalation**: Calling blocked tool during cooldown extends cooldown by 5.
+    ///
+    /// Tracking is arg-aware: `listFiles("src")` and `listFiles("lib")` are different entries.
+    @MainActor
+    class RepetitionTracker {
+        var recentKeys: [String] = []       // sliding window of "name:arg" keys
+        var warnings: Set<String> = []      // keys that have been warned
+        var blockedUntil: [String: Int] = [:] // tool key → iteration when block expires
+
+        /// Record tool calls from this round into the sliding window.
+        func track(toolCalls: [APIClient.ToolCall]) {
+            for tc in toolCalls {
+                guard !AgentEngine.exemptTools.contains(tc.name) else { continue }
+                recentKeys.append(AgentEngine.toolRepetitionKey(name: tc.name, arguments: tc.arguments))
+            }
+            if recentKeys.count > 12 {
+                recentKeys = Array(recentKeys.suffix(12))
+            }
+        }
+
+        /// Check if a tool call is blocked. Returns true if blocked.
+        func isBlocked(name: String, arguments: [String: String], iteration: Int) -> Bool {
+            guard !AgentEngine.exemptTools.contains(name) else { return false }
+            let key = AgentEngine.toolRepetitionKey(name: name, arguments: arguments)
+
+            // Check existing cooldown — extend on violation
+            if let until = blockedUntil[key], iteration < until {
+                blockedUntil[key] = until + 5
+                return true
+            }
+
+            // Soft block at 8 occurrences in window
+            if recentKeys.filter({ $0 == key }).count >= 8 {
+                blockedUntil[key] = iteration + 3
+                return true
+            }
+
+            return false
+        }
+
+        /// Apply warning prefix if tool key has appeared 5+ times. Returns modified output.
+        func applyWarning(name: String, arguments: [String: String], output: String) -> String {
+            guard !AgentEngine.exemptTools.contains(name), !output.hasPrefix("BLOCKED:") else {
+                return output
+            }
+            let key = AgentEngine.toolRepetitionKey(name: name, arguments: arguments)
+            let count = recentKeys.filter { $0 == key }.count
+            guard count >= 5, !warnings.contains(key) else { return output }
+
+            warnings.insert(key)
+            let alt = AgentEngine.toolAlternativeSuggestion(for: name)
+            return "WARNING: \(name) with these arguments has been called \(count) times recently. "
+                + "Consider \(alt). Continued repetition will cause this tool to be temporarily blocked.\n\n"
+                + output
+        }
+    }
+
+    /// Primary argument key per tool — used to distinguish different invocations.
+    private static let primaryArgKey: [String: String] = [
+        "listFiles": "path", "readFile": "path", "searchFiles": "pattern",
+        "browse": "url", "webSearch": "query",
+    ]
+
+    /// Build a repetition key like "listFiles:src/lib" or "saveMemory" (no primary arg).
+    static func toolRepetitionKey(name: String, arguments: [String: String]) -> String {
+        if let argKey = primaryArgKey[name], let val = arguments[argKey], !val.isEmpty {
+            return "\(name):\(val)"
+        }
+        return name
+    }
+
+    /// Tool-specific block messages suggesting useful alternatives.
+    static func toolBlockMessage(for toolName: String) -> String {
+        let prefix = "BLOCKED: \(toolName) has been called too many times with the same arguments."
+        switch toolName {
+        case "listFiles":
+            return "\(prefix) Use shell with `ls` instead: {\"command\": \"ls -la path/to/dir\"}"
+        case "readFile":
+            return "\(prefix) Use shell with `cat` instead: {\"command\": \"cat path/to/file\"}"
+        case "searchFiles":
+            return "\(prefix) Use shell with `grep -r` instead: {\"command\": \"grep -r 'pattern' path/\"}"
+        case "browse":
+            return "\(prefix) Try a different URL, or use webSearch to find what you need."
+        case "webSearch":
+            return "\(prefix) Try a different search query, or use browse to visit a specific URL."
+        default:
+            return "\(prefix) This tool is temporarily disabled. Try a different approach using shell."
+        }
+    }
+
+    /// Suggest alternatives for the warning phase.
+    static func toolAlternativeSuggestion(for toolName: String) -> String {
+        switch toolName {
+        case "listFiles": return "using shell with `ls` or trying a different path"
+        case "readFile": return "using shell with `cat` or reading a different file"
+        case "searchFiles": return "using shell with `grep -r` or a different search pattern"
+        case "browse": return "trying a different URL or using webSearch"
+        case "webSearch": return "trying a different query or using browse"
+        default: return "a different approach"
+        }
+    }
+
+    // MARK: - Tool Execution
+
+    /// Result of executing a single tool call.
+    struct ToolResult {
+        let id: String
+        let name: String
+        var output: String
+    }
+
+    /// Shared tool handler instances. Handlers are stateless — safe to reuse.
+    private static var toolHandlers: [AgentToolKind: any ToolHandler] {
+        [
+            .shell: ShellHandler(),
+            .readFile: ReadFileHandler(),
+            .writeFile: WriteFileHandler(),
+            .editFile: EditFileHandler(),
+            .searchFiles: SearchFilesHandler(),
+            .listFiles: ListFilesHandler(),
+            .browse: BrowseHandler(),
+            .webSearch: WebSearchHandler(),
+            .saveMemory: SaveMemoryHandler(),
+        ]
+    }
+
+    /// Execute a single tool call with cwd handling, validation, blocking, and warnings.
+    ///
+    /// Handles the full pipeline:
+    /// 1. Smart fallback (editFile without find → writeFile)
+    /// 2. Working directory changes (cwd tool)
+    /// 3. Repetition blocking check
+    /// 4. Required parameter validation
+    /// 5. Handler dispatch
+    /// 6. Warning injection
+    static func executeToolCall(
+        _ tc: APIClient.ToolCall,
+        workingDirectory: inout String?,
+        repetition: RepetitionTracker,
+        iteration: Int,
+        agentMemory: AgentMemory
+    ) async -> ToolResult {
+        let tool = AgentToolKind(rawValue: tc.name)
+
+        // Smart fallback: editFile with content but no find → writeFile
+        let effectiveTool: AgentToolKind?
+        if tool == .editFile && tc.arguments["content"] != nil && tc.arguments["find"] == nil {
+            effectiveTool = .writeFile
+        } else {
+            effectiveTool = tool
+        }
+
+        var output: String
+
+        if effectiveTool == .cwd {
+            // Change working directory for subsequent calls
+            if let path = tc.arguments["path"] {
+                let resolved: String
+                if path.hasPrefix("/") || path.hasPrefix("~") {
+                    resolved = NSString(string: path).expandingTildeInPath
+                } else if let wd = workingDirectory {
+                    resolved = (wd as NSString).appendingPathComponent(path)
+                } else {
+                    resolved = path
+                }
+                let normalized = (resolved as NSString).standardizingPath
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
+                    workingDirectory = normalized
+                    output = "Changed working directory to \(normalized)"
+                } else {
+                    output = "Error: '\(normalized)' is not a directory"
+                }
+            } else {
+                output = "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
+            }
+        } else if repetition.isBlocked(name: tc.name, arguments: tc.arguments, iteration: iteration) {
+            output = toolBlockMessage(for: tc.name)
+        } else {
+            // Validate required parameters
+            let missing = missingRequiredParams(for: tc.name, arguments: tc.arguments)
+            if !missing.isEmpty {
+                if (tc.name == "writeFile" || tc.name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
+                    output = "Error: \(tc.name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
+                } else {
+                    output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: tc.name))"
+                }
+            } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
+                do {
+                    output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
+                    if effectiveTool == .shell, let cmd = tc.arguments["command"] {
+                        agentMemory.recordCommand(cmd)
+                    }
+                } catch {
+                    let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+                    output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: tc.name))"
+                }
+            } else {
+                output = "Error: Unknown tool '\(tc.name)'"
+            }
+        }
+
+        // Apply warning if near repetition threshold
+        output = repetition.applyWarning(name: tc.name, arguments: tc.arguments, output: output)
+
+        return ToolResult(id: tc.id, name: tc.name, output: output)
+    }
+
+    // MARK: - Tool Result Overflow
+
+    /// Per-tool context caps (chars). Oversized results are saved to disk.
+    static let toolResultCaps: [String: Int] = [
+        "shell": 6000,
+        "readFile": 8000,
+        "searchFiles": 4000,
+        "listFiles": 4000,
+        "webSearch": 2000,
+        "browse": 3000,
+        "editFile": 2000,
+        "writeFile": 2000,
+        "saveMemory": 500,
+    ]
+
+    /// Truncate tool output, saving full result to disk if oversized.
+    static func truncateWithOverflow(_ output: String, toolCallId: String, toolName: String) -> String {
+        let maxChars = toolResultCaps[toolName] ?? 4000
+        guard output.count > maxChars else { return output }
+
+        // Save full output to disk for debugging
+        let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+        let path = (dir as NSString).appendingPathComponent("\(toolCallId).txt")
+        try? output.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let preview = String(output.prefix(maxChars))
+        return "\(preview)\n\n[... truncated at \(maxChars) of \(output.count) chars]"
+    }
+
+    /// Clean up overflow files older than 24 hours.
+    static func cleanupOverflowFiles() {
+        let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        let cutoff = Date().addingTimeInterval(-86400)
+        for file in files {
+            let path = (dir as NSString).appendingPathComponent(file)
+            if let attrs = try? fm.attributesOfItem(atPath: path),
+               let modified = attrs[.modificationDate] as? Date,
+               modified < cutoff {
+                try? fm.removeItem(atPath: path)
+            }
+        }
+    }
+
+    // MARK: - Workspace Context
+
+    /// Build the working directory section for the system prompt.
+    /// Includes the directory path and a listing of its contents so the model
+    /// doesn't need to call listFiles on the root — it's always available.
+    static func workingDirectoryContext(_ path: String) -> String {
+        var section = "\n\n# Working Directory\nYour working directory is `\(path)`. All file tool operations are confined to this directory — paths that resolve outside it will be rejected. Use relative paths. Shell commands run here by default."
+
+        let listing = directoryListing(path)
+        if !listing.isEmpty {
+            section += "\n\n## Files\nThis listing is always up-to-date — no need to call listFiles on the root directory.\n```\n\(listing)\n```"
+        }
+
+        return section
+    }
+
+    /// Compact directory listing: top-level entries with type indicators.
+    /// Directories end with /, hidden files included, sorted, capped at 100 entries.
+    private static func directoryListing(_ path: String) -> String {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: path) else { return "" }
+
+        var entries: [String] = []
+        for name in items.sorted() {
+            var isDir: ObjCBool = false
+            let fullPath = (path as NSString).appendingPathComponent(name)
+            if fm.fileExists(atPath: fullPath, isDirectory: &isDir) {
+                entries.append(isDir.boolValue ? "\(name)/" : name)
+            } else {
+                entries.append(name)
+            }
+            if entries.count >= 100 { break }
+        }
+
+        if entries.isEmpty { return "" }
+        let suffix = items.count > 100 ? "\n... and \(items.count - 100) more" : ""
+        return entries.joined(separator: "\n") + suffix
+    }
+
+    // MARK: - Debug
+
+    /// Dump the exact request body to file for analysis.
+    static func dumpDebugRequest(messages: [[String: Any]], maxTokens: Int) {
+        do {
+            let debugPath = NSString(string: "~/.mlx-serve/last-agent-request.json").expandingTildeInPath
+            let messagesData = try JSONSerialization.data(withJSONObject: messages, options: .prettyPrinted)
+            let messagesStr = String(data: messagesData, encoding: .utf8) ?? "[]"
+            let debugJSON = """
+            {
+              "model": "mlx-serve",
+              "max_tokens": \(maxTokens),
+              "temperature": 0.7,
+              "stream": true,
+              "messages": \(messagesStr),
+              "tools": \(AgentPrompt.toolDefinitionsJSON)
+            }
+            """
+            try debugJSON.data(using: .utf8)?.write(to: URL(fileURLWithPath: debugPath))
+        } catch { /* ignore debug errors */ }
+    }
+}
