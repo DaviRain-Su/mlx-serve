@@ -1,5 +1,37 @@
 # Changelog
 
+## v26.4.25 — Nemotron-H, LFM2, Qwen3.5 GatedDeltaNet Fixes
+
+### Nemotron-H (Mamba2 SSM) — Now Working
+- **A_neg float32 precision**: Cast `-exp(A_log)` to float32 in `mamba2Mixer`, matching Python's `A = -mx.exp(A_log).astype(dt.dtype)`. BF16 precision caused decay values `dA = exp(A*dt)` to be imprecise, compounding across 42 layers
+- **time_step_limit defaults**: Python defaults to `(0.0, inf)` when `time_step_limit` is absent from config. We were reading `time_step_min`/`time_step_max` from config (0.001, 0.1) and using them for dt clipping — this corrupted SSM dynamics. Now defaults to `(0.0, inf)` and only reads the `time_step_limit` JSON array if explicitly present
+
+### Qwen 3.5 GatedDeltaNet — Now Working
+- **Parameter-free RMS norm fix**: GatedDeltaNet Q/K normalization passed a null array as weight to `mlx_fast_rms_norm`. mlx-c now requires a non-empty array — fixed by passing `ones([dk], bfloat16)`
+- **SSM state initialization**: `conv1dWithCache` sets `ssm.initialized = true` before the SSM recurrence state is created, causing the state init to be skipped. Fixed by checking `ssm.ssm_state.ctx == null` instead (same pattern as Mamba2)
+- **Qwen 3.6 compatibility**: Qwen3.6-35B-A3B uses `model_type: qwen3_5_moe` with both GatedDeltaNet and MoE — works with existing code paths after these fixes
+
+### LFM2 (Liquid) — Confirmed Working
+- **Benchmarked**: LFM2.5-350M-8bit runs at 3780 tok/s prefill, 210 tok/s decode (0.4 GB)
+
+### Benchmark Suite
+- **`bench.sh` rewrite**: Deterministic benchmarking with fixed prompts, warmup exclusion, error handling, `--model` filter, `--runs` override
+- **mlx-lm reference**: Side-by-side comparison with Python mlx-lm (`--no-mlx-lm` / `--only-mlx-lm` flags)
+- **`BenchmarkLog.md`**: Performance tracking across releases with methodology documentation
+
+### Model Browser
+- **Architecture tag prefixes**: Added `nemotron` and `lfm` to `supportedArchitectureTagPrefixes` — HuggingFace search results for these models no longer show "Unsupported architecture"
+
+### Build & Versioning
+- **CalVer auto-increment**: `build.sh` now uses `YY.M.N` versioning where N is auto-incremented from the latest GitHub release for the current month (was day-based, causing skipped numbers)
+- **Version passed to Zig**: `build.sh` passes `-Dversion` to `zig build` so the CLI binary reports the correct version
+
+### Documentation
+- **README.md**: Moved Nemotron-H and LFM2 from "Not Yet Supported" to supported models table; added Qwen 3.6
+- **CLAUDE.md**: Updated architecture table, added gotchas for SSM state init, parameter-free RMS norm, and time_step_limit
+
+---
+
 ## v26.4.22 — Model Browser, Menu Bar Status Icon
 
 ### Model Browser

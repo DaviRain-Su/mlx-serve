@@ -12,12 +12,16 @@ TEAM_ID="${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in env}"
 
 cd "$SCRIPT_DIR"
 
-# Set calver version (YYYY.M.D)
-CALVER="$(date +%Y.%-m.%-d)"
+# Set calver version (YY.M.N) — auto-increment N from last GitHub release
+YM="$(date +%y.%-m)"
+LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null || echo "0")
+NEXT_N=$((LAST_N + 1))
+CALVER="${YM}.${NEXT_N}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" Info.plist
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" Info.plist
+export MLX_SERVE_VERSION="$CALVER"
 
-echo "=== Building MLX Core $CALVER ==="
+echo "=== Building MLX Core v$CALVER ==="
 
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
@@ -32,7 +36,7 @@ echo "  Swift binary: $(du -h "$SWIFT_BIN" | cut -f1)"
 # ── Phase 2: Build mlx-serve (Zig) ──
 echo "→ Building mlx-serve (Zig)..."
 cd "$PROJECT_ROOT"
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast 2>&1 | tail -3
+DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" 2>&1 | tail -3
 MLX_BIN="zig-out/bin/mlx-serve"
 if [ ! -f "$MLX_BIN" ]; then
     echo "ERROR: Zig build failed"
@@ -203,3 +207,7 @@ echo ""
 echo "=== Build complete! ==="
 echo "App: $APP"
 echo "DMG: $DMG_PATH"
+echo "Version: v$MLX_SERVE_VERSION"
+echo ""
+echo "To release:"
+echo "  gh release create v$MLX_SERVE_VERSION $DMG_PATH --title \"mlx-serve v$MLX_SERVE_VERSION\" --notes-file CHANGELOG_LATEST.md"

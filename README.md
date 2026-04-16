@@ -52,7 +52,9 @@ Menu bar app that wraps the server with a full UI:
 |---|---|---|---|---|
 | **Gemma 4** | `gemma4` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns | SigLIP |
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
-| **Qwen 3 / 3.5** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.5-MoE-A3B` | ChatML | -- |
+| **Qwen 3 / 3.5 / 3.6** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-35B-A3B` | ChatML | -- |
+| **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
+| **LFM2** | `lfm2` | LFM2.5-350M | ChatML | -- |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B | ChatML | -- |
 
@@ -62,8 +64,7 @@ Any quantized MLX model using one of the above architectures should work. Models
 
 | Architecture | `model_type` | Examples | Reason |
 |---|---|---|---|
-| **LFM2 / LFM2-VL** | `lfm2`, `lfm2-vl` | LFM2.5-350M, LFM2.5-VL-450M | State-space (Liquid) architecture, not transformer-based |
-| **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | Hybrid transformer + Mamba (SSM) layers |
+| **LFM2-VL** | `lfm2-vl` | LFM2.5-VL-450M | Needs vision encoder integration |
 | **Phi** | `phi`, `phi3` | Phi-3, Phi-4 | Different attention/MLP layout, untested |
 | **Cohere** | `command-r` | Command R+ | Different architecture, untested |
 | **BERT** (partial) | `bert` | -- | Encoder-only, config parsing exists but no serving endpoint |
@@ -180,8 +181,10 @@ Benchmarked on Apple M4 (16 GB unified memory):
 
 | Model | Prefill | Decode | Memory |
 |---|---|---|---|
-| Gemma-4 E4B (4-bit) | ~300 tok/s | ~33 tok/s | 4.0 GB |
-| Qwen3-4B (4-bit) | ~220 tok/s | ~37 tok/s | 2.17 GB |
+| Gemma-4 E4B (4-bit) | ~390 tok/s | ~32 tok/s | 4.3 GB |
+| Qwen3.5-4B (4-bit) | ~155 tok/s | ~33 tok/s | 2.4 GB |
+| LFM2.5-350M (8-bit) | ~3800 tok/s | ~210 tok/s | 0.4 GB |
+| Nemotron-3-Nano-4B (8-bit) | -- | ~22 tok/s | 4.3 GB |
 
 Matches mlx-lm (Python) generation speed while using less memory and starting 3x faster. Key optimizations: fully-lazy async pipeline with reordered eval (submit-first pattern), JIT-compiled activations (GELU, GeGLU, softcap via `mlx_compile`), and GPU memory wiring.
 

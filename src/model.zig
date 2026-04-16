@@ -2,7 +2,9 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
-pub const HiddenAct = enum { gelu_approx, silu };
+pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
+
+pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
 pub const ModelConfig = struct {
     // Architecture identity
@@ -107,6 +109,28 @@ pub const ModelConfig = struct {
     has_v_norm: bool = false, // parameter-free RMS norm on values
     // Gemma 4 (31B): full_attention layers share V with K (no v_proj stored)
     attention_k_eq_v: bool = false,
+
+    // Hybrid layers (LFM2, Nemotron-H): per-layer type dispatch
+    has_hybrid_layers: bool = false,
+    layer_block_types: [128]LayerBlockType = .{.attention} ** 128,
+    has_embedding_norm: bool = false, // LFM2: RMS norm applied to embeddings
+    has_final_norm: bool = true, // false for LFM2 (no model.norm.weight)
+
+    // LFM2 gated convolution
+    lfm_conv_kernel: u32 = 3,
+    lfm_conv_dim: u32 = 0, // 0 = hidden_size
+
+    // Mamba2 SSM (Nemotron-H)
+    mamba_num_heads: u32 = 0,
+    mamba_head_dim: u32 = 0,
+    mamba_n_groups: u32 = 8,
+    ssm_state_size: u32 = 128,
+    mamba_conv_kernel: u32 = 4,
+    mamba_expand: u32 = 2,
+    time_step_min: f32 = 0.0,
+    time_step_max: f32 = std.math.inf(f32),
+    mamba_chunk_size: u32 = 256,
+    mamba_mlp_act: HiddenAct = .relu_sq, // Nemotron-H MLP uses ReLU^2
 
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
@@ -465,6 +489,114 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
         if (cfg_obj.get("partial_rotary_factor")) |v| config.partial_rotary_factor = jsonFloat(v);
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
+        }
+    } else if (std.mem.eql(u8, model_type, "lfm2") or std.mem.startsWith(u8, model_type, "lfm2")) {
+        config.model_type = "lfm2";
+        // VL variant nests text weights under language_model.model (like Gemma 4)
+        config.weight_prefix = if (root.get("text_config") != null) "language_model.model" else "model";
+        config.hidden_act = .silu;
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.has_sliding_window = false;
+        config.has_hybrid_layers = true;
+        config.has_embedding_norm = false;
+        config.has_final_norm = true; // embedding_norm IS the final norm
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (config.head_dim == 256) { // default from gemma3, override
+            config.head_dim = config.hidden_size / config.num_attention_heads;
+        }
+        config.query_pre_attn_scalar = config.head_dim;
+        // tie_embedding (LFM2 name) -> tie_word_embeddings; default true for LFM2
+        config.tie_word_embeddings = true;
+        if (cfg_obj.get("tie_embedding")) |v| {
+            if (v == .bool) config.tie_word_embeddings = v.bool;
+        }
+        if (cfg_obj.get("norm_eps")) |v| config.rms_norm_eps = jsonFloat(v);
+        if (cfg_obj.get("conv_dim")) |v| config.lfm_conv_dim = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+        // Parse layer_types array: ["conv", "full_attention", ...]
+        if (cfg_obj.get("layer_types")) |lt_val| {
+            if (lt_val == .array) {
+                for (lt_val.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    if (item == .string) {
+                        config.layer_block_types[i] = if (std.mem.eql(u8, item.string, "conv"))
+                            .gated_conv
+                        else
+                            .attention;
+                    }
+                }
+            }
+        }
+        if (config.num_eos_tokens == 0) {
+            if (cfg_obj.get("eos_token_id")) |v| {
+                if (v == .integer) config.addEosToken(@intCast(v.integer));
+            }
+        }
+    } else if (std.mem.eql(u8, model_type, "nemotron_h")) {
+        config.model_type = "nemotron_h";
+        config.weight_prefix = "backbone";
+        config.hidden_act = .silu;
+        config.mamba_mlp_act = .relu_sq;
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.has_sliding_window = false;
+        config.has_hybrid_layers = true;
+        config.has_final_norm = true;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        config.query_pre_attn_scalar = config.head_dim;
+        if (cfg_obj.get("rms_norm_eps")) |v| {
+            config.rms_norm_eps = jsonFloat(v);
+        } else if (cfg_obj.get("layer_norm_epsilon")) |v| {
+            config.rms_norm_eps = jsonFloat(v);
+        }
+        // Mamba2-specific config
+        if (cfg_obj.get("mamba_num_heads")) |v| config.mamba_num_heads = switch (v) { .integer => |i| @intCast(i), else => 0 };
+        if (cfg_obj.get("mamba_head_dim")) |v| config.mamba_head_dim = switch (v) { .integer => |i| @intCast(i), else => 0 };
+        if (cfg_obj.get("n_groups")) |v| config.mamba_n_groups = switch (v) { .integer => |i| @intCast(i), else => 8 };
+        if (cfg_obj.get("ssm_state_size")) |v| config.ssm_state_size = switch (v) { .integer => |i| @intCast(i), else => 128 };
+        if (cfg_obj.get("conv_kernel")) |v| config.mamba_conv_kernel = switch (v) { .integer => |i| @intCast(i), else => 4 };
+        if (cfg_obj.get("expand")) |v| config.mamba_expand = switch (v) { .integer => |i| @intCast(i), else => 2 };
+        // time_step_limit: Python defaults to (0.0, inf) if not in config.
+        // config.json may have time_step_min/time_step_max fields but Python ignores them
+        // for SSM clipping — only time_step_limit (a 2-element array) is used.
+        if (cfg_obj.get("time_step_limit")) |v| {
+            if (v == .array) {
+                const items = v.array.items;
+                if (items.len >= 2) {
+                    config.time_step_min = jsonFloat(items[0]);
+                    config.time_step_max = jsonFloat(items[1]);
+                }
+            }
+        }
+        if (cfg_obj.get("chunk_size")) |v| config.mamba_chunk_size = switch (v) { .integer => |i| @intCast(i), else => 256 };
+        // Parse hybrid_override_pattern: "M-M-M-MM-M-M*-..."
+        if (cfg_obj.get("hybrid_override_pattern")) |v| {
+            if (v == .string) {
+                for (v.string, 0..) |ch, i| {
+                    if (i >= 128) break;
+                    config.layer_block_types[i] = switch (ch) {
+                        'M' => .mamba2,
+                        '-' => .mlp,
+                        '*' => .attention,
+                        'E' => .moe,
+                        else => .attention,
+                    };
+                }
+            }
+        }
+        if (config.num_eos_tokens == 0) {
+            if (cfg_obj.get("eos_token_id")) |v| {
+                if (v == .integer) config.addEosToken(@intCast(v.integer));
+            }
         }
     } else if (std.mem.eql(u8, model_type, "bert")) {
         config.model_type = "bert";

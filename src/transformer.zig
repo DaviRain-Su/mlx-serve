@@ -470,6 +470,57 @@ const MoeLayerWeights = struct {
     layer_scalar: ?mlx.mlx_array = null,
 };
 
+// ── Hybrid layer weights (LFM2, Nemotron-H) ──
+
+const GatedConvWeights = struct {
+    in_proj_w: mlx.mlx_array, // [3*hidden, hidden] → B, C, x split
+    in_proj_s: mlx.mlx_array,
+    in_proj_b: mlx.mlx_array,
+    conv_w: mlx.mlx_array, // [hidden, kernel, 1] depthwise
+    out_proj_w: mlx.mlx_array, // [hidden, hidden]
+    out_proj_s: mlx.mlx_array,
+    out_proj_b: mlx.mlx_array,
+};
+
+const Mamba2Weights = struct {
+    in_proj_w: mlx.mlx_array,
+    in_proj_s: mlx.mlx_array,
+    in_proj_b: mlx.mlx_array,
+    conv1d_w: mlx.mlx_array, // depthwise conv
+    conv1d_b: ?mlx.mlx_array, // optional bias
+    A_log: mlx.mlx_array, // static state matrix (log-space)
+    D: mlx.mlx_array, // skip connection
+    dt_bias: mlx.mlx_array, // time-step bias
+    norm_w: mlx.mlx_array, // output normalization
+    out_proj_w: mlx.mlx_array,
+    out_proj_s: mlx.mlx_array,
+    out_proj_b: mlx.mlx_array,
+};
+
+const SimpleMlpWeights = struct {
+    up_w: mlx.mlx_array,
+    up_s: mlx.mlx_array,
+    up_b: mlx.mlx_array,
+    down_w: mlx.mlx_array,
+    down_s: mlx.mlx_array,
+    down_b: mlx.mlx_array,
+};
+
+const HybridOp = union(enum) {
+    gated_conv: GatedConvWeights,
+    full_attn: FullAttnWeights,
+    mamba2: Mamba2Weights,
+    dense_mlp: DenseMlpWeights, // gated MLP (SwiGLU)
+    simple_mlp: SimpleMlpWeights, // ungated MLP (ReLU^2)
+};
+
+const HybridLayerWeights = struct {
+    input_norm: mlx.mlx_array,
+    post_norm: ?mlx.mlx_array, // null for single-op blocks (Nemotron-H)
+    op: HybridOp,
+    mlp: ?DenseMlpWeights, // optional MLP after mixer (LFM2: always; Nemotron-H: null)
+};
+
 // ── Quantization bit cache ──
 // A tiny lock-free pointer→bits cache. Quantized weights are loaded once at init and
 // reused for every forward pass; we detect bits on first touch and serve hits thereafter.
@@ -551,6 +602,10 @@ pub const Transformer = struct {
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
 
+    // Hybrid layers (LFM2, Nemotron-H)
+    hybrid_layers: ?[]HybridLayerWeights,
+    embedding_norm: ?mlx.mlx_array, // LFM2: RMS norm on embeddings
+
     // Prompt cache for prefix reuse across requests
     prompt_cache: ?PrefillCache,
 
@@ -585,18 +640,40 @@ pub const Transformer = struct {
 
         if (config.is_encoder_only) return initBert(allocator, config, weights, &name_buf, s);
 
-        const emb_w = getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
-        const emb_s_arr = getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
-        const emb_b_arr = getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
+        // Embeddings: Nemotron-H uses "backbone.embeddings", others use "{prefix}.embed_tokens"
+        const is_nemotron = std.mem.eql(u8, config.model_type, "nemotron_h");
+        const emb_w = if (is_nemotron)
+            getWeightFmt(weights, &name_buf, "{s}.embeddings.weight", prefix)
+        else
+            getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
+        const emb_s_arr = if (is_nemotron)
+            getWeightFmt(weights, &name_buf, "{s}.embeddings.scales", prefix)
+        else
+            getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
+        const emb_b_arr = if (is_nemotron)
+            getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix)
+        else
+            getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
 
         const emb_scale: ?mlx.mlx_array = if (config.scale_embeddings)
             bf16Scalar(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), s)
         else
             null;
 
-        const final_norm_raw = getWeightFmt(weights, &name_buf, "{s}.norm.weight", prefix);
-        const final_norm = if (config.norm_has_offset) try addOne(final_norm_raw, s) else final_norm_raw;
-        if (config.norm_has_offset) try mlx.check(mlx.mlx_array_eval(final_norm));
+        // Final norm: LFM2 uses "embedding_norm", Nemotron-H uses "norm_f", others use "norm"
+        const is_lfm2 = std.mem.eql(u8, config.model_type, "lfm2");
+        var final_norm: mlx.mlx_array = undefined;
+        if (!config.has_final_norm) {
+            final_norm = mlx.mlx_array_new(); // placeholder, unused
+        } else if (is_lfm2) {
+            final_norm = getWeightFmt(weights, &name_buf, "{s}.embedding_norm.weight", prefix);
+        } else if (is_nemotron) {
+            final_norm = getWeightFmt(weights, &name_buf, "{s}.norm_f.weight", prefix);
+        } else {
+            const final_norm_raw = getWeightFmt(weights, &name_buf, "{s}.norm.weight", prefix);
+            final_norm = if (config.norm_has_offset) try addOne(final_norm_raw, s) else final_norm_raw;
+            if (config.norm_has_offset) try mlx.check(mlx.mlx_array_eval(final_norm));
+        }
 
         var lm_head_w: mlx.mlx_array = undefined;
         var lm_head_s: mlx.mlx_array = undefined;
@@ -637,13 +714,24 @@ pub const Transformer = struct {
         var layers: []LayerWeights = &.{};
         var moe_layers: ?[]MoeLayerWeights = null;
         var ssm_entries: ?[]SSMCacheEntry = null;
+        var hybrid_layers: ?[]HybridLayerWeights = null;
 
-        if (config.isMoe() or config.full_attention_interval > 0) {
+        if (config.has_hybrid_layers) {
+            const hl = try initHybridLayers(allocator, config, weights, &name_buf, s);
+            hybrid_layers = hl.hybrid_layers;
+            ssm_entries = hl.ssm_entries;
+        } else if (config.isMoe() or config.full_attention_interval > 0) {
             const ml = try initMoeLayers(allocator, config, weights, &name_buf, s);
             moe_layers = ml.moe_layers;
             ssm_entries = ml.ssm_entries;
         } else {
             layers = try initStandardLayers(allocator, config, weights, &name_buf, s);
+        }
+
+        // LFM2: load embedding norm
+        var embedding_norm_w: ?mlx.mlx_array = null;
+        if (config.has_embedding_norm) {
+            embedding_norm_w = getWeightFmtOpt(weights, &name_buf, "{s}.embedding_norm.weight", prefix);
         }
 
         // Gemma 4: load PLE global weights
@@ -875,6 +963,8 @@ pub const Transformer = struct {
             .moe_layers = moe_layers,
             .ssm_entries = ssm_entries,
             .moe_seq_offset = 0,
+            .hybrid_layers = hybrid_layers,
+            .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
         };
     }
@@ -1491,7 +1581,92 @@ pub const Transformer = struct {
         return switch (self.config.hidden_act) {
             .gelu_approx => self.gelu(x),
             .silu => self.silu(x),
+            .relu_sq => self.reluSquared(x),
         };
+    }
+
+    fn reluSquared(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        const zero = bf16Scalar(0.0, self.s);
+        defer _ = mlx.mlx_array_free(zero);
+        var relu = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(relu);
+        try mlx.check(mlx.mlx_maximum(&relu, x, zero, self.s));
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_square(&result, relu, self.s));
+        return result;
+    }
+
+    // ── Conv1d with cache (shared by GatedDeltaNet, LFM2, Mamba2) ──
+
+    /// Prepends cached conv state, applies depthwise conv1d, updates cache.
+    /// If apply_silu is true, applies SiLU activation after conv.
+    /// conv_b is an optional bias added after conv1d.
+    fn conv1dWithCache(
+        self: *Transformer,
+        x: mlx.mlx_array,
+        conv_w: mlx.mlx_array,
+        conv_b: ?mlx.mlx_array,
+        ssm: *SSMCacheEntry,
+        batch: c_int,
+        cdim: c_int,
+        kernel: c_int,
+        apply_silu: bool,
+    ) !mlx.mlx_array {
+        // Prepend conv_state or zeros
+        var conv_input: mlx.mlx_array = undefined;
+        defer _ = mlx.mlx_array_free(conv_input);
+        if (ssm.initialized) {
+            const arr = [_]mlx.mlx_array{ ssm.conv_state, x };
+            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            conv_input = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s));
+        } else {
+            const zero_shape = [_]c_int{ batch, kernel - 1, cdim };
+            var zero_state = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zero_state);
+            try mlx.check(mlx.mlx_zeros(&zero_state, &zero_shape, 3, .bfloat16, self.s));
+            const arr = [_]mlx.mlx_array{ zero_state, x };
+            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            conv_input = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s));
+        }
+
+        // Update conv_state: keep last (kernel-1) positions
+        {
+            const ci_shape = mlx.getShape(conv_input);
+            const ci_len = ci_shape[1];
+            const keep_start = ci_len - (kernel - 1);
+            const start = [_]c_int{ 0, keep_start, 0 };
+            const stop = [_]c_int{ batch, ci_len, cdim };
+            const strides = [_]c_int{ 1, 1, 1 };
+            var new_conv_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&new_conv_state, conv_input, &start, 3, &stop, 3, &strides, 3, self.s));
+            _ = mlx.mlx_array_free(ssm.conv_state);
+            ssm.conv_state = new_conv_state;
+            ssm.initialized = true;
+        }
+
+        // Depthwise conv1d (groups = cdim)
+        var conv_out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_conv1d(&conv_out, conv_input, conv_w, 1, 0, 1, cdim, self.s));
+
+        // Optional bias
+        if (conv_b) |cb| {
+            var biased = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&biased, conv_out, cb, self.s));
+            _ = mlx.mlx_array_free(conv_out);
+            conv_out = biased;
+        }
+
+        // Optional SiLU activation
+        if (apply_silu) {
+            const activated = try self.silu(conv_out);
+            _ = mlx.mlx_array_free(conv_out);
+            return activated;
+        }
+        return conv_out;
     }
 
     /// Fused GeGLU: gelu(gate) * up in a single compiled kernel.
@@ -1559,6 +1734,7 @@ pub const Transformer = struct {
 
     pub fn forward(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (self.bert_layers != null) return self.forwardBert(token_ids);
+        if (self.hybrid_layers != null) return self.forwardHybrid(token_ids);
         if (self.moe_layers != null) return self.forwardMoe(token_ids);
         return self.forwardStandard(token_ids);
     }
@@ -2366,6 +2542,582 @@ pub const Transformer = struct {
         return logits;
     }
 
+    // ── Hybrid forward pass (LFM2, Nemotron-H) ──
+
+    fn forwardHybrid(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const hl = self.hybrid_layers.?;
+        const offset = self.moe_seq_offset;
+        const cfg = &self.config;
+
+        var h = try self.embedding(token_ids);
+
+        const x_shape = mlx.getShape(h);
+        const batch: c_int = x_shape[0];
+        const seq_len: c_int = x_shape[1];
+
+        for (0..cfg.num_hidden_layers) |layer_idx| {
+            const li: u32 = @intCast(layer_idx);
+            const lw = &hl[layer_idx];
+
+            const normed = try self.rmsNorm(h, lw.input_norm);
+            defer _ = mlx.mlx_array_free(normed);
+
+            // Primary operation
+            const op_out = switch (lw.op) {
+                .gated_conv => |cw| try self.gatedConv(normed, &cw, &self.ssm_entries.?[layer_idx], batch, seq_len),
+                .full_attn => |fa| try self.hybridAttn(normed, &fa, li, @intCast(offset), batch, seq_len, seq_len > 1),
+                .mamba2 => |mw| try self.mamba2Mixer(normed, &mw, &self.ssm_entries.?[layer_idx], batch, seq_len),
+                .dense_mlp => |dw| try self.denseMLP(normed, &dw),
+                .simple_mlp => |sw| try self.simpleMLP(normed, &sw),
+            };
+            defer _ = mlx.mlx_array_free(op_out);
+
+            // Residual connection
+            var h_new = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&h_new, h, op_out, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h_new;
+
+            // Optional MLP (LFM2: always present after mixer; Nemotron-H: null)
+            if (lw.mlp) |mlp_w| {
+                const ff_normed = try self.rmsNorm(h, lw.post_norm.?);
+                defer _ = mlx.mlx_array_free(ff_normed);
+                const mlp_out = try self.denseMLP(ff_normed, &mlp_w);
+                defer _ = mlx.mlx_array_free(mlp_out);
+
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
+            }
+
+            if (seq_len > 1 and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
+                try mlx.check(mlx.mlx_array_eval(h));
+            }
+
+        }
+
+        self.moe_seq_offset += @intCast(seq_len);
+
+        // Final norm (absent for LFM2)
+        if (cfg.has_final_norm) {
+            const final_normed = try self.rmsNorm(h, self.final_norm);
+            _ = mlx.mlx_array_free(h);
+            if (self.embedding_mode) return final_normed;
+            const logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+            _ = mlx.mlx_array_free(final_normed);
+            return logits;
+        } else {
+            if (self.embedding_mode) return h;
+            const logits = try self.qmatmul(h, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+            _ = mlx.mlx_array_free(h);
+            return logits;
+        }
+    }
+
+    // ── Gated Convolution (LFM2) ──
+
+    fn gatedConv(
+        self: *Transformer,
+        x: mlx.mlx_array,
+        cw: *const GatedConvWeights,
+        ssm: *SSMCacheEntry,
+        batch: c_int,
+        seq_len: c_int,
+    ) !mlx.mlx_array {
+        _ = seq_len;
+        const hidden: c_int = @intCast(self.config.hidden_size);
+        const kernel: c_int = @intCast(self.config.lfm_conv_kernel);
+
+        // 1. Input projection: [B, S, hidden] → [B, S, 3*hidden]
+        const proj = try self.qmatmul(x, cw.in_proj_w, cw.in_proj_s, cw.in_proj_b);
+        defer _ = mlx.mlx_array_free(proj);
+
+        // 2. Split into 3 equal parts: B, C, x (this order per mlx-lm/HF reference)
+        const proj_shape = mlx.getShape(proj);
+        const proj_seq = proj_shape[1];
+        const strides3 = [_]c_int{ 1, 1, 1 };
+
+        var b_gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(b_gate);
+        try mlx.check(mlx.mlx_slice(&b_gate, proj, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, proj_seq, hidden }, 3, &strides3, 3, self.s));
+
+        var c_gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c_gate);
+        try mlx.check(mlx.mlx_slice(&c_gate, proj, &[_]c_int{ 0, 0, hidden }, 3, &[_]c_int{ batch, proj_seq, hidden * 2 }, 3, &strides3, 3, self.s));
+
+        var x_conv = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_conv);
+        try mlx.check(mlx.mlx_slice(&x_conv, proj, &[_]c_int{ 0, 0, hidden * 2 }, 3, &[_]c_int{ batch, proj_seq, hidden * 3 }, 3, &strides3, 3, self.s));
+
+        // 3. First gating: B * x
+        var gated_input = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated_input);
+        try mlx.check(mlx.mlx_multiply(&gated_input, b_gate, x_conv, self.s));
+
+        // 4. Conv1d with cache (depthwise, groups=hidden, no activation)
+        const conv_out = try self.conv1dWithCache(gated_input, cw.conv_w, null, ssm, batch, hidden, kernel, false);
+        defer _ = mlx.mlx_array_free(conv_out);
+
+        // 5. Second gating: C_gate * conv_out
+        var gated_output = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated_output);
+        try mlx.check(mlx.mlx_multiply(&gated_output, c_gate, conv_out, self.s));
+
+        // 6. Output projection
+        return self.qmatmul(gated_output, cw.out_proj_w, cw.out_proj_s, cw.out_proj_b);
+    }
+
+    // ── Mamba2 SSM (Nemotron-H) ──
+
+    fn mamba2Mixer(
+        self: *Transformer,
+        x: mlx.mlx_array,
+        mw: *const Mamba2Weights,
+        ssm: *SSMCacheEntry,
+        batch: c_int,
+        seq_len: c_int,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        const num_heads: c_int = @intCast(cfg.mamba_num_heads);
+        const head_dim: c_int = @intCast(cfg.mamba_head_dim);
+        const n_groups: c_int = @intCast(cfg.mamba_n_groups);
+        const state_size: c_int = @intCast(cfg.ssm_state_size);
+        const d_inner: c_int = num_heads * head_dim; // intermediate_size
+        const conv_dim: c_int = d_inner + 2 * n_groups * state_size;
+        const kernel: c_int = @intCast(cfg.mamba_conv_kernel);
+        const repeats: c_int = @divExact(num_heads, n_groups);
+
+        // 1. Input projection: [B, S, hidden] → [B, S, d_inner + conv_dim + num_heads]
+        const proj = try self.qmatmul(x, mw.in_proj_w, mw.in_proj_s, mw.in_proj_b);
+        defer _ = mlx.mlx_array_free(proj);
+
+        // 2. Split: gate [d_inner], conv_input [conv_dim], dt [num_heads]
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate);
+        try mlx.check(mlx.mlx_slice(&gate, proj, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, seq_len, d_inner }, 3, &strides3, 3, self.s));
+
+        var conv_input = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(conv_input);
+        try mlx.check(mlx.mlx_slice(&conv_input, proj, &[_]c_int{ 0, 0, d_inner }, 3, &[_]c_int{ batch, seq_len, d_inner + conv_dim }, 3, &strides3, 3, self.s));
+
+        var dt_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_raw);
+        try mlx.check(mlx.mlx_slice(&dt_raw, proj, &[_]c_int{ 0, 0, d_inner + conv_dim }, 3, &[_]c_int{ batch, seq_len, d_inner + conv_dim + num_heads }, 3, &strides3, 3, self.s));
+
+        // 3. Conv1d with cache + SiLU on conv_input
+        const conv_out = try self.conv1dWithCache(conv_input, mw.conv1d_w, mw.conv1d_b, ssm, batch, conv_dim, kernel, true);
+        defer _ = mlx.mlx_array_free(conv_out);
+
+        // 4. Split conv output: x_ssm [d_inner], B [n_groups*state_size], C [n_groups*state_size]
+        var x_ssm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_ssm);
+        try mlx.check(mlx.mlx_slice(&x_ssm, conv_out, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, seq_len, d_inner }, 3, &strides3, 3, self.s));
+
+        const b_end: c_int = d_inner + n_groups * state_size;
+        var B_proj = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(B_proj);
+        try mlx.check(mlx.mlx_slice(&B_proj, conv_out, &[_]c_int{ 0, 0, d_inner }, 3, &[_]c_int{ batch, seq_len, b_end }, 3, &strides3, 3, self.s));
+
+        var C_proj = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(C_proj);
+        try mlx.check(mlx.mlx_slice(&C_proj, conv_out, &[_]c_int{ 0, 0, b_end }, 3, &[_]c_int{ batch, seq_len, conv_dim }, 3, &strides3, 3, self.s));
+
+        // 5. Reshape to head format
+        // x_ssm: [B, S, num_heads, head_dim]
+        const x_shape = [_]c_int{ batch, seq_len, num_heads, head_dim };
+        var x_h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_h);
+        try mlx.check(mlx.mlx_reshape(&x_h, x_ssm, &x_shape, 4, self.s));
+
+        // B, C: [B, S, n_groups, state_size]
+        const bc_shape = [_]c_int{ batch, seq_len, n_groups, state_size };
+        var B_h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(B_h);
+        var C_h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(C_h);
+        try mlx.check(mlx.mlx_reshape(&B_h, B_proj, &bc_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&C_h, C_proj, &bc_shape, 4, self.s));
+
+        // 6. Compute dt = softplus(dt + dt_bias), clamp to time limits
+        // Cast dt to float32 for precision (matching Python)
+        var dt_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_f32);
+        try mlx.check(mlx.mlx_astype(&dt_f32, dt_raw, .float32, self.s));
+        // dt + dt_bias
+        var dt_biased = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_biased);
+        try mlx.check(mlx.mlx_add(&dt_biased, dt_f32, mw.dt_bias, self.s));
+        // softplus: log1p(exp(x))
+        var dt_exp_val = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_exp_val);
+        try mlx.check(mlx.mlx_exp(&dt_exp_val, dt_biased, self.s));
+        var dt_sp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_sp);
+        try mlx.check(mlx.mlx_log1p(&dt_sp, dt_exp_val, self.s));
+        // Clamp (use float32 scalars matching dt precision)
+        var dt_min_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_min_arr);
+        {
+            const v = mlx.mlx_array_new_float(cfg.time_step_min);
+            defer _ = mlx.mlx_array_free(v);
+            try mlx.check(mlx.mlx_astype(&dt_min_arr, v, .float32, self.s));
+        }
+        var dt_max_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_max_arr);
+        {
+            const v = mlx.mlx_array_new_float(cfg.time_step_max);
+            defer _ = mlx.mlx_array_free(v);
+            try mlx.check(mlx.mlx_astype(&dt_max_arr, v, .float32, self.s));
+        }
+        var dt_clamped_lo = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_clamped_lo);
+        try mlx.check(mlx.mlx_maximum(&dt_clamped_lo, dt_sp, dt_min_arr, self.s));
+        var dt_val = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dt_val);
+        try mlx.check(mlx.mlx_minimum(&dt_val, dt_clamped_lo, dt_max_arr, self.s));
+
+        // 7. A = -exp(A_log) — cast to float32 to match Python precision
+        // Python's ssm_attn does: A = -mx.exp(A_log).astype(dt.dtype) where dt is float32.
+        // Without this cast, A stays in BF16 and decay values dA = exp(A*dt) are imprecise,
+        // compounding across 42 layers × N timesteps.
+        var A_neg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(A_neg);
+        {
+            var A_exp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(A_exp);
+            try mlx.check(mlx.mlx_exp(&A_exp, mw.A_log, self.s));
+            var A_neg_bf16 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(A_neg_bf16);
+            try mlx.check(mlx.mlx_negative(&A_neg_bf16, A_exp, self.s));
+            try mlx.check(mlx.mlx_astype(&A_neg, A_neg_bf16, .float32, self.s));
+        }
+
+        // 8. Initialize SSM state if needed: [B, num_heads, head_dim, state_size]
+        // Note: can't use ssm.initialized here — conv1dWithCache already set it to true.
+        // Check if ssm_state is empty (ctx == null) as the actual init indicator.
+        if (ssm.ssm_state.ctx == null) {
+            const state_shape = [_]c_int{ batch, num_heads, head_dim, state_size };
+            ssm.ssm_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&ssm.ssm_state, &state_shape, 4, .float32, self.s));
+        }
+
+        // Precompute D reshaped for broadcasting: [H] → [H, 1]
+        var D_bc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(D_bc);
+        try mlx.check(mlx.mlx_expand_dims(&D_bc, mw.D, 1, self.s));
+
+        // 9. Per-timestep SSM recurrence
+        const T: usize = @intCast(seq_len);
+        const out_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(out_vec);
+
+        for (0..T) |t| {
+            const ti: c_int = @intCast(t);
+
+            // Extract timestep slices
+            const strides4 = [_]c_int{ 1, 1, 1, 1 };
+            // dt_t: [B, 1, num_heads] → [B, num_heads]
+            var dt_t_3d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dt_t_3d);
+            try mlx.check(mlx.mlx_slice(&dt_t_3d, dt_val, &[_]c_int{ 0, ti, 0 }, 3, &[_]c_int{ batch, ti + 1, num_heads }, 3, &strides3, 3, self.s));
+            var dt_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dt_t);
+            {
+                const dt_reshape = [_]c_int{ batch, num_heads };
+                try mlx.check(mlx.mlx_reshape(&dt_t, dt_t_3d, &dt_reshape, 2, self.s));
+            }
+
+            // x_t: [B, num_heads, head_dim]
+            var x_t_4d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_t_4d);
+            try mlx.check(mlx.mlx_slice(&x_t_4d, x_h, &[_]c_int{ 0, ti, 0, 0 }, 4, &[_]c_int{ batch, ti + 1, num_heads, head_dim }, 4, &strides4, 4, self.s));
+            var x_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_t);
+            {
+                const x_reshape = [_]c_int{ batch, num_heads, head_dim };
+                try mlx.check(mlx.mlx_reshape(&x_t, x_t_4d, &x_reshape, 3, self.s));
+            }
+
+            // B_t: [B, n_groups, state_size] → repeat to [B, num_heads, state_size]
+            var B_t_4d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(B_t_4d);
+            try mlx.check(mlx.mlx_slice(&B_t_4d, B_h, &[_]c_int{ 0, ti, 0, 0 }, 4, &[_]c_int{ batch, ti + 1, n_groups, state_size }, 4, &strides4, 4, self.s));
+            var B_t_sq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(B_t_sq);
+            {
+                const bc_rs = [_]c_int{ batch, n_groups, state_size };
+                try mlx.check(mlx.mlx_reshape(&B_t_sq, B_t_4d, &bc_rs, 3, self.s));
+            }
+            var B_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(B_t);
+            if (repeats > 1) {
+                try mlx.check(mlx.mlx_repeat_axis(&B_t, B_t_sq, repeats, 1, self.s));
+            } else {
+                try mlx.check(mlx.mlx_array_set(&B_t, B_t_sq));
+            }
+
+            // C_t: same as B_t
+            var C_t_4d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(C_t_4d);
+            try mlx.check(mlx.mlx_slice(&C_t_4d, C_h, &[_]c_int{ 0, ti, 0, 0 }, 4, &[_]c_int{ batch, ti + 1, n_groups, state_size }, 4, &strides4, 4, self.s));
+            var C_t_sq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(C_t_sq);
+            {
+                const bc_rs = [_]c_int{ batch, n_groups, state_size };
+                try mlx.check(mlx.mlx_reshape(&C_t_sq, C_t_4d, &bc_rs, 3, self.s));
+            }
+            var C_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(C_t);
+            if (repeats > 1) {
+                try mlx.check(mlx.mlx_repeat_axis(&C_t, C_t_sq, repeats, 1, self.s));
+            } else {
+                try mlx.check(mlx.mlx_array_set(&C_t, C_t_sq));
+            }
+
+
+            // dA = exp(A * dt_t): [B, num_heads]
+            var A_dt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(A_dt);
+            try mlx.check(mlx.mlx_multiply(&A_dt, A_neg, dt_t, self.s));
+            var dA = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dA);
+            try mlx.check(mlx.mlx_exp(&dA, A_dt, self.s));
+
+            // dA_expanded: [B, num_heads, 1, 1] for state broadcast
+            var dA_e1 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dA_e1);
+            var dA_exp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dA_exp);
+            try mlx.check(mlx.mlx_expand_dims(&dA_e1, dA, 2, self.s));
+            try mlx.check(mlx.mlx_expand_dims(&dA_exp, dA_e1, 3, self.s));
+
+            // Decay state: state *= dA
+            var decayed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(decayed);
+            try mlx.check(mlx.mlx_multiply(&decayed, ssm.ssm_state, dA_exp, self.s));
+
+            // dtx = x_t * dt_t: [B, num_heads, head_dim]
+            var dt_exp2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dt_exp2);
+            try mlx.check(mlx.mlx_expand_dims(&dt_exp2, dt_t, 2, self.s)); // [B, num_heads, 1]
+            var dtx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dtx);
+            try mlx.check(mlx.mlx_multiply(&dtx, x_t, dt_exp2, self.s));
+
+            // Outer product update: dtx[..., :, None] * B_t[..., None, :]
+            // dtx: [B, H, D] → [B, H, D, 1]
+            // B_t: [B, H, S] → [B, H, 1, S]
+            var dtx_e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dtx_e);
+            try mlx.check(mlx.mlx_expand_dims(&dtx_e, dtx, 3, self.s));
+            var B_t_e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(B_t_e);
+            try mlx.check(mlx.mlx_expand_dims(&B_t_e, B_t, 2, self.s));
+            var update = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(update);
+            try mlx.check(mlx.mlx_multiply(&update, dtx_e, B_t_e, self.s));
+
+            // new_state = decayed + update
+            var new_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&new_state, decayed, update, self.s));
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = new_state;
+
+            // Output: y = sum_s(state * C_t) + x * D
+            // C_t: [B, H, S] → [B, H, 1, S]
+            var C_t_e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(C_t_e);
+            try mlx.check(mlx.mlx_expand_dims(&C_t_e, C_t, 2, self.s));
+            // state * C_t_e: [B, H, D, S]
+            var state_c = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(state_c);
+            try mlx.check(mlx.mlx_multiply(&state_c, ssm.ssm_state, C_t_e, self.s));
+            // sum over S: [B, H, D]
+            var y_state = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y_state);
+            try mlx.check(mlx.mlx_sum_axis(&y_state, state_c, -1, false, self.s));
+
+            // D * x: [B, H, D] where D_bc is [H, 1], x_t is [B, H, D]
+            var dx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dx);
+            try mlx.check(mlx.mlx_multiply(&dx, x_t, D_bc, self.s));
+
+            // y_t = y_state + dx
+            var y_t = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&y_t, y_state, dx, self.s));
+            _ = mlx.mlx_vector_array_append_value(out_vec, y_t);
+            _ = mlx.mlx_array_free(y_t);
+
+            if (t == 0) {
+                try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
+                log.debug("[mamba2] timestep 0 ok\n", .{});
+            } else if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) {
+                try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
+            }
+        }
+
+        // 10. Stack: [T, B, H, D] → transpose to [B, T, H, D]
+        var stacked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stacked);
+        try mlx.check(mlx.mlx_stack_axis(&stacked, out_vec, 0, self.s));
+        const perm_tbhd = [_]c_int{ 1, 0, 2, 3 };
+        var y_bthd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y_bthd);
+        try mlx.check(mlx.mlx_transpose_axes(&y_bthd, stacked, &perm_tbhd, 4, self.s));
+
+        // Flatten heads: [B, T, H, D] → [B, T, H*D]
+        const y_flat_shape = [_]c_int{ batch, seq_len, d_inner };
+        var y_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y_flat);
+        try mlx.check(mlx.mlx_reshape(&y_flat, y_bthd, &y_flat_shape, 3, self.s));
+
+        // 11. MambaRMSNormGated: silu(gate) * y, then group RMS norm, then weight
+        // swiglu: silu(gate) * y
+        const gated = try self.swiglu(gate, y_flat);
+        defer _ = mlx.mlx_array_free(gated);
+
+        // Group RMS norm: reshape to [B, S, n_groups, group_size], rms_norm per group, flatten
+        // group_size = intermediate_size / n_groups (e.g. 7680/8 = 960), NOT head_dim
+        const group_size: c_int = @divExact(d_inner, n_groups);
+        const gated_shape = [_]c_int{ batch, seq_len, n_groups, group_size };
+        var gated_grouped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated_grouped);
+        try mlx.check(mlx.mlx_reshape(&gated_grouped, gated, &gated_shape, 4, self.s));
+
+        var normed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(normed);
+        {
+            // Parameter-free RMS norm: create ones weight of shape [group_size]
+            const ones_shape = [_]c_int{group_size};
+            var ones_w = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ones_w);
+            try mlx.check(mlx.mlx_ones(&ones_w, &ones_shape, 1, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&normed, gated_grouped, ones_w, cfg.rms_norm_eps, self.s));
+        }
+
+        // Flatten back and apply weight
+        var normed_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(normed_flat);
+        try mlx.check(mlx.mlx_reshape(&normed_flat, normed, &y_flat_shape, 3, self.s));
+
+        var weighted = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(weighted);
+        try mlx.check(mlx.mlx_multiply(&weighted, normed_flat, mw.norm_w, self.s));
+
+        // 12. Output projection
+        return self.qmatmul(weighted, mw.out_proj_w, mw.out_proj_s, mw.out_proj_b);
+    }
+
+    // ── Hybrid attention (LFM2, Nemotron-H) ──
+
+    fn hybridAttn(
+        self: *Transformer,
+        x: mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer_idx: u32,
+        offset: c_int,
+        batch: c_int,
+        seq_len: c_int,
+        is_prefill: bool,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        const n_heads: c_int = @intCast(cfg.num_attention_heads);
+        const n_kv_heads: c_int = @intCast(cfg.num_key_value_heads);
+        const hd: c_int = @intCast(cfg.head_dim);
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+
+        // Q/K/V projections
+        const q_raw = try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
+        defer _ = mlx.mlx_array_free(q_raw);
+        const k_raw = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
+        defer _ = mlx.mlx_array_free(k_raw);
+        const v_raw = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+        defer _ = mlx.mlx_array_free(v_raw);
+
+        // Reshape to heads: [B, S, n*hd] → [B, S, n, hd]
+        const q_shape = [_]c_int{ batch, seq_len, n_heads, hd };
+        const kv_shape = [_]c_int{ batch, seq_len, n_kv_heads, hd };
+        var q = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q);
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_reshape(&q, q_raw, &q_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&k, k_raw, &kv_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&v, v_raw, &kv_shape, 4, self.s));
+
+        // QK LayerNorm (LFM2 has it, Nemotron-H does not — checked by weight presence)
+        if (cfg.has_qk_norm) {
+            var q_normed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_fast_rms_norm(&q_normed, q, fa.q_norm, cfg.rms_norm_eps, self.s));
+            _ = mlx.mlx_array_free(q);
+            q = q_normed;
+            var k_normed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_fast_rms_norm(&k_normed, k, fa.k_norm, cfg.rms_norm_eps, self.s));
+            _ = mlx.mlx_array_free(k);
+            k = k_normed;
+        }
+
+        // Transpose to [B, n, S, hd] for attention and RoPE
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        var q_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_t);
+        var k_t = mlx.mlx_array_new();
+        var v_t = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_transpose_axes(&q_t, q, &perm, 4, self.s));
+        try mlx.check(mlx.mlx_transpose_axes(&k_t, k, &perm, 4, self.s));
+        try mlx.check(mlx.mlx_transpose_axes(&v_t, v, &perm, 4, self.s));
+
+        // RoPE (applied after transpose to [B, n, S, hd])
+        const rope_base = mlx.mlx_optional_float.some(cfg.rope_theta);
+        const no_freqs = mlx.mlx_array{ .ctx = null };
+        try mlx.check(mlx.mlx_fast_rope(&q_t, q_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&k_t, k_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
+
+        // KV cache: update and get full K/V
+        const kv = try self.cache.update(layer_idx, k_t, v_t, self.s, cfg.max_position_embeddings);
+        _ = mlx.mlx_array_free(k_t);
+        _ = mlx.mlx_array_free(v_t);
+        k_t = kv.@"0";
+        v_t = kv.@"1";
+
+        // Scaled dot-product attention (causal)
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+
+        var attn_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_out);
+        if (is_prefill) {
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+        } else {
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+        }
+
+        // Transpose back: [B, n, S, hd] → [B, S, n, hd] → [B, S, n*hd]
+        var attn_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_t);
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
+        const flat_shape = [_]c_int{ batch, seq_len, n_heads * hd };
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+
+        return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    }
+
+    // ── Simple (ungated) MLP with ReLU^2 (Nemotron-H) ──
+
+    fn simpleMLP(self: *Transformer, x: mlx.mlx_array, sw: *const SimpleMlpWeights) !mlx.mlx_array {
+        const up = try self.qmatmul(x, sw.up_w, sw.up_s, sw.up_b);
+        defer _ = mlx.mlx_array_free(up);
+        const activated = try self.reluSquared(up);
+        defer _ = mlx.mlx_array_free(activated);
+        return self.qmatmul(activated, sw.down_w, sw.down_s, sw.down_b);
+    }
+
     /// Forward pass that returns hidden states (after final_norm, before lm_head).
     /// Output shape: [1, seq_len, hidden_size]. Caller must free.
     pub fn forwardEmbedding(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
@@ -2763,48 +3515,8 @@ pub const Transformer = struct {
             a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
             b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
         }
-
-        // Conv1d: prepend conv_state, apply depthwise conv, then silu
-        var conv_input: mlx.mlx_array = undefined;
-        defer _ = mlx.mlx_array_free(conv_input);
-        if (ssm.initialized) {
-            const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
-            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            conv_input = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s));
-        } else {
-            // First call: prepend zeros
-            const zero_shape = [_]c_int{ batch, kernel - 1, conv_dim };
-            var zero_state = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(zero_state);
-            try mlx.check(mlx.mlx_zeros(&zero_state, &zero_shape, 3, .bfloat16, self.s));
-            const arr = [_]mlx.mlx_array{ zero_state, qkv };
-            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            conv_input = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s));
-        }
-
-        // Update conv_state: keep last (kernel-1) positions
-        {
-            const ci_shape = mlx.getShape(conv_input);
-            const ci_len = ci_shape[1];
-            const keep_start = ci_len - (kernel - 1);
-            const start = [_]c_int{ 0, keep_start, 0 };
-            const stop = [_]c_int{ batch, ci_len, conv_dim };
-            const strides = [_]c_int{ 1, 1, 1 };
-            var new_conv_state = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&new_conv_state, conv_input, &start, 3, &stop, 3, &strides, 3, self.s));
-            _ = mlx.mlx_array_free(ssm.conv_state);
-            ssm.conv_state = new_conv_state;
-        }
-
-        // Depthwise conv1d + silu
-        var conv_out_raw = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(conv_out_raw);
-        try mlx.check(mlx.mlx_conv1d(&conv_out_raw, conv_input, la.conv1d_w, 1, 0, 1, conv_dim, self.s));
-        const conv_out = try self.silu(conv_out_raw); // [B, S, conv_dim]
+        // Conv1d with cache: prepend conv_state, apply depthwise conv + silu
+        const conv_out = try self.conv1dWithCache(qkv, la.conv1d_w, null, ssm, batch, conv_dim, kernel, true);
         defer _ = mlx.mlx_array_free(conv_out);
 
         // Split conv output into Q, K, V
@@ -2856,16 +3568,22 @@ pub const Transformer = struct {
         const inv_sqrt_sc = bf16Scalar(inv_sqrt_scale, self.s);
         defer _ = mlx.mlx_array_free(inv_sqrt_sc);
 
+        // Parameter-free RMS norm: use ones weight (mlx-c requires non-empty array)
+        const ones_shape = [_]c_int{dk};
+        var ones_w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ones_w);
+        try mlx.check(mlx.mlx_ones(&ones_w, &ones_shape, 1, .bfloat16, self.s));
+
         var q_norm = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_norm);
-        try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, .{ .ctx = null }, 1e-6, self.s));
+        try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, 1e-6, self.s));
         var q_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_scaled);
         try mlx.check(mlx.mlx_multiply(&q_scaled, q_norm, inv_scale_sq, self.s));
 
         var k_norm = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_norm);
-        try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, .{ .ctx = null }, 1e-6, self.s));
+        try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, 1e-6, self.s));
         var k_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_scaled);
         try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, self.s));
@@ -2933,13 +3651,13 @@ pub const Transformer = struct {
             if (k_rep_owned) _ = mlx.mlx_array_free(k_rep);
         }
 
-        // Initialize SSM state if needed
-        if (!ssm.initialized) {
+        // Initialize SSM state if needed.
+        // Can't use ssm.initialized — conv1dWithCache already set it to true.
+        // Check if ssm_state is empty (ctx == null) as the actual init indicator.
+        if (ssm.ssm_state.ctx == null) {
             const state_shape = [_]c_int{ batch, num_v_heads, dv, dk };
-            _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_zeros(&ssm.ssm_state, &state_shape, 4, .bfloat16, self.s));
-            ssm.initialized = true;
         }
 
         // Delta recurrence: loop over timesteps
@@ -3667,6 +4385,147 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     return .{ .moe_layers = moe_layers, .ssm_entries = ssm_entries };
 }
 
+fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, _: mlx.mlx_stream) !struct { hybrid_layers: []HybridLayerWeights, ssm_entries: []SSMCacheEntry } {
+    log.info("Precomputing hybrid layer weights...\n", .{});
+    const prefix = config.weight_prefix;
+    const hybrid_layers = try allocator.alloc(HybridLayerWeights, config.num_hidden_layers);
+    const ssm_entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
+    const is_lfm2 = std.mem.eql(u8, config.model_type, "lfm2");
+    const is_nemotron = std.mem.eql(u8, config.model_type, "nemotron_h");
+
+    for (0..config.num_hidden_layers) |i| {
+        const li: u32 = @intCast(i);
+        const lw = &hybrid_layers[i];
+        const block_type = config.layer_block_types[i];
+
+        // Input norm: LFM2 uses "operator_norm", Nemotron-H uses "norm"
+        if (is_lfm2) {
+            lw.input_norm = getLayerWeight(weights, name_buf, prefix, li, "operator_norm.weight");
+        } else {
+            lw.input_norm = getLayerWeight(weights, name_buf, prefix, li, "norm.weight");
+        }
+
+        // Post norm (before MLP): LFM2 uses "ffn_norm", Nemotron-H single-op blocks have none
+        if (is_lfm2) {
+            lw.post_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "ffn_norm.weight");
+        } else {
+            lw.post_norm = null;
+        }
+
+        // Initialize SSM/conv cache entry
+        ssm_entries[i] = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = false,
+        };
+
+        switch (block_type) {
+            .gated_conv => {
+                lw.op = .{ .gated_conv = .{
+                    .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.weight"),
+                    .in_proj_s = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.scales"),
+                    .in_proj_b = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.biases"),
+                    .conv_w = getLayerWeight(weights, name_buf, prefix, li, "conv.conv.weight"),
+                    .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.weight"),
+                    .out_proj_s = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.scales"),
+                    .out_proj_b = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.biases"),
+                } };
+            },
+            .attention => {
+                if (is_nemotron) {
+                    // Nemotron-H: mixer.{q,k,v,o}_proj, no QK norms
+                    // Use Opt for biases — mxfp8 quantized layers may lack them
+                    lw.op = .{ .full_attn = .{
+                        .q_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.q_proj.weight"),
+                        .q_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.q_proj.scales"),
+                        .q_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.q_proj.biases") orelse mlx.mlx_array_new(),
+                        .k_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.k_proj.weight"),
+                        .k_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.k_proj.scales"),
+                        .k_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.k_proj.biases") orelse mlx.mlx_array_new(),
+                        .v_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.v_proj.weight"),
+                        .v_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.v_proj.scales"),
+                        .v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.v_proj.biases") orelse mlx.mlx_array_new(),
+                        .o_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.o_proj.weight"),
+                        .o_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.o_proj.scales"),
+                        .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.o_proj.biases") orelse mlx.mlx_array_new(),
+                        .q_norm = mlx.mlx_array_new(),
+                        .k_norm = mlx.mlx_array_new(),
+                    } };
+                } else {
+                    // LFM2: self_attn.{q,k,v}_proj + out_proj, QK layernorms
+                    lw.op = .{ .full_attn = .{
+                        .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
+                        .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
+                        .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
+                        .k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight"),
+                        .k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales"),
+                        .k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases"),
+                        .v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight"),
+                        .v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales"),
+                        .v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases"),
+                        .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.weight"),
+                        .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.scales"),
+                        .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.biases"),
+                        .q_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_layernorm.weight") orelse mlx.mlx_array_new(),
+                        .k_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_layernorm.weight") orelse mlx.mlx_array_new(),
+                    } };
+                }
+            },
+            .mamba2 => {
+                lw.op = .{ .mamba2 = .{
+                    .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.in_proj.weight"),
+                    .in_proj_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.in_proj.scales"),
+                    .in_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.in_proj.biases") orelse mlx.mlx_array_new(),
+                    .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.conv1d.weight"),
+                    .conv1d_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.conv1d.bias"),
+                    .A_log = getLayerWeight(weights, name_buf, prefix, li, "mixer.A_log"),
+                    .D = getLayerWeight(weights, name_buf, prefix, li, "mixer.D"),
+                    .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "mixer.dt_bias"),
+                    .norm_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.norm.weight"),
+                    .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.out_proj.weight"),
+                    .out_proj_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.out_proj.scales"),
+                    .out_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.out_proj.biases") orelse mlx.mlx_array_new(),
+                } };
+            },
+            .mlp => {
+                // Nemotron-H standalone MLP (ReLU^2, ungated: up + down only)
+                lw.op = .{ .simple_mlp = .{
+                    .up_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.up_proj.weight"),
+                    .up_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.up_proj.scales"),
+                    .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .down_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.down_proj.weight"),
+                    .down_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.down_proj.scales"),
+                    .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.down_proj.biases") orelse mlx.mlx_array_new(),
+                } };
+            },
+            .moe => {
+                // TODO: Nemotron MoE support
+                unreachable;
+            },
+        }
+
+        // MLP: present for all LFM2 layers, absent for Nemotron-H single-op blocks
+        if (is_lfm2) {
+            // LFM2 uses feed_forward.w1 (gate), w3 (up), w2 (down) — SwiGLU
+            lw.mlp = .{
+                .gate_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.weight"),
+                .gate_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.scales"),
+                .gate_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.biases"),
+                .up_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.weight"),
+                .up_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.scales"),
+                .up_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.biases"),
+                .down_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.weight"),
+                .down_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.scales"),
+                .down_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.biases"),
+            };
+        } else {
+            lw.mlp = null;
+        }
+    }
+
+    return .{ .hybrid_layers = hybrid_layers, .ssm_entries = ssm_entries };
+}
+
 fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) void {
     inline for (std.meta.fields(FullAttnWeights)) |field| {
         _ = mlx.mlx_vector_array_append_value(vec, @field(fa, field.name));
@@ -3718,6 +4577,38 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    // Detect mxfp8 mode: biases array has null ctx (created with mlx_array_new())
+    const is_mxfp = bi.ctx == null;
+
+    if (is_mxfp) {
+        // mxfp8: bits is always 8; infer group_size from scales/weight shape ratio
+        const mxfp_bits: u32 = 8;
+        const s_shape = mlx.getShape(sc);
+        const w_shape = mlx.getShape(w);
+        const mxfp_gs: u32 = if (s_shape.len >= 2 and w_shape.len >= 2) blk: {
+            const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
+            const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
+            if (s_cols > 0) break :blk (w_cols * 32) / (s_cols * mxfp_bits);
+            break :blk 32;
+        } else 32;
+
+        const null_bi = mlx.mlx_array{ .ctx = null };
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &result,
+            x,
+            w,
+            sc,
+            null_bi,
+            true,
+            mlx.mlx_optional_int.some(@intCast(mxfp_gs)),
+            mlx.mlx_optional_int.some(@intCast(mxfp_bits)),
+            "mxfp8",
+            s,
+        ));
+        return result;
+    }
+
     var result = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_quantized_matmul(
         &result,
@@ -3949,6 +4840,8 @@ fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
         .moe_layers = null,
         .ssm_entries = null,
         .moe_seq_offset = 0,
+        .hybrid_layers = null,
+        .embedding_norm = null,
         .prompt_cache = null,
     };
 }

@@ -70,6 +70,34 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 - For tests: `zig build test` (Zig) and `cd app && swift test` (Swift)
 - **Rebuild Jinja library** (after changing `lib/jinja_cpp/*.cpp`): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
 
+## Versioning & Releases
+
+**Scheme**: CalVer `YY.M.N` — e.g., `v26.4.25` means 2026, April, 25th release that month.
+- `YY.M` comes from the build date
+- `N` is auto-incremented from the last GitHub release for that `YY.M` prefix
+- `build.sh` computes the version automatically via `gh release list`
+
+**Version sources** (all set by `build.sh`):
+- `app/Info.plist` → `CFBundleVersion` + `CFBundleShortVersionString`
+- Zig binary → passed via `-Dversion` build option (consumed as `build_options.version` in `main.zig`)
+- Git tag → created manually with `gh release create v{version}`
+
+**Release process**:
+1. Update `CHANGELOG.md` with a new entry — use the NEXT version, not the current latest release. Run `gh release list --limit 1` to check what's already released.
+2. Commit and push changes
+3. Run `cd app && SKIP_NOTARIZE=1 bash build.sh` — this computes the version, builds everything, and prints the `gh release create` command at the end
+4. Run the printed `gh release create` command
+
+**Important**: Never write a CHANGELOG entry using a version that already exists as a GitHub release. Always check `gh release list` first.
+
+## Benchmarking
+
+Run `./bench.sh` after every major feature or optimization change. Results go in `BenchmarkLog.md`.
+- `./bench.sh` — full suite: mlx-serve + mlx-lm reference, all models
+- `./bench.sh --model gemma` — single model
+- `./bench.sh --no-mlx-lm` — skip Python reference
+- `./bench.sh --runs 5` — more runs for tighter averages
+
 ## Conventions
 
 - Prefer minimal, DRY Zig; avoid unnecessary abstraction.
@@ -90,8 +118,10 @@ Model support is determined by `model_type` in the model's `config.json`. The se
 | `gemma4`, `gemma4_text` | Gemma 4 | `language_model.model` | SigLIP | -- | Full support incl. vision, clipped linears, PLE |
 | `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
 | `qwen3` | Qwen 3 | `model` | -- | -- | QK norm enabled |
-| `qwen3_5`, `qwen3_5_moe`, `qwen3_5_moe_text` | Qwen 3.5 | `language_model.model` | -- | Shared expert | PLE weights, MoE routing |
+| `qwen3_5`, `qwen3_5_moe`, `qwen3_5_moe_text` | Qwen 3.5 / 3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense MLP, shared expert routing |
 | `qwen3_next` | Qwen 3-next | `model` | -- | Optional | DeltaNet (GatedDeltaNet layers) |
+| `nemotron_h` | NVIDIA Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM, per-timestep recurrence |
+| `lfm2` | Liquid LFM2.5 | `model` | -- | -- | Hybrid gated conv + full attention, state-space recurrence |
 | `llama` | Llama | `model` | -- | -- | |
 | `mistral` | Mistral | `model` | -- | -- | |
 
@@ -99,9 +129,7 @@ Model support is determined by `model_type` in the model's `config.json`. The se
 
 | `model_type` | Family | Blocked by | Effort |
 |---|---|---|---|
-| `lfm2` | Liquid LFM2.5 | State-space (non-transformer) architecture — needs new forward pass | High |
-| `lfm2-vl` | Liquid LFM2.5-VL | Same as lfm2 + vision encoder | High |
-| `nemotron_h` | NVIDIA Nemotron-H | Hybrid transformer + Mamba (SSM) layers — needs Mamba forward pass | High |
+| `lfm2-vl` | Liquid LFM2.5-VL | Needs vision encoder integration | Medium |
 | `phi`, `phi3` | Microsoft Phi | Different attention/MLP layout, different weight names | Medium |
 | `command-r` | Cohere Command R | Different architecture | Medium |
 
@@ -214,6 +242,15 @@ Gemma 4 templates handle `role: "tool"` natively (producing `<|turn>tool`). No t
 
 ### Streaming with tools and thinking
 When `tools` are present, the server buffers tokens to detect tool call patterns. If thinking is also enabled, `<|channel>thought` tokens are detected and kept buffered (not flushed as content) until the closing `<channel|>` tag. After generation, thinking content is split from visible content and emitted as `reasoning_content`. Channel tags (`<|channel>`, `<channel|>`) are stripped from visible content.
+
+### SSM/GatedDeltaNet state initialization
+`conv1dWithCache` sets `ssm.initialized = true` after updating the conv state, but BEFORE the SSM recurrence state is created. Code that initializes SSM state must check `ssm.ssm_state.ctx == null` (not `!ssm.initialized`). Both `mamba2Mixer` and `gatedDeltaNet` use this pattern.
+
+### Parameter-free RMS norm (mlx-c)
+mlx-c requires a non-empty weight array for `mlx_fast_rms_norm`. Passing a null/empty array (`.{ .ctx = null }`) crashes. For parameter-free normalization, pass `ones([dim], bfloat16)` as the weight. This affects GatedDeltaNet Q/K normalization and Mamba2 group norm.
+
+### Nemotron-H time_step_limit
+Python's `ModelArgs.__post_init__` defaults `time_step_limit` to `(0.0, inf)` — effectively no dt clipping. The config.json fields `time_step_min`/`time_step_max` exist but are NOT used for SSM clipping by Python. Our defaults match Python: `(0.0, inf)`. Only the `time_step_limit` JSON array (if present) overrides these.
 
 ### mlx-c API changes
 mlx-c 0.6.0 added a `global_scale` parameter (may be null) to `mlx_dequantize` between `mode` and `dtype`. The FFI declaration in `mlx.zig` must match the installed header. When upgrading mlx-c, diff the headers in `/opt/homebrew/include/mlx/c/ops.h` against the `extern "c"` declarations in `src/mlx.zig`.

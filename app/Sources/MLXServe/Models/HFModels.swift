@@ -11,10 +11,12 @@ private let compatiblePipelineTags: Set<String> = [
 /// A model is supported if any of its tags starts with one of these prefixes.
 /// HF tags vary (gemma3, gemma4, gemma3n, qwen3_5, qwen3.5, etc.) so prefix matching is needed.
 private let supportedArchitectureTagPrefixes: [String] = [
-    "gemma",   // gemma, gemma2, gemma3, gemma3n, gemma4
-    "qwen",    // qwen2, qwen3, qwen3_5, qwen3.5
+    "gemma",      // gemma, gemma2, gemma3, gemma3n, gemma4
+    "qwen",       // qwen2, qwen3, qwen3_5, qwen3.5, qwen3.6
     "llama",
     "mistral",
+    "nemotron",   // nemotron_h (Mamba2 SSM hybrid)
+    "lfm",        // lfm2, lfm2-vl (Liquid state-space hybrid)
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -23,6 +25,8 @@ let supportedModelTypes: Set<String> = [
     "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen2",
     "llama", "mistral",
+    "lfm2", "lfm2-vl",
+    "nemotron_h",
 ]
 
 struct HFModel: Identifiable, Codable {
