@@ -121,6 +121,7 @@ enum AgentEngine {
             let msg = allMessages[i]
             if msg.role == .system && msg.toolCallId == nil { continue }
             if msg.isAgentSummary { continue }
+            if msg.failedRetry { continue }
             if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
 
             let cost = tokenCostForMessage(msg)
@@ -188,6 +189,7 @@ enum AgentEngine {
 
         // Emit messages from the backward-walk window.
         for msg in window {
+            if msg.failedRetry { continue }
             // Tool responses — progressive truncation
             if let callId = msg.toolCallId {
                 let isRecent = toolResultsSeen >= totalToolResults - 2

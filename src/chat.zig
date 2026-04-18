@@ -205,9 +205,21 @@ fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message
                 try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
                 try appendJsonString(allocator, &buf, tc.name);
                 try buf.appendSlice(allocator, ",\"arguments\":");
-                // Arguments must be a JSON string (not parsed object) for templates
-                // that format tool calls themselves (e.g. Gemma 4).
-                try appendJsonString(allocator, &buf, tc.arguments);
+                // Embed arguments as a JSON OBJECT when it parses cleanly — Qwen
+                // 3.5/3.6 templates do `tool_call.arguments|items` which requires
+                // a dict. Templates that need a string (e.g. Gemma 4 with `tojson`
+                // or `string`) still get a usable value. Falls back to a string
+                // for malformed arguments so downstream still sees something.
+                if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{})) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value == .object) {
+                        try buf.appendSlice(allocator, tc.arguments);
+                    } else {
+                        try appendJsonString(allocator, &buf, tc.arguments);
+                    }
+                } else |_| {
+                    try appendJsonString(allocator, &buf, tc.arguments);
+                }
                 try buf.appendSlice(allocator, "}}");
             }
             try buf.append(allocator, ']');
@@ -517,9 +529,19 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
         };
     }
     if (thinking) {
-        const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
-        const reasoning = std.mem.trimLeft(u8, text[start..], "\n ");
-        return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
+        // Unclosed think block: split policy depends on whether the model's
+        // output begins with a literal opener.
+        //   • Literal opener present → model definitely entered thinking but
+        //     ran out of tokens / didn't close. Treat as reasoning.
+        //   • No literal opener → template likely injected the opener and the
+        //     model either didn't think or thought without closing. Either way,
+        //     defaulting to content keeps the answer visible to the user.
+        if (std.mem.startsWith(u8, text, "<think>") or std.mem.startsWith(u8, text, "<|channel>thought")) {
+            const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
+            const reasoning = std.mem.trimLeft(u8, text[start..], "\n ");
+            return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
+        }
+        return .{ .reasoning_content = null, .content = std.mem.trimLeft(u8, text, "\n ") };
     }
     return .{ .reasoning_content = null, .content = text };
 }
@@ -614,20 +636,68 @@ pub const ParsedToolCall = struct {
 };
 
 fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedToolCall {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch blk: {
+        // Strict parse failed. Try a chain of repairs for known Qwen MoE shapes:
+        //   1. {"name":"shell", {"command":"ls"}}           — missing `"arguments":` key entirely
+        //   2. {"name":"shell", arguments":{"command":..}}   — missing OPENING quote on `arguments`
+        // Repairs are cheap and run only on the parse-failure path.
+        const repaired = repairBrokenToolCallJson(allocator, text) orelse return null;
+        defer allocator.free(repaired);
+        const reparsed = std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch return null;
+        break :blk reparsed;
+    };
     defer parsed.deinit();
 
     if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
+    var obj = parsed.value.object;
+
+    // Qwen 3.5/3.6 MoE sometimes emits nested-name garbage like
+    //   {"name":{"name":{"name":"write","arguments":{...}}}}
+    // Walk down through up to a few levels of nested "name" objects to find the
+    // leaf object that has a string name + arguments/parameters. Observed in the
+    // wild with pi + Qwen3.6-35B in non-thinking mode.
+    {
+        var depth: u8 = 0;
+        while (depth < 4) : (depth += 1) {
+            const nv = obj.get("name") orelse return null;
+            switch (nv) {
+                .string => break,
+                .object => |inner| obj = inner,
+                else => return null,
+            }
+        }
+    }
 
     const name_val = obj.get("name") orelse return null;
     if (name_val != .string) return null;
 
-    const args_val = obj.get("arguments") orelse (obj.get("parameters") orelse return null);
-    const args_str = switch (args_val) {
-        .object => std.json.Stringify.valueAlloc(allocator, args_val, .{}) catch return null,
-        .string => |s| allocator.dupe(u8, s) catch return null,
-        else => return null,
+    const args_str: []const u8 = blk: {
+        if (obj.get("arguments") orelse obj.get("parameters")) |args_val| {
+            break :blk switch (args_val) {
+                .object => std.json.Stringify.valueAlloc(allocator, args_val, .{}) catch return null,
+                .string => |s| allocator.dupe(u8, s) catch return null,
+                else => return null,
+            };
+        }
+        // Flat shape (e.g. Qwen MoE): {"name":"shell","command":"ls"} —
+        // parameters live at top level. Synthesize an arguments object from
+        // every non-metadata key.
+        var flat_map = std.json.ObjectMap.init(allocator);
+        defer flat_map.deinit();
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (std.mem.eql(u8, k, "name") or
+                std.mem.eql(u8, k, "id") or
+                std.mem.eql(u8, k, "type"))
+            {
+                continue;
+            }
+            flat_map.put(k, entry.value_ptr.*) catch return null;
+        }
+        if (flat_map.count() == 0) return null;
+        const flat_value = std.json.Value{ .object = flat_map };
+        break :blk std.json.Stringify.valueAlloc(allocator, flat_value, .{}) catch return null;
     };
 
     return .{
@@ -637,6 +707,68 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
         },
         .arguments = args_str,
     };
+}
+
+/// Run known Qwen-MoE-broken-JSON repairs in sequence; return the first
+/// successfully-repaired string (allocator-owned), or null if none match.
+fn repairBrokenToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    if (repairFlatBraceToolCallJson(allocator, text)) |s| return s;
+    if (repairUnquotedArgsKey(allocator, text)) |s| return s;
+    return null;
+}
+
+/// Repair `{"name":"x", arguments":{...}}` (missing OPENING quote on
+/// `arguments`/`parameters`) by injecting the quote.
+fn repairUnquotedArgsKey(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+    // Look for the unquoted-key pattern. Both `arguments` and `parameters`
+    // have been observed; both are short fixed strings, so direct search is fine.
+    const candidates = [_][]const u8{ ", arguments\":", ",arguments\":", ", parameters\":", ",parameters\":" };
+    for (candidates) |needle| {
+        if (std.mem.indexOf(u8, trimmed, needle)) |at| {
+            const insert_at = at + 1; // right after the comma
+            // Skip leading whitespace after the comma so the injected `"` lands on the identifier.
+            var p = insert_at;
+            while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t')) p += 1;
+            return std.fmt.allocPrint(allocator, "{s}\"{s}", .{ trimmed[0..p], trimmed[p..] }) catch null;
+        }
+    }
+    return null;
+}
+
+/// Repair the Qwen-MoE-broken shape `{"name":"x", {"k":"v"}}` by injecting
+/// the missing `"arguments":` key between the comma and the inner object.
+/// Returns an allocator-owned repaired JSON string, or null if the pattern
+/// doesn't match.
+fn repairFlatBraceToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+    if (trimmed.len < 4 or trimmed[0] != '{') return null;
+
+    // Locate `"name"` key.
+    const name_at = std.mem.indexOf(u8, trimmed, "\"name\"") orelse return null;
+    var p = name_at + 6;
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != ':') return null;
+    p += 1;
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != '"') return null;
+
+    // Skip the string value.
+    p += 1;
+    while (p < trimmed.len and trimmed[p] != '"') {
+        if (trimmed[p] == '\\' and p + 1 < trimmed.len) p += 2 else p += 1;
+    }
+    if (p >= trimmed.len) return null;
+    p += 1;
+
+    // Expect `, {` (any whitespace).
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t' or trimmed[p] == '\n')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != ',') return null;
+    p += 1;
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t' or trimmed[p] == '\n')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != '{') return null;
+
+    return std.fmt.allocPrint(allocator, "{s}\"arguments\":{s}", .{ trimmed[0..p], trimmed[p..] }) catch null;
 }
 
 /// Parse Gemma 4 tool call format: "call:function_name{json_args}"
@@ -907,10 +1039,20 @@ test "splitThinkBlock with empty reasoning" {
     try testing.expectEqualStrings("actual content", result.content);
 }
 
-test "splitThinkBlock thinking=true no close tag" {
+test "splitThinkBlock thinking=true no close tag, literal opener present" {
+    // Model entered thinking but ran out of tokens before closing.
     const result = splitThinkBlock("<think>partial reasoning", true);
     try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
     try testing.expectEqualStrings("", result.content);
+}
+
+test "splitThinkBlock thinking=true no close tag, no opener (template-injected)" {
+    // Qwen 3.6 case: chat template injects `<think>\n` so model output starts
+    // mid-block; if model finishes without `</think>`, treat as content so
+    // the user actually sees the answer.
+    const result = splitThinkBlock("It is currently 8:15 AM PDT.", true);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("It is currently 8:15 AM PDT.", result.content);
 }
 
 test "splitThinkBlock thinking=false no tags" {
@@ -942,6 +1084,159 @@ test "parseToolCalls JSON format" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "parseToolCalls Qwen3.6 MoE nested-name garbage (real capture)" {
+    // Captured verbatim from Qwen3.6-35B-A3B-6bit generating a tool call in
+    // streaming mode with enable_thinking=false and tools present.
+    // parseToolCalls previously returned null here because the top-level "name"
+    // is an object, not a string — tokens then leaked as plain-text content.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name": {"name": {"name":  "write", "arguments": {"path": "/tmp/x/app.test.js", "content": "hello"}}}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/x/app.test.js", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("hello", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls Qwen MoE double-nested name" {
+    // Two layers of nesting — defensive test for a slightly different shape.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name":{"name":"shell","arguments":{"command":"ls"}}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+}
+
+test "parseToolCalls flat Qwen MoE shape (no arguments wrapper)" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"shell\", \"command\": \"mkdir -p 2ddungeon\"}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mkdir -p 2ddungeon", parsed.value.object.get("command").?.string);
+    try testing.expect(parsed.value.object.get("name") == null);
+}
+
+test "parseToolCalls flat shape with multiple top-level args" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"writeFile\", \"path\": \"/tmp/a\", \"content\": \"hi\"}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/a", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("hi", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls flat shape ignores id/type metadata" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"id\": \"call_1\", \"type\": \"function\", \"name\": \"shell\", \"command\": \"ls\"}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls", parsed.value.object.get("command").?.string);
+    try testing.expect(parsed.value.object.get("id") == null);
+    try testing.expect(parsed.value.object.get("type") == null);
+}
+
+test "parseToolCalls repairs Qwen MoE missing-arguments-key shape" {
+    const allocator = testing.allocator;
+    // Real broken output observed from Qwen3.6-35B-A3B-6bit:
+    // {"name": "shell",  {"command":"ls"}}  — `, {` instead of `, "arguments": {`
+    const text = "<tool_call>\n{\"name\":  \"shell\",     {\"command\":\"ls -la\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls repairs Qwen MoE missing-opening-quote on arguments key" {
+    const allocator = testing.allocator;
+    // Real broken output observed from Qwen3.6-35B-A3B-6bit:
+    // {"name": "shell", arguments": {"command":"mkdir -p src/app"}}
+    // — missing the OPENING `"` on the `arguments` key.
+    const text = "<tool_call>\n{\"name\": \"shell\", arguments\": {\"command\": \"mkdir -p src/app\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mkdir -p src/app", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls returns null for name-only object (no real args)" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"shell\"}\n</tool_call>";
+    const result = try parseToolCalls(allocator, text);
+    try testing.expect(result == null);
 }
 
 test "parseToolCalls multiple calls" {
@@ -1318,6 +1613,40 @@ test "serializeMessagesJson with tool_calls" {
     // Should contain tool_calls array
     try testing.expect(std.mem.indexOf(u8, result, "\"tool_calls\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+}
+
+test "serializeMessagesJson embeds valid-JSON arguments as object (not string)" {
+    // Required by Qwen 3.5/3.6 templates that do `tool_call.arguments|items`.
+    // Without this, the Jinja `items` filter fails on a string and the server
+    // falls back to ChatML — losing the `<think>\n` injection that primes the
+    // model's reasoning + close-tag behavior on the next turn.
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"date\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // Object form: ..."arguments":{"command":"date"}...
+    // String form (rejected): ..."arguments":"{\"command\":\"date\"}"...
+    try testing.expect(std.mem.indexOf(u8, result, "\"arguments\":{\"command\":\"date\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"arguments\":\"{") == null);
+}
+
+test "serializeMessagesJson keeps malformed arguments as string" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "not valid json" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"arguments\":\"not valid json\"") != null);
 }
 
 test "serializeMessagesJson tool response has tool_call_id and content" {

@@ -1,5 +1,40 @@
 # Changelog
 
+## v26.4.26 — Qwen 3.5/3.6 Tool-Call Reliability, Thinking Streaming, Swift Agent Robustness
+
+### Qwen 3.5/3.6 MoE Tool-Call Fixes
+- **Nested-name repair**: `chat.tryParseJsonToolCall` now walks down through up to 4 levels of `{"name":{"name":{…}}}` wrappers when Qwen 3.5/3.6 MoE emits garbage-wrapped tool-call JSON in streaming mode. Prior behaviour was to drop the whole `<tool_call>` block onto the content stream as plain text, which stranded agentic clients. Observed in the wild with `pi` + Qwen3.6-35B-A3B-6bit (`--thinking off`), now repaired cleanly. Two new regression tests in `src/chat.zig`.
+- **Missing `"arguments":` repair**: `{"name":"shell", {"command":"ls"}}` (opening quote/colon missing on `arguments`) — now recognised and repaired before JSON parse.
+- **Unquoted-key repair**: `{"name":"shell", arguments":{…}}` (missing OPENING quote on `arguments`) — injected before parse.
+- **KV cache reset on identical prompt**: Re-issuing the exact same prompt (common in idempotent retries) no longer reuses stale KV residue from the previous generation. Fixes generation-quality drift on Qwen3.5/3.6 MoE when a prompt is replayed.
+- **Client-side fallback**: Swift `APIClient` now scans accumulated streamed content for `<tool_call>…</tool_call>` blocks as a last resort when no `tool_calls` delta arrives — belt-and-suspenders with the server repair.
+
+### Thinking-Tag Streaming (Qwen, Gemma 4)
+- **Template-pre-injected opener handling**: Many templates (Qwen 3.5/3.6, some Gemma 4 variants) pre-inject `<think>\n` into the prompt, so the model's first token is already inside the thinking block. The streaming parser now stays in the think block when no literal opener appears, and flushes reasoning tokens with a 9-byte look-behind buffer for the longest close tag (`</think>` / `<channel|>`).
+- **Dual close-tag detection**: Both `</think>` and `<channel|>` are scanned every tick — whichever appears first wins. Eliminates the case where a model switches tag style mid-stream.
+- **Mirror fix in Anthropic Messages endpoint**: `handleAnthropicStreaming` gets the same treatment so Claude Code / Anthropic SDK clients see clean `thinking` blocks.
+
+### Swift Agent Harness Robustness (MLX Core app)
+- **Stream watchdog**: 90 s inactivity watchdog around the agent-loop SSE consumer. A stalled server, sampling-degenerate loop, or KV-cache poison scenario now surfaces a clear "the model didn't respond within 90s" error instead of an indefinite spinner. Stop button cancellation is preserved via `withTaskCancellationHandler`.
+- **`failedRetry` flag on `ChatMessage`**: Pad-retry and max-tokens truncation recovery no longer `removeLast()` the streamed assistant message — they flag it `failedRetry` so its reasoning stays visible in the UI but it's excluded from future API history. Fixes "thinking block disappears mid-conversation" regression.
+- **Completion-text guarantee**: When the agent exits with no tool calls and the final content contains a malformed tool-call tag (`<|tool_call>…`, `<tool_call>…`, `<function=…`), it re-prompts once for a plain-text summary. The per-turn nudge after tool results now asks explicitly for "short plain-text summary for the user — no tool calls, no JSON" when the task is complete.
+- **Per-tool 30s timeout for `browse` / `webSearch`**: `withThrowingTaskGroup`-based ceiling on any single browser-tool invocation; `BrowserManager.evaluateJavaScript` calls also get an inner 25 s cap. A hung page can no longer freeze the agent loop.
+
+### Testing Infrastructure
+- **`pi-integration-test.md` + `tests/pi_integration_run.sh`**: New end-to-end harness that points [`pi`](https://github.com/badlogic/pi-mono) (a third-party OpenAI-compatible agent CLI) at mlx-serve and runs a two-turn Express todo-app build across a matrix of `(model × streaming × thinking)`. Catches wire-protocol regressions unit tests miss.
+- **`tests/pi_nonstream_smoke.sh`**: Single-request non-streaming smoke (curl + manual tool-call validation) for every model.
+- **+5 new Zig tests in `src/chat.zig`**: Covers nested-name garbage, flat-shape tool calls, missing-quote repairs, think-block streaming edge cases.
+- **+2 new Swift tests in `AgentHarnessTests.swift`**: Validates `failedRetry` exclusion in `buildAgentHistory`.
+
+### Verification
+Full end-to-end matrix run on Apple Silicon (64 GB):
+- gemma-4-e4b-it-8bit streaming → 5/5 (jest green)
+- gemma-4-26b-a4b-it-4bit streaming → 5/5 (jest green)
+- Qwen3.6-35B-A3B-6bit streaming, thinking off → **5/5** (was 3/5 pre-fix)
+- Qwen3.6-35B-A3B-6bit streaming, thinking medium → **5/5** (was 3/5 pre-fix)
+- 4/4 non-streaming smokes clean (valid JSON args, no tag leaks)
+- 112/112 Swift unit tests, Zig unit tests all green
+
 ## v26.4.25 — Nemotron-H, LFM2, Qwen3.5 GatedDeltaNet Fixes
 
 ### Nemotron-H (Mamba2 SSM) — Now Working

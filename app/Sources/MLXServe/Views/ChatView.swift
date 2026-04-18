@@ -10,6 +10,20 @@ private struct ScrollViewHeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
+/// Thread-safe timestamp used by the agent-loop stream watchdog to decide if the
+/// current iteration has stalled (no SSE events for too long).
+final class StreamProgressClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: Date = Date()
+    func bump() {
+        lock.lock(); last = Date(); lock.unlock()
+    }
+    func idleSeconds() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(last)
+    }
+}
+
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -657,6 +671,10 @@ struct ChatDetailView: View {
         let padRetryPolicy = RetryPolicy.aggressive
         let repetition = AgentEngine.RepetitionTracker()
         var truncationRetries = 0
+        // One retry when the model exits with a malformed/ghost tool-call tag
+        // in its content instead of a proper finish — re-prompt for a clean
+        // plain-text summary so the user isn't left staring at `<|tool_call>…`.
+        var completionRetries = 0
 
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
@@ -680,9 +698,11 @@ struct ChatDetailView: View {
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
-            // a user message. Add a nudge so the model knows to synthesize a response.
+            // a user message. Add a nudge so the model knows to synthesize a response —
+            // asks explicitly for a short plain-text summary when finished so the user
+            // never sees a conversation that ends on a bare tool-call echo.
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Continue. If the task is done, summarize the result. If not, take the next step."])
+                history.append(["role": "user", "content": "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."])
             }
             messages.append(contentsOf: history)
 
@@ -704,41 +724,106 @@ struct ChatDetailView: View {
                 enableThinking: enableThinking,
                 toolsJSON: AgentPrompt.toolDefinitionsJSON
             )
-            for try await event in stream {
-                try Task.checkCancellation()
-                switch event {
-                case .content(let text):
-                    appState.updateLastMessage(in: sessionId, content: text)
-                case .reasoning(let text):
-                    appState.updateLastMessage(in: sessionId, reasoning: text)
-                case .usage(let usage):
-                    appState.updateLastMessage(in: sessionId, usage: usage)
-                case .toolCalls(let calls):
-                    receivedToolCalls = calls
-                case .maxTokensReached:
-                    maxTokensHit = true
-                    appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached. Try breaking the task into smaller steps.*")
-                case .done:
-                    break
+
+            // Watchdog: cancel the stream if no SSE event arrives within 90s.
+            // Server-side thinking buffering for tool-enabled requests can block the
+            // client for many seconds; a genuine stall (KV cache poison, sampling
+            // loop, network hang) would otherwise hang forever until the user hits Stop.
+            let watchdogSeconds: Double = 90
+            let lastEventAt = StreamProgressClock()
+            var streamStalled = false
+            let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool), Error> {
+                var tcs: [APIClient.ToolCall] = []
+                var maxHit = false
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    lastEventAt.bump()
+                    switch event {
+                    case .content(let text):
+                        appState.updateLastMessage(in: sessionId, content: text)
+                    case .reasoning(let text):
+                        appState.updateLastMessage(in: sessionId, reasoning: text)
+                    case .usage(let usage):
+                        appState.updateLastMessage(in: sessionId, usage: usage)
+                    case .toolCalls(let calls):
+                        tcs = calls
+                    case .maxTokensReached:
+                        maxHit = true
+                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached. Try breaking the task into smaller steps.*")
+                    case .done:
+                        break
+                    }
+                }
+                return (tcs, maxHit)
+            }
+            let watchdog = Task {
+                while !streamTask.isCancelled {
+                    try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
+                    if Task.isCancelled { return }
+                    if lastEventAt.idleSeconds() > watchdogSeconds {
+                        streamStalled = true
+                        streamTask.cancel()
+                        return
+                    }
                 }
             }
+            // Unstructured child tasks don't inherit cancellation from the outer
+            // agent-loop task, so wire the Stop button through explicitly.
+            do {
+                let result = try await withTaskCancellationHandler {
+                    try await streamTask.value
+                } onCancel: {
+                    streamTask.cancel()
+                    watchdog.cancel()
+                }
+                receivedToolCalls = result.tcs
+                maxTokensHit = result.maxHit
+            } catch is CancellationError {
+                watchdog.cancel()
+                if !streamStalled { throw CancellationError() }
+            } catch {
+                watchdog.cancel()
+                throw error
+            }
+            watchdog.cancel()
             appState.updateLastMessage(in: sessionId, streaming: false)
+
+            // Watchdog-triggered stall: surface a clear error and stop the loop.
+            // The user can simply resend their question — server state is preserved.
+            if streamStalled {
+                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                   !appState.chatSessions[sIdx].messages.isEmpty {
+                    let mIdx = appState.chatSessions[sIdx].messages.count - 1
+                    appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
+                }
+                let errorMsg = ChatMessage(
+                    role: .assistant,
+                    content: "⚠️ The model didn't produce a response within \(Int(watchdogSeconds))s. Try resending your message, simplifying the request, or restarting the server."
+                )
+                appState.appendMessage(to: sessionId, message: errorMsg)
+                return
+            }
 
             // Truncation recovery: if max_tokens was hit AND tool calls were received,
             // the tool call args are likely truncated (incomplete JSON). Don't execute them —
-            // drop the broken message, tell the model what happened, and retry.
+            // mark the broken message as non-replayable (preserves reasoning in the UI)
+            // and nudge the model to try again more concisely.
             if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
                 truncationRetries += 1
                 if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                    !appState.chatSessions[sIdx].messages.isEmpty {
-                    appState.chatSessions[sIdx].messages.removeLast()
+                    let mIdx = appState.chatSessions[sIdx].messages.count - 1
+                    appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
+                    appState.chatSessions[sIdx].messages[mIdx].toolCalls = nil
                 }
                 let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
                 appState.appendMessage(to: sessionId, message: nudge)
                 continue
             }
 
-            // Check for pad-only or empty responses — retry limited times
+            // Check for pad-only or empty responses — retry limited times.
+            // Mark the empty message as failedRetry so it's hidden from API history
+            // but its reasoning (if any) stays visible in the UI.
             if receivedToolCalls.isEmpty {
                 let lastContent = appState.chatSessions
                     .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
@@ -748,7 +833,8 @@ struct ChatDetailView: View {
                 if cleaned.isEmpty {
                     if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                        !appState.chatSessions[sIdx].messages.isEmpty {
-                        appState.chatSessions[sIdx].messages.removeLast()
+                        let mIdx = appState.chatSessions[sIdx].messages.count - 1
+                        appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
                     }
                     padRetries += 1
                     if padRetries <= padRetryPolicy.maxRetries {
@@ -762,8 +848,33 @@ struct ChatDetailView: View {
                 }
             }
 
-            // If no tool calls, we're done
-            guard !receivedToolCalls.isEmpty else { return }
+            // If no tool calls, we're done — but make sure the user sees a
+            // clean completion text. The model sometimes exits with a ghost
+            // tool call (malformed <|tool_call>...<tool_call|> or <tool_call>
+            // with bad args that didn't parse) as its final content; that's
+            // ugly and uninformative. When we detect one, mark the garbled
+            // turn as failedRetry (hidden from API history) and ask the model
+            // for a plain-text summary before returning control to the user.
+            if receivedToolCalls.isEmpty {
+                let lastContent = appState.chatSessions
+                    .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
+                let looksLikeGhostToolCall = lastContent.contains("<|tool_call>") ||
+                    lastContent.contains("<tool_call>") ||
+                    lastContent.contains("<tool_call|>") ||
+                    lastContent.contains("<function=")
+                if looksLikeGhostToolCall && completionRetries < 1 {
+                    completionRetries += 1
+                    if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                       !appState.chatSessions[sIdx].messages.isEmpty {
+                        let mIdx = appState.chatSessions[sIdx].messages.count - 1
+                        appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
+                    }
+                    let nudge = ChatMessage(role: .user, content: "[System: your last response contained a malformed tool-call tag. If you meant to call a tool, call it with proper JSON. If the task is complete, respond with a short plain-text summary of what you did — no tool tags, no JSON — just a sentence or two for the user.]")
+                    appState.appendMessage(to: sessionId, message: nudge)
+                    continue
+                }
+                return
+            }
 
             // Track repetition for this round
             repetition.track(toolCalls: receivedToolCalls)
@@ -1149,6 +1260,14 @@ struct MarkdownText: View {
         "step", "result", "answer", "reasoning", "tool_call", "tool_response",
     ]
 
+    /// Tags whose content should be hidden from the chat entirely (consumed but
+    /// not rendered). Real tool calls show in the dedicated tool-call UI; raw
+    /// `<tool_call>` text in the assistant bubble is either a parser fallback or
+    /// a malformed/truncated leak — neither is useful to display.
+    private static let hiddenTags: Set<String> = [
+        "tool_call", "tool_response",
+    ]
+
     init(_ source: String) {
         self.source = source
     }
@@ -1195,13 +1314,14 @@ struct MarkdownText: View {
                     continue
                 }
                 let closeTag = "</\(tag)>"
+                let isHidden = Self.hiddenTags.contains(String(tag))
                 if line.contains(closeTag) {
                     // Single-line tag block
-                    blocks.append(.xmlBlock(line))
+                    if !isHidden { blocks.append(.xmlBlock(line)) }
                     i += 1
                     continue
                 }
-                // Multi-line: collect until closing tag
+                // Multi-line: collect until closing tag (or EOF for unclosed)
                 var xmlLines: [String] = [line]
                 i += 1
                 while i < lines.count {
@@ -1212,7 +1332,9 @@ struct MarkdownText: View {
                     }
                     i += 1
                 }
-                blocks.append(.xmlBlock(xmlLines.joined(separator: "\n")))
+                if !isHidden {
+                    blocks.append(.xmlBlock(xmlLines.joined(separator: "\n")))
+                }
                 continue
             }
 

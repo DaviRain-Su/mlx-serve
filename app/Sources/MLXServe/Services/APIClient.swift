@@ -210,6 +210,10 @@ class APIClient {
         var pendingToolCalls: [String: (id: String, name: String, args: String)] = [:]
         var hasToolCalls = false
         var emittedToolCalls = false
+        // Accumulated assistant content — used as last-resort source for tool-call
+        // recovery when the server streams <tool_call> blocks as plain content
+        // (e.g. some Qwen MoE outputs an older binary failed to parse).
+        var contentAccumulator = ""
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data: ") else { continue }
@@ -255,6 +259,7 @@ class APIClient {
             }
 
             if let content = delta["content"] as? String, !content.isEmpty {
+                contentAccumulator += content
                 continuation.yield(.content(content))
             }
             if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
@@ -320,13 +325,91 @@ class APIClient {
                 Self.appendToolLog("FALLBACK: name=\(tc.name) rawArgs=\(tc.args.prefix(500))")
                 let args = Self.parseToolCallArgs(tc.args, toolName: tc.name)
                 calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args, rawArguments: tc.args))
+                emittedToolCalls = true
             }
             if !calls.isEmpty {
                 continuation.yield(.toolCalls(calls))
             }
         }
 
+        // Last-resort: server emitted no tool_calls deltas at all but the
+        // assistant content contains <tool_call>...</tool_call> blocks (older
+        // server binary / unrecognized format). Recover them from content.
+        if !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
+            let recovered = Self.extractToolCallsFromContent(contentAccumulator)
+            if !recovered.isEmpty {
+                Self.appendToolLog("CONTENT_SCAN_RECOVER: count=\(recovered.count)")
+                continuation.yield(.toolCalls(recovered))
+            }
+        }
+
         continuation.finish()
+    }
+
+    /// Extract `<tool_call>{json}</tool_call>` blocks from assistant content.
+    /// Handles both standard `{"name":"x","arguments":{...}}` and flat
+    /// `{"name":"x","key":"value"}` shapes.
+    static func extractToolCallsFromContent(_ content: String) -> [ToolCall] {
+        var calls: [ToolCall] = []
+        var cursor = content.startIndex
+        var index = 0
+        while let openRange = content.range(of: "<tool_call>", range: cursor..<content.endIndex) {
+            guard let closeRange = content.range(of: "</tool_call>", range: openRange.upperBound..<content.endIndex) else {
+                break
+            }
+            let body = content[openRange.upperBound..<closeRange.lowerBound]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            cursor = closeRange.upperBound
+
+            guard let data = body.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let name = obj["name"] as? String, !name.isEmpty else {
+                continue
+            }
+
+            // Locate args: prefer "arguments" / "parameters", else synthesize
+            // from non-metadata top-level keys (Qwen MoE flat shape).
+            var argsDict: [String: Any] = [:]
+            if let nested = obj["arguments"] as? [String: Any] {
+                argsDict = nested
+            } else if let nestedStr = obj["arguments"] as? String,
+                      let d = nestedStr.data(using: .utf8),
+                      let parsed = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                argsDict = parsed
+            } else if let nested = obj["parameters"] as? [String: Any] {
+                argsDict = nested
+            } else {
+                for (k, v) in obj {
+                    if k == "name" || k == "id" || k == "type" { continue }
+                    argsDict[k] = v
+                }
+            }
+            if argsDict.isEmpty { continue }
+
+            let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            let argsStrings: [String: String] = argsDict.reduce(into: [:]) { acc, kv in
+                if let s = kv.value as? String {
+                    acc[kv.key] = s
+                } else if JSONSerialization.isValidJSONObject([kv.value]),
+                          let data = try? JSONSerialization.data(withJSONObject: [kv.value]),
+                          let arrStr = String(data: data, encoding: .utf8),
+                          arrStr.count >= 2 {
+                    // strip the wrapping `[...]`
+                    acc[kv.key] = String(arrStr.dropFirst().dropLast())
+                } else {
+                    acc[kv.key] = "\(kv.value)"
+                }
+            }
+            calls.append(ToolCall(
+                id: "call_recovered_\(index)",
+                name: name,
+                arguments: argsStrings,
+                rawArguments: argsJSON
+            ))
+            index += 1
+        }
+        return calls
     }
 
     /// Parse tool call arguments JSON string into a dictionary.

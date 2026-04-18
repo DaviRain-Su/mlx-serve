@@ -75,6 +75,10 @@ struct ChatMessage: Identifiable, Codable {
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
     var images: [ChatImage]?  // Images attached to this message
+    // When true, the message is kept visible in the UI (e.g. preserved reasoning
+    // from a cut-off or pad-only retry) but excluded from API history so it
+    // can't confuse subsequent iterations of the agent loop.
+    var failedRetry: Bool = false
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -96,7 +100,7 @@ struct ChatMessage: Identifiable, Codable {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
-        case toolCallId, toolName, toolCalls, images
+        case toolCallId, toolName, toolCalls, images, failedRetry
     }
 
     init(from decoder: Decoder) throws {
@@ -117,6 +121,7 @@ struct ChatMessage: Identifiable, Codable {
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
+        failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
     }
 }
 

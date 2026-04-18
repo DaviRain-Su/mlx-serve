@@ -52,6 +52,10 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 ## Testing
 
+- Always add tests, for anything you do, and update them as needed
+- Unit tests are fine, but also add integration tests with real models, these are the real tests
+- Make sure tests account for all the suported model architecture types, not just one.
+- After a big feature, always test by building mlx-serve and mlx core.app, then run the .app bundle with TestServer.swift enable and test agentic harness
 - `zig build test` — unit tests (chat, server, generate, model, log, tokenizer)
 - `cd app && swift test` — Swift unit tests (agent harness, SSE parsing, serialization, history)
 - `./tests/integration_test.sh [model_dir] [port]` — 36 end-to-end API tests (needs a model)

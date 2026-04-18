@@ -23,6 +23,40 @@ struct TestChatMessage: Codable {
     var toolCallId: String? = nil
     var toolName: String? = nil
     var toolCalls: [SerializedToolCall]? = nil
+    var failedRetry: Bool = false
+
+    init(role: TestRole, content: String, isStreaming: Bool = false,
+         isAgentSummary: Bool = false, toolCallId: String? = nil,
+         toolName: String? = nil, toolCalls: [SerializedToolCall]? = nil,
+         failedRetry: Bool = false) {
+        self.role = role
+        self.content = content
+        self.isStreaming = isStreaming
+        self.isAgentSummary = isAgentSummary
+        self.toolCallId = toolCallId
+        self.toolName = toolName
+        self.toolCalls = toolCalls
+        self.failedRetry = failedRetry
+    }
+
+    // Mirror the real ChatMessage decoder so historical JSON without the
+    // `failedRetry` field still decodes cleanly.
+    enum CodingKeys: String, CodingKey {
+        case role, content, isStreaming, isAgentSummary
+        case toolCallId, toolName, toolCalls, failedRetry
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        role = try c.decode(TestRole.self, forKey: .role)
+        content = try c.decode(String.self, forKey: .content)
+        isStreaming = try c.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
+        isAgentSummary = try c.decodeIfPresent(Bool.self, forKey: .isAgentSummary) ?? false
+        toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
+        toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
+        toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
+        failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
+    }
 }
 
 struct TestToolCall: Equatable {
@@ -59,6 +93,7 @@ func buildAgentHistory(messages: [TestChatMessage]) -> [[String: Any]] {
     }
 
     for msg in window {
+        if msg.failedRetry { continue }
         if let callId = msg.toolCallId {
             let isRecent = toolResultsSeen >= totalToolResults - 2
             let limit = isRecent ? 2000 : 500
@@ -880,6 +915,38 @@ final class HistoryEdgeCaseTests: XCTestCase {
     func testHistory_AgentSummaryExcluded() {
         var msg = TestChatMessage(role: .assistant, content: "**shell** -> output")
         msg.isAgentSummary = true
+        XCTAssertEqual(buildAgentHistory(messages: [msg]).count, 0)
+    }
+
+    func testHistory_FailedRetryAssistantExcluded() {
+        // An assistant message marked as failedRetry (e.g. a truncated tool-call
+        // response that we kept visible in the UI to preserve reasoning) must NOT
+        // appear in the API history — otherwise the model would try to execute
+        // the broken tool call or fixate on the pad-only turn.
+        let normalUser = TestChatMessage(role: .user, content: "Please run ls")
+        var retryAssistant = TestChatMessage(role: .assistant, content: "partial response")
+        retryAssistant.failedRetry = true
+        retryAssistant.toolCalls = [
+            SerializedToolCall(id: "call_broken", name: "shell", arguments: "{\"command\":\"l")
+        ]
+        let nudge = TestChatMessage(role: .user, content: "[System: last response cut off...]")
+
+        let history = buildAgentHistory(messages: [normalUser, retryAssistant, nudge])
+
+        // Only the two user messages should be emitted; the failedRetry assistant is skipped.
+        XCTAssertEqual(history.count, 2)
+        for entry in history {
+            XCTAssertEqual(entry["role"] as? String, "user")
+            XCTAssertNil(entry["tool_calls"])
+        }
+    }
+
+    func testHistory_FailedRetryPadToolMessageExcluded() {
+        // A tool-role message flagged failedRetry (defensive — pad retries can
+        // never produce these today, but the flag must be respected generally).
+        var msg = TestChatMessage(role: .system, content: "irrelevant tool output")
+        msg.toolCallId = "call_X"
+        msg.failedRetry = true
         XCTAssertEqual(buildAgentHistory(messages: [msg]).count, 0)
     }
 

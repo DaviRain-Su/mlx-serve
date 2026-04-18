@@ -1938,10 +1938,13 @@ fn handleStreamingGeneration(
 
             if (!maybe_tool) {
                 // No tool call pattern — flush buffered tokens as streamed content.
-                // But if thinking is enabled, keep buffering if a thinking block might be starting.
-                // Detect thinking blocks even when thinking is disabled — models may emit
-                // them regardless, and we need to strip them from content.
-                const has_thinking = std.mem.indexOf(u8, buf, "<|channel>thought") != null or
+                // But if thinking is enabled, keep buffering until the close tag arrives.
+                // Many templates (Qwen 3.5/3.6) pre-inject the opener (`<think>\n`)
+                // into the prompt, so the model's tokens are already inside the
+                // thinking block — we won't see a literal opener in the buffer.
+                // Also detect literal openers for templates that don't pre-inject.
+                const has_thinking = enable_thinking or
+                    std.mem.indexOf(u8, buf, "<|channel>thought") != null or
                     std.mem.indexOf(u8, buf, "<think>") != null or
                     (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
                     (std.mem.startsWith(u8, buf, "<think") and buf.len < 7);
@@ -1987,7 +1990,10 @@ fn handleStreamingGeneration(
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
 
-            // Skip the initial think tag prefix (<think> or <|channel>thought\n)
+            // Skip the initial think tag prefix (<think> or <|channel>thought\n).
+            // Many templates (e.g. Qwen 3.5/3.6, some Gemma 4 variants) pre-inject
+            // the opener into the prompt so the model's first tokens are already
+            // INSIDE the thinking block — no opener appears in the streamed text.
             if (!skipped_think_open and think_buf.items.len >= 7) {
                 if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
                     // Remove <think> prefix and any leading newline
@@ -1998,7 +2004,7 @@ fn handleStreamingGeneration(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                } else if (think_buf.items.len >= 18 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
+                } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     // Gemma 4 think format — switch close tag
                     think_close_tag = "<channel|>";
                     var skip: usize = 17; // len of "<|channel>thought"
@@ -2008,12 +2014,13 @@ fn handleStreamingGeneration(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                } else if (!std.mem.startsWith(u8, "<think>", think_buf.items) and
-                    !std.mem.startsWith(u8, "<|channel>thought", think_buf.items))
-                {
-                    // Not a think block at all — flush as content
+                } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
+                    // Buffer is still a partial prefix of `<|channel>thought` —
+                    // wait for more tokens before deciding.
+                } else {
+                    // Not a known opener — template already injected one.
+                    // Stay inside the think block; close tag is detected dynamically below.
                     skipped_think_open = true;
-                    in_think_block = false;
                 }
             }
 
@@ -2030,14 +2037,25 @@ fn handleStreamingGeneration(
                 continue;
             }
 
-            // Check for </think> in buffer
-            if (std.mem.indexOf(u8, think_buf.items, think_close_tag)) |close_pos| {
-                // Flush reasoning before </think>
-                if (close_pos > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..close_pos] }, null, null);
+            // Check for the close tag — accept whichever appears first.
+            // Models with templates that pre-inject the opener (Qwen 3.5/3.6,
+            // some Gemma 4 variants) don't reveal which format they use until
+            // the close tag arrives, so we look for both.
+            const think_pos = std.mem.indexOf(u8, think_buf.items, "</think>");
+            const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+            const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
+                if (think_pos == null and channel_pos == null) break :blk null;
+                if (think_pos == null) break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
+                if (channel_pos == null) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
+                if (think_pos.? <= channel_pos.?) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
+                break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
+            };
+
+            if (close_match) |m| {
+                if (m.pos > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null);
                 }
-                // Content after </think> or <channel|>
-                const after = close_pos + think_close_tag.len;
+                const after = m.pos + m.tag.len;
                 var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
                 // Strip Gemma 4 content channel tag: <|channel>\n or <|channel>
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
@@ -2051,16 +2069,18 @@ fn handleStreamingGeneration(
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
+                think_close_tag = m.tag;
             } else if (skipped_think_open) {
-                // Flush reasoning tokens that can't be part of </think>
-                // Keep last (think_close_tag.len - 1) bytes as they might be a partial tag
-                const safe_len = if (think_buf.items.len > think_close_tag.len - 1)
-                    think_buf.items.len - (think_close_tag.len - 1)
+                // Flush reasoning tokens that can't be part of either close tag.
+                // Hold back the longest possible partial-tag suffix (max 9 bytes
+                // to cover both "</think>" and "<channel|>").
+                const max_partial: usize = 9;
+                const safe_len = if (think_buf.items.len > max_partial)
+                    think_buf.items.len - max_partial
                 else
                     0;
                 if (safe_len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null);
-                    // Shift remaining bytes to front
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -2322,6 +2342,19 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
         var shared: usize = 0;
         while (shared < max_shared and cached[shared] == prompt_ids[shared]) {
             shared += 1;
+        }
+
+        // Identical prompt seen before — the underlying KV buffer still holds
+        // tokens from the previous generation past the prompt boundary, and
+        // truncate() can't always fully scrub them on every architecture
+        // (observed on Qwen 3.5/3.6 MoE). Force a full reset so the new
+        // generation starts from clean state.
+        if (shared == prompt_ids.len and shared == cached.len) {
+            log.info("  [cache] reset — identical prompt re-issued (stale generation residue)\n", .{});
+            allocator.free(cached);
+            cached_prompt_ids = null;
+            try xfm.resetCache();
+            return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
         }
 
         // Always keep at least 1 token to process (generator needs at least 1 for prefill)
@@ -3610,7 +3643,7 @@ fn handleAnthropicStreaming(
                         try sendAnthropicEvent(stream, "content_block_start", sd);
                         thinking_block_open = true;
                     }
-                } else if (think_buf.items.len >= 18 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
+                } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     think_close_tag = "<channel|>";
                     var skip: usize = 17;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -3627,11 +3660,20 @@ fn handleAnthropicStreaming(
                         try sendAnthropicEvent(stream, "content_block_start", sd);
                         thinking_block_open = true;
                     }
-                } else if (!std.mem.startsWith(u8, "<think>", think_buf.items) and
-                    !std.mem.startsWith(u8, "<|channel>thought", think_buf.items))
-                {
+                } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
+                    // Partial prefix of `<|channel>thought` — wait for more tokens.
+                } else {
+                    // No opener in the model's output — template injected one.
+                    // Stay in the think block; close tag is detected dynamically.
                     skipped_think_open = true;
-                    in_think_block = false;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
                 }
             }
 
@@ -3651,18 +3693,27 @@ fn handleAnthropicStreaming(
                 continue;
             }
 
-            // Check for close tag
-            if (std.mem.indexOf(u8, think_buf.items, think_close_tag)) |close_pos| {
-                if (thinking_block_open and close_pos > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..close_pos]);
+            // Check for the close tag — accept whichever appears first.
+            const think_pos = std.mem.indexOf(u8, think_buf.items, "</think>");
+            const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+            const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
+                if (think_pos == null and channel_pos == null) break :blk null;
+                if (think_pos == null) break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
+                if (channel_pos == null) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
+                if (think_pos.? <= channel_pos.?) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
+                break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
+            };
+
+            if (close_match) |m| {
+                if (thinking_block_open and m.pos > 0) {
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..m.pos]);
                 }
                 if (thinking_block_open) {
                     try closeAnthropicThinkingBlock(allocator, stream, block_index);
                     thinking_block_open = false;
                     block_index += 1;
                 }
-                // Content after close tag
-                const after = close_pos + think_close_tag.len;
+                const after = m.pos + m.tag.len;
                 var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
@@ -3680,10 +3731,13 @@ fn handleAnthropicStreaming(
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
+                think_close_tag = m.tag;
             } else if (skipped_think_open and thinking_block_open) {
-                // Stream safe thinking content
-                const safe_len = if (think_buf.items.len > think_close_tag.len - 1)
-                    think_buf.items.len - (think_close_tag.len - 1)
+                // Hold back the longest possible partial-tag suffix (max 9 bytes
+                // covers both "</think>" and "<channel|>").
+                const max_partial: usize = 9;
+                const safe_len = if (think_buf.items.len > max_partial)
+                    think_buf.items.len - max_partial
                 else
                     0;
                 if (safe_len > 0) {

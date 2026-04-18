@@ -72,14 +72,12 @@ class BrowserManager: ObservableObject {
             return text.substring(0, 3000);
         })()
         """
-        let result = try await webView.evaluateJavaScript(js)
-        return jsResultToString(result)
+        return try await evaluateJSWithTimeout(js, description: "readText")
     }
 
     func readHTML() async throws -> String {
         let js = "document.documentElement.outerHTML.substring(0, 8000)"
-        let result = try await webView.evaluateJavaScript(js)
-        return jsResultToString(result)
+        return try await evaluateJSWithTimeout(js, description: "readHTML")
     }
 
     func click(selector: String) async throws -> String {
@@ -92,8 +90,7 @@ class BrowserManager: ObservableObject {
             return 'Clicked: ' + (el.tagName || '') + ' ' + (el.textContent || '').substring(0, 50);
         })()
         """
-        let result = try await webView.evaluateJavaScript(js)
-        return jsResultToString(result)
+        return try await evaluateJSWithTimeout(js, description: "click")
     }
 
     func evaluateJS(_ script: String) async throws -> String {
@@ -103,8 +100,28 @@ class BrowserManager: ObservableObject {
         if js.hasPrefix("return ") || js.hasPrefix("return\n") {
             js = String(js.dropFirst(7))
         }
-        let result = try await webView.evaluateJavaScript(js)
-        return jsResultToString(result)
+        return try await evaluateJSWithTimeout(js, description: "evaluateJS")
+    }
+
+    /// Wrap `evaluateJavaScript` in a 25s timeout so a stuck page can't freeze
+    /// the agent loop. WKWebView itself has no built-in JS-eval timeout.
+    /// Result is converted to String on the main actor to avoid sending non-Sendable
+    /// `Any?` values across task boundaries.
+    private func evaluateJSWithTimeout(_ script: String, description: String) async throws -> String {
+        try await withThrowingTaskGroup(of: String.self) { group in
+            let capturedWebView = webView
+            group.addTask { @MainActor in
+                let raw = try await capturedWebView.evaluateJavaScript(script)
+                return jsResultToString(raw)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 25_000_000_000)
+                throw ToolError.executionFailed("browser \(description) timed out after 25s")
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     func takeScreenshot() async -> Data? {
