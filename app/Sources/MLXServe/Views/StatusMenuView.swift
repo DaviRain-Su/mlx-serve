@@ -329,15 +329,11 @@ struct StatusMenuView: View {
                 .buttonStyle(.bordered)
                 .help("MLX Serve Folder")
 
-                Button {
-                    launchClaudeCodeWithPicker(baseURL: server.baseURL)
-                } label: {
-                    ClaudeIcon(size: 12)
-                        .foregroundStyle(.white)
-                }
-                .buttonStyle(.bordered)
-                .disabled(server.status != .running)
-                .help("Launch Claude Code")
+                CLILauncherButton(
+                    baseURL: server.baseURL,
+                    servedModelId: server.modelInfo?.name ?? "mlx-serve",
+                    isEnabled: server.status == .running
+                )
 
                 Button {
                     server.stop()

@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.4.27 — Multi-CLI Launcher (Claude Code / pi / OpenCode)
+
+### CLI Launcher
+- **Menu-bar dropdown** replaces the single "Launch Claude Code" button. Detects installed CLIs on PATH (through a login `zsh -l` so nvm / Homebrew / `~/.local/bin` / `~/.opencode/bin` are honored) and shows one entry per installed agent: **Claude Code**, **pi**, **OpenCode**.
+- **Smart visibility**: if exactly one CLI is installed the launcher renders as a single button (no wasted click); with 2+ it becomes a dropdown; with zero it disappears entirely so the footer doesn't advertise a feature the user can't use.
+- **Per-CLI config staging**: launching pi writes `~/.pi/agent/models.json` with an `mlx` provider pointing at the running server; launching OpenCode writes a dedicated `OPENCODE_CONFIG` JSON in `$TMPDIR` so the user's main `~/.config/opencode/opencode.json` is left untouched.
+- **Model-aware launches**: all three use the served model id from `/v1/models` rather than the hard-coded `mlx-serve` alias, so `pi` and `opencode` model-switchers show the real name (e.g. `qwen3_5_moe`).
+
 ## v26.4.26 — Qwen 3.5/3.6 Tool-Call Reliability, Thinking Streaming, Swift Agent Robustness
 
 ### Qwen 3.5/3.6 MoE Tool-Call Fixes
