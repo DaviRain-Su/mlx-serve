@@ -36,6 +36,16 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("mlxc", .{});
     mod.linkSystemLibrary("webp", .{});
 
+    _ = b.addModule("mlx_serve", .{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
         .root_module = mod,
