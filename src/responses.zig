@@ -5,6 +5,7 @@
 //! HTTP plumbing and generation orchestration live in `server.zig`.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const chat_mod = @import("chat.zig");
 
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
@@ -86,7 +87,7 @@ pub fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8),
 var id_counter: std.atomic.Value(u64) = .{ .raw = 0 };
 
 pub fn makeId(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
-    const ms = std.time.milliTimestamp();
+    const ms = compat.milliTimestamp();
     const seq = id_counter.fetchAdd(1, .monotonic);
     return std.fmt.allocPrint(allocator, "{s}_{d}_{x}", .{ prefix, ms, seq });
 }
@@ -523,7 +524,7 @@ pub const StoredResponse = struct {
 };
 
 pub const ResponseStore = struct {
-    mu: std.Thread.Mutex = .{},
+    mu: std.atomic.Mutex = .unlocked,
     map: std.StringHashMapUnmanaged(*StoredResponse) = .{},
     lru: std.DoublyLinkedList = .{},
     cap: usize,
@@ -534,7 +535,7 @@ pub const ResponseStore = struct {
     }
 
     pub fn deinit(self: *ResponseStore) void {
-        self.mu.lock();
+        self.lock();
         defer self.mu.unlock();
         var node = self.lru.first;
         while (node) |n| {
@@ -550,7 +551,7 @@ pub const ResponseStore = struct {
     /// Take ownership of `sr`. Evicts the LRU tail if at capacity.
     /// `sr.id` must already be set.
     pub fn put(self: *ResponseStore, sr: *StoredResponse) !void {
-        self.mu.lock();
+        self.lock();
         defer self.mu.unlock();
 
         // If id already exists, evict the old entry first
@@ -576,7 +577,7 @@ pub const ResponseStore = struct {
 
     /// Returns a borrowed reference (do not free). Touches LRU.
     pub fn get(self: *ResponseStore, id: []const u8) ?*StoredResponse {
-        self.mu.lock();
+        self.lock();
         defer self.mu.unlock();
         const sr = self.map.get(id) orelse return null;
         self.lru.remove(&sr.list_node);
@@ -586,12 +587,16 @@ pub const ResponseStore = struct {
 
     /// Returns true if removed.
     pub fn delete(self: *ResponseStore, id: []const u8) bool {
-        self.mu.lock();
+        self.lock();
         defer self.mu.unlock();
         const kv = self.map.fetchRemove(id) orelse return false;
         self.lru.remove(&kv.value.list_node);
         kv.value.deinit();
         return true;
+    }
+
+    fn lock(self: *ResponseStore) void {
+        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
     }
 };
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -17,13 +18,74 @@ const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const VisionEncoder = vision_mod.VisionEncoder;
+
+var server_io: std.Io = undefined;
+
+const net = struct {
+    pub const Stream = struct {
+        inner: std.Io.net.Stream,
+        io: std.Io,
+
+        pub fn close(stream: Stream) void {
+            stream.inner.close(stream.io);
+        }
+
+        pub fn read(stream: Stream, buf: []u8) !usize {
+            var bufs: [1][]u8 = .{buf};
+            return stream.io.vtable.netRead(stream.io.userdata, stream.inner.socket.handle, &bufs);
+        }
+
+        pub fn writeAll(stream: Stream, bytes: []const u8) !void {
+            var remaining = bytes;
+            while (remaining.len > 0) {
+                const n = try stream.io.vtable.netWrite(stream.io.userdata, stream.inner.socket.handle, &.{}, &.{remaining}, 1);
+                if (n == 0) return error.WriteZeroBytes;
+                remaining = remaining[n..];
+            }
+        }
+    };
+
+    pub const Address = struct {
+        inner: std.Io.net.IpAddress,
+
+        pub fn initIp4(bytes: [4]u8, port: u16) Address {
+            return .{ .inner = .{ .ip4 = .{ .bytes = bytes, .port = port } } };
+        }
+
+        pub fn listen(address: Address, options: anytype) !Server {
+            const server = try std.Io.net.IpAddress.listen(&address.inner, server_io, .{
+                .reuse_address = options.reuse_address,
+            });
+            return .{
+                .inner = server,
+                .io = server_io,
+                .stream = .{ .handle = server.socket.handle },
+            };
+        }
+    };
+
+    pub const Server = struct {
+        inner: std.Io.net.Server,
+        io: std.Io,
+        stream: struct { handle: std.Io.net.Socket.Handle },
+
+        pub fn deinit(server: *Server) void {
+            server.inner.deinit(server.io);
+        }
+
+        pub fn accept(server: *Server) !struct { stream: Stream } {
+            return .{ .stream = .{ .inner = try server.inner.accept(server.io), .io = server.io } };
+        }
+    };
+};
+
 /// Global flag set by signal handler for graceful shutdown.
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
 /// Single-slot inference gate: mutex + condition variable for request queuing.
 /// Requests wait in line instead of getting 503 when the server is busy.
-var inference_mutex: std.Thread.Mutex = .{};
-var inference_cond: std.Thread.Condition = .{};
+var inference_mutex: std.Io.Mutex = .init;
+var inference_cond: std.Io.Condition = .init;
 var inference_busy: bool = false;
 var inference_queue_len: u32 = 0;
 const max_queue_size: u32 = 32;
@@ -31,8 +93,8 @@ const max_queue_size: u32 = 32;
 /// Acquire the inference slot, blocking until available.
 /// Returns false if the queue is full or shutdown was requested.
 fn acquireInferenceSlot() bool {
-    inference_mutex.lock();
-    defer inference_mutex.unlock();
+    inference_mutex.lockUncancelable(server_io);
+    defer inference_mutex.unlock(server_io);
 
     if (inference_queue_len >= max_queue_size) return false;
     inference_queue_len += 1;
@@ -46,7 +108,7 @@ fn acquireInferenceSlot() bool {
             inference_queue_len -= 1;
             return false;
         }
-        inference_cond.wait(&inference_mutex);
+        inference_cond.waitUncancelable(server_io, &inference_mutex);
     }
 
     inference_queue_len -= 1;
@@ -56,14 +118,14 @@ fn acquireInferenceSlot() bool {
 
 /// Release the inference slot and wake the next waiting request.
 fn releaseInferenceSlot() void {
-    inference_mutex.lock();
-    defer inference_mutex.unlock();
+    inference_mutex.lockUncancelable(server_io);
+    defer inference_mutex.unlock(server_io);
 
     inference_busy = false;
-    inference_cond.signal();
+    inference_cond.signal(server_io);
 }
 
-fn signalHandler(_: c_int) callconv(.c) void {
+fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
@@ -141,6 +203,7 @@ fn deinitGlobalResponseStore() void {
 /// Start the HTTP server on the given host and port.
 pub fn serve(
     allocator: std.mem.Allocator,
+    io: std.Io,
     xfm: *Transformer,
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
@@ -152,6 +215,7 @@ pub fn serve(
     timeout: u32,
     reasoning_budget: i32,
 ) !void {
+    server_io = io;
     global_vision_encoder = vision_encoder;
     max_context_size = ctx_size;
     request_timeout_sec = timeout;
@@ -178,7 +242,7 @@ pub fn serve(
         }
     }
 
-    const addr = std.net.Address.initIp4(ip4_bytes, port);
+    const addr = net.Address.initIp4(ip4_bytes, port);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
 
@@ -275,7 +339,7 @@ pub fn serve(
 
 fn connectionThread(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
@@ -284,7 +348,7 @@ fn connectionThread(
     defer stream.close();
     handleConnection(allocator, stream, xfm, tok, chat_config, config) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {
+            error.ConnectionResetByPeer => {
                 log.debug("  -> client disconnected\n", .{});
             },
             else => {
@@ -296,7 +360,7 @@ fn connectionThread(
 
 fn handleConnection(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
@@ -513,7 +577,7 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// that tiles over seq and never materializes the full [heads, seq, seq] attention matrix.
 /// So peak memory is dominated by (a) the persistent KV cache and (b) per-layer working
 /// tensors (QKV projections, MLP intermediates). There is no seq² term.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: std.net.Stream, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: net.Stream, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
 
@@ -585,7 +649,7 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize) u32 {
     return max_tokens;
 }
 
-fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig) !void {
+fn handleModels(allocator: std.mem.Allocator, stream: net.Stream, config: *const model_mod.ModelConfig) !void {
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
@@ -594,12 +658,12 @@ fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, config: *c
 
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","meta":{{"vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
-    , .{ config.model_type, std.time.timestamp(), config.vocab_size, config.hidden_size, config.num_hidden_layers, config.quant_bits, ctx_str });
+    , .{ config.model_type, compat.timestamp(), config.vocab_size, config.hidden_size, config.num_hidden_layers, config.quant_bits, ctx_str });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig, chat_config: *const chat_mod.ChatConfig) !void {
+fn handleProps(allocator: std.mem.Allocator, stream: net.Stream, config: *const model_mod.ModelConfig, chat_config: *const chat_mod.ChatConfig) !void {
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
@@ -637,7 +701,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *co
 
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -747,7 +811,7 @@ fn handleEmbeddings(
 
 fn handleTokenize(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     tok: *const Tokenizer,
 ) !void {
@@ -784,7 +848,7 @@ fn handleTokenize(
 
 fn handleDetokenize(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     tok: *const Tokenizer,
 ) !void {
@@ -835,7 +899,7 @@ fn handleDetokenize(
 
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -1100,7 +1164,7 @@ fn handleChatCompletions(
                     if (js == .object) {
                         if (js.object.get("schema")) |schema_val| {
                             grammar_schema_val = schema_val;
-                            var out: std.io.Writer.Allocating = .init(allocator);
+                            var out: std.Io.Writer.Allocating = .init(allocator);
                             defer out.deinit();
                             var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
                             schema_val.jsonStringify(&jws) catch {};
@@ -1298,7 +1362,7 @@ fn handleChatCompletions(
 
 fn handleCompletions(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -1458,7 +1522,7 @@ fn handleCompletions(
 
 fn handleNonStreamingCompletion(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1469,7 +1533,7 @@ fn handleNonStreamingCompletion(
     model_name: []const u8,
     cached_tokens: u32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = try compat.Timer.start();
 
     var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
     result.prompt_tokens += cached_tokens;
@@ -1497,8 +1561,8 @@ fn handleNonStreamingCompletion(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
-        std.time.milliTimestamp(),
-        std.time.timestamp(),
+        compat.milliTimestamp(),
+        compat.timestamp(),
         model_name,
         escaped_text,
         finish_reason,
@@ -1513,7 +1577,7 @@ fn handleNonStreamingCompletion(
 
 fn handleStreamingCompletion(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1525,9 +1589,9 @@ fn handleStreamingCompletion(
     include_usage: bool,
     cached_tokens: u32,
 ) !void {
-    const cmpl_id = std.time.milliTimestamp();
-    const created_ts = std.time.timestamp();
-    var timer = try std.time.Timer.start();
+    const cmpl_id = compat.milliTimestamp();
+    const created_ts = compat.timestamp();
+    var timer = try compat.Timer.start();
 
     var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
@@ -1651,7 +1715,7 @@ fn handleStreamingCompletion(
 
 fn handleNonStreamingGeneration(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1666,7 +1730,7 @@ fn handleNonStreamingGeneration(
     enable_thinking: bool,
     reasoning_budget: i32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = try compat.Timer.start();
 
     var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), logprobs_n);
     result.prompt_tokens += cached_tokens; // Include cached tokens in total prompt count
@@ -1748,7 +1812,7 @@ fn handleNonStreamingGeneration(
             try tc_buf.appendSlice(allocator, "[");
             for (tool_calls, 0..) |tc, i| {
                 if (i > 0) try tc_buf.appendSlice(allocator, ",");
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ compat.milliTimestamp(), i });
                 defer allocator.free(tc_id);
                 const escaped_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(escaped_name);
@@ -1779,8 +1843,8 @@ fn handleNonStreamingGeneration(
             const response = try std.fmt.allocPrint(allocator,
                 \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
-                std.time.milliTimestamp(),
-                std.time.timestamp(),
+                compat.milliTimestamp(),
+                compat.timestamp(),
                 model_name,
                 tc_reasoning_json,
                 tc_buf.items,
@@ -1832,8 +1896,8 @@ fn handleNonStreamingGeneration(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
-        std.time.milliTimestamp(),
-        std.time.timestamp(),
+        compat.milliTimestamp(),
+        compat.timestamp(),
         model_name,
         escaped_text,
         reasoning_json,
@@ -1850,7 +1914,7 @@ fn handleNonStreamingGeneration(
 
 fn handleStreamingGeneration(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1866,8 +1930,8 @@ fn handleStreamingGeneration(
     enable_thinking: bool,
     reasoning_budget: i32,
 ) !void {
-    const chat_id = std.time.milliTimestamp();
-    var timer = try std.time.Timer.start();
+    const chat_id = compat.milliTimestamp();
+    var timer = try compat.Timer.start();
 
     // Prefill + init generator
     var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
@@ -2124,14 +2188,14 @@ fn handleStreamingGeneration(
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null);
                 }
                 const after = m.pos + m.tag.len;
-                var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 // Strip Gemma 4 content channel tag: <|channel>\n or <|channel>
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
                     content_after = content_after[11..];
                 } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                     content_after = content_after[10..];
                 }
-                content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null);
                 }
@@ -2317,7 +2381,7 @@ const DeltaFields = struct {
 
 fn sendSSEChunk(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     chat_id: i64,
     model_name: []const u8,
     delta: DeltaFields,
@@ -2377,7 +2441,7 @@ fn sendSSEChunk(
     // Build the full SSE chunk
     const chunk = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"delta":{s},"finish_reason":{s}}}],"usage":{s}}}
-    , .{ chat_id, std.time.timestamp(), model_name, delta_buf.items, fr_str, usage_str });
+    , .{ chat_id, compat.timestamp(), model_name, delta_buf.items, fr_str, usage_str });
     defer allocator.free(chunk);
 
     // Write as SSE event
@@ -2474,7 +2538,7 @@ fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32, has
     cached_has_tools = has_tools;
 }
 
-fn sendResponse(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
+fn sendResponse(stream: net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
     logHttpResponse(status, content_type, body);
 
     var hdr_buf: [512]u8 = undefined;
@@ -2591,7 +2655,7 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
-fn sendErrorResponse(allocator: std.mem.Allocator, stream: std.net.Stream, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+fn sendErrorResponse(allocator: std.mem.Allocator, stream: net.Stream, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -3016,7 +3080,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8) ?chat_
 
 // ── Anthropic Messages API ──
 
-fn sendAnthropicError(allocator: std.mem.Allocator, stream: std.net.Stream, err_type: []const u8, message: []const u8, status_code: u32) !void {
+fn sendAnthropicError(allocator: std.mem.Allocator, stream: net.Stream, err_type: []const u8, message: []const u8, status_code: u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
     const body = try std.fmt.allocPrint(allocator,
@@ -3028,7 +3092,7 @@ fn sendAnthropicError(allocator: std.mem.Allocator, stream: std.net.Stream, err_
     try sendResponse(stream, status, "application/json", body);
 }
 
-fn sendAnthropicEvent(stream: std.net.Stream, event_name: []const u8, data: []const u8) !void {
+fn sendAnthropicEvent(stream: net.Stream, event_name: []const u8, data: []const u8) !void {
     logHttpSseEvent(event_name, data);
     try stream.writeAll("event: ");
     try stream.writeAll(event_name);
@@ -3124,7 +3188,7 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
 
 fn handleAnthropicMessages(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -3470,7 +3534,7 @@ fn handleAnthropicMessages(
 
 fn handleAnthropicNonStreaming(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -3485,7 +3549,7 @@ fn handleAnthropicNonStreaming(
     reasoning_budget: i32,
     prompt_token_count: u32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = try compat.Timer.start();
 
     var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
     result.prompt_tokens += cached_tokens;
@@ -3572,7 +3636,7 @@ fn handleAnthropicNonStreaming(
             // Emit tool_use content blocks
             for (tool_calls, 0..) |tc, i| {
                 if (block_count > 0) try content.append(allocator, ',');
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ compat.milliTimestamp(), i });
                 defer allocator.free(tc_id);
                 const esc_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(esc_name);
@@ -3617,7 +3681,7 @@ fn handleAnthropicNonStreaming(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
     , .{
-        std.time.milliTimestamp(),
+        compat.milliTimestamp(),
         content.items,
         model_name,
         stop_reason,
@@ -3630,7 +3694,7 @@ fn handleAnthropicNonStreaming(
 
 fn handleAnthropicStreaming(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -3645,7 +3709,7 @@ fn handleAnthropicStreaming(
     reasoning_budget: i32,
     prompt_token_count: u32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = try compat.Timer.start();
     var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
     defer gen.deinit(allocator);
@@ -3674,7 +3738,7 @@ fn handleAnthropicStreaming(
     {
         const data = try std.fmt.allocPrint(allocator,
             \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ std.time.milliTimestamp(), model_name, prompt_token_count });
+        , .{ compat.milliTimestamp(), model_name, prompt_token_count });
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -3876,10 +3940,10 @@ fn handleAnthropicStreaming(
                     block_index += 1;
                 }
                 const after = m.pos + m.tag.len;
-                var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
-                content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     if (!text_block_open) {
                         const sd = try std.fmt.allocPrint(allocator,
@@ -3972,7 +4036,7 @@ fn handleAnthropicStreaming(
             }
 
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ compat.milliTimestamp(), i });
                 defer allocator.free(tc_id);
                 const esc_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(esc_name);
@@ -4087,7 +4151,7 @@ fn handleAnthropicStreaming(
 }
 
 /// Emit a text_delta event for Anthropic streaming.
-fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32, text: []const u8) !void {
+fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: net.Stream, index: u32, text: []const u8) !void {
     const esc = try jsonEscape(allocator, text);
     defer allocator.free(esc);
     const inner = esc[1 .. esc.len - 1];
@@ -4099,7 +4163,7 @@ fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: std.net.Stream, 
 }
 
 /// Emit a thinking_delta event for Anthropic streaming.
-fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32, thinking: []const u8) !void {
+fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: net.Stream, index: u32, thinking: []const u8) !void {
     const esc = try jsonEscape(allocator, thinking);
     defer allocator.free(esc);
     const inner = esc[1 .. esc.len - 1];
@@ -4111,7 +4175,7 @@ fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: std.net.Stre
 }
 
 /// Close a thinking block with a fake signature and content_block_stop.
-fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32) !void {
+fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: net.Stream, index: u32) !void {
     const sig = try std.fmt.allocPrint(allocator,
         \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"signature_delta","signature":"mlx-serve-local"}}}}
     , .{index});
@@ -4124,7 +4188,7 @@ fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: std.net.Str
 
 // ─── /v1/responses (OpenAI Responses API) ────────────────────────────────
 
-fn handleResponsesGet(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !void {
+fn handleResponsesGet(allocator: std.mem.Allocator, stream: net.Stream, id: []const u8) !void {
     const store = getOrInitResponseStore(allocator);
     if (store.get(id)) |sr| {
         try sendResponse(stream, "200 OK", "application/json", sr.body_json);
@@ -4133,7 +4197,7 @@ fn handleResponsesGet(allocator: std.mem.Allocator, stream: std.net.Stream, id: 
     }
 }
 
-fn handleResponsesDelete(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !void {
+fn handleResponsesDelete(allocator: std.mem.Allocator, stream: net.Stream, id: []const u8) !void {
     const store = getOrInitResponseStore(allocator);
     if (store.delete(id)) {
         const esc_id = try jsonEscape(allocator, id);
@@ -4174,7 +4238,7 @@ fn buildResponsesJsonInstruction(allocator: std.mem.Allocator, schema_val: ?std.
     }
 
     if (schema_val) |sv| {
-        var out: std.io.Writer.Allocating = .init(allocator);
+        var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
         sv.jsonStringify(&jws) catch {};
@@ -4202,7 +4266,7 @@ fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
 
 fn handleResponses(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -4672,7 +4736,7 @@ fn buildResponsesEnvelope(
         \\{{"id":{s},"object":"response","created_at":{d},"status":"{s}","model":{s},"output":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"total_tokens":{d}}},"store":{}{s}{s}}}
     , .{
         esc_resp_id,
-        std.time.timestamp(),
+        compat.timestamp(),
         status_str,
         esc_model,
         output_json,
@@ -4690,7 +4754,7 @@ fn buildResponsesEnvelope(
 /// .done, summary_part.done, output_item.done.
 fn emitResponsesReasoningEvents(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     output_index: u32,
     item_id: []const u8,
     reasoning_text: []const u8,
@@ -4748,7 +4812,7 @@ fn emitResponsesReasoningEvents(
 /// function_call_arguments.delta (single full-args delta), .done, output_item.done.
 fn emitResponsesFunctionCallEvents(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     output_index: u32,
     fc_id: []const u8,
     call_id: []const u8,
@@ -4799,7 +4863,7 @@ fn emitResponsesFunctionCallEvents(
 /// content_part.done, output_item.done.
 fn emitResponsesMessageEvents(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: net.Stream,
     output_index: u32,
     item_id: []const u8,
     text: []const u8,
@@ -4926,7 +4990,7 @@ fn storeResponse(
 
     sr.* = .{
         .id = try a.dupe(u8, resp_id),
-        .created_at = std.time.timestamp(),
+        .created_at = compat.timestamp(),
         .model = try a.dupe(u8, model_name),
         .status = try a.dupe(u8, status_str),
         .body_json = try a.dupe(u8, body_json),

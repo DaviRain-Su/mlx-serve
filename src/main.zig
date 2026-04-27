@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const build_options = @import("build_options");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
@@ -14,8 +15,7 @@ pub const VERSION: []const u8 = build_options.version;
 
 const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
-fn printUsage() void {
-    const stdout = std.fs.File.stdout();
+fn printUsage(stdout: *std.Io.Writer) void {
     stdout.writeAll(
         \\mlx-serve — MLX inference server for Apple Silicon
         \\
@@ -41,17 +41,20 @@ fn printUsage() void {
     ) catch {};
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    defer stdout.flush() catch {};
 
     // Parse CLI args (before model loading for --version/--help)
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.len == 1) {
-        printUsage();
+    if (args.len <= 1) {
+        printUsage(stdout);
         return;
     }
 
@@ -67,14 +70,14 @@ pub fn main() !void {
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
-            const stdout = std.fs.File.stdout();
             stdout.writeAll("mlx-serve " ++ VERSION ++ "\n") catch {};
             return;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
-            printUsage();
+            printUsage(stdout);
             return;
         } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
@@ -120,7 +123,7 @@ pub fn main() !void {
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
     if (serve_mode) {
-        if (portInUse(port)) {
+        if (portInUse(io, port)) {
             log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
@@ -145,10 +148,12 @@ pub fn main() !void {
     }
 
     // Seed MLX RNG with current time for non-deterministic sampling
-    _ = mlx.mlx_random_seed(@intCast(std.time.milliTimestamp()));
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    _ = mlx.mlx_random_seed(std.mem.readInt(u64, &seed_bytes, .little));
 
     // Parse config
-    var config = try model_mod.parseConfig(allocator, model_dir);
+    var config = try model_mod.parseConfig(allocator, io, model_dir);
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -161,11 +166,11 @@ pub fn main() !void {
 
     // Load tokenizer
     log.info("Loading tokenizer...\n", .{});
-    var tok = try tokenizer_mod.loadTokenizer(allocator, model_dir);
+    var tok = try tokenizer_mod.loadTokenizer(allocator, io, model_dir);
     defer tok.deinit();
 
     // Load chat config
-    var chat_config = try chat_mod.loadChatConfig(allocator, model_dir);
+    var chat_config = try chat_mod.loadChatConfig(allocator, io, model_dir);
     defer chat_config.deinit();
 
     // Resolve EOS tokens from tokenizer if config.json didn't specify any
@@ -197,9 +202,9 @@ pub fn main() !void {
     const load_vision = config.has_vision and !no_vision;
     log.info("Loading weights...\n", .{});
     var weights = if (load_vision)
-        try model_mod.loadWeightsWithVision(allocator, model_dir)
+        try model_mod.loadWeightsWithVision(allocator, io, model_dir)
     else
-        try model_mod.loadWeights(allocator, model_dir);
+        try model_mod.loadWeights(allocator, io, model_dir);
     defer weights.deinit();
 
     // Initialize transformer
@@ -250,7 +255,7 @@ pub fn main() !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, host, port, ctx_size, timeout, reasoning_budget);
+        try server_mod.serve(allocator, io, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, host, port, ctx_size, timeout, reasoning_budget);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
@@ -265,11 +270,10 @@ pub fn main() !void {
 
         const eos_slice = config.eosTokenSlice();
         const sampling = generate_mod.SamplingParams{ .temperature = temperature };
-        const stdout = std.fs.File.stdout();
 
         if (stream_mode) {
             // Streaming: print tokens as they're generated
-            var timer = try std.time.Timer.start();
+            var timer = try compat.Timer.start();
             var gen = try generate_mod.Generator.init(allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice);
             defer gen.deinit(allocator);
 
@@ -280,7 +284,7 @@ pub fn main() !void {
                 0.0;
 
             try stdout.writeAll("==========\n");
-            var decode_timer = try std.time.Timer.start();
+            var decode_timer = try compat.Timer.start();
             var completion_tokens: u32 = 0;
             while (try gen.next(allocator)) |token_id| {
                 const ids = [_]u32{token_id};
@@ -331,12 +335,10 @@ pub fn main() !void {
 }
 
 /// Check if a port is already in use by trying to connect to it.
-fn portInUse(port: u16) bool {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
-    defer std.posix.close(sock);
-
-    // If connect succeeds, something is already listening
-    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+fn portInUse(io: std.Io, port: u16) bool {
+    const ip4 = std.Io.net.Ip4Address.loopback(port);
+    var addr = std.Io.net.IpAddress{ .ip4 = ip4 };
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return false;
+    defer stream.close(io);
     return true;
 }

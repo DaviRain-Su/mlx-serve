@@ -44,14 +44,16 @@ pub const ChatConfig = struct {
 };
 
 /// Load chat template configuration from tokenizer_config.json.
-pub fn loadChatConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
+pub fn loadChatConfig(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !ChatConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
 
-    const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    var file_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &file_buffer);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
@@ -65,9 +67,11 @@ pub fn loadChatConfig(allocator: std.mem.Allocator, model_dir: []const u8) !Chat
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
         const jinja_path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
         defer allocator.free(jinja_path);
-        if (std.fs.openFileAbsolute(jinja_path, .{})) |f| {
-            defer f.close();
-            break :blk try f.readToEndAlloc(allocator, 1 * 1024 * 1024);
+        if (std.Io.Dir.openFileAbsolute(io, jinja_path, .{})) |f| {
+            defer f.close(io);
+            var jinja_buffer: [4096]u8 = undefined;
+            var jinja_reader = f.reader(io, &jinja_buffer);
+            break :blk try jinja_reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
         } else |_| {
             break :blk try allocator.dupe(u8, "");
         }
@@ -481,11 +485,11 @@ fn fallbackFormatChat(
 pub fn stripThinkBlock(text: []const u8) []const u8 {
     // Gemma 4 style: <|channel>thought\n...<channel|>
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
-        return std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+        return std.mem.trimStart(u8, text[end + 10 ..], "\n ");
     }
     // Standard style: <think>...</think>
     if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
-        return std.mem.trimLeft(u8, text[think_end + 8 ..], "\n ");
+        return std.mem.trimStart(u8, text[think_end + 8 ..], "\n ");
     }
     if (std.mem.startsWith(u8, text, "<think>")) return text[0..0];
     if (std.mem.startsWith(u8, text, "<|channel>thought")) return text[0..0];
@@ -505,14 +509,14 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
         const think_tag = "<|channel>thought\n";
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
-        var content = std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+        var content = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
         // Strip the content channel tag: <|channel>\n or <|channel>
         if (std.mem.startsWith(u8, content, "<|channel>\n")) {
             content = content[11..];
         } else if (std.mem.startsWith(u8, content, "<|channel>")) {
             content = content[10..];
         }
-        content = std.mem.trimLeft(u8, content, "\n ");
+        content = std.mem.trimStart(u8, content, "\n ");
         return .{
             .reasoning_content = if (reasoning.len > 0) reasoning else null,
             .content = content,
@@ -522,7 +526,7 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
     if (std.mem.indexOf(u8, text, "</think>")) |end| {
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
-        const content = std.mem.trimLeft(u8, text[end + 8 ..], "\n ");
+        const content = std.mem.trimStart(u8, text[end + 8 ..], "\n ");
         return .{
             .reasoning_content = if (reasoning.len > 0) reasoning else null,
             .content = content,
@@ -538,10 +542,10 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
         //     defaulting to content keeps the answer visible to the user.
         if (std.mem.startsWith(u8, text, "<think>") or std.mem.startsWith(u8, text, "<|channel>thought")) {
             const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
-            const reasoning = std.mem.trimLeft(u8, text[start..], "\n ");
+            const reasoning = std.mem.trimStart(u8, text[start..], "\n ");
             return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
         }
-        return .{ .reasoning_content = null, .content = std.mem.trimLeft(u8, text, "\n ") };
+        return .{ .reasoning_content = null, .content = std.mem.trimStart(u8, text, "\n ") };
     }
     return .{ .reasoning_content = null, .content = text };
 }
@@ -551,9 +555,9 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // Strip thinking blocks if present
     var effective_text = text;
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
-        effective_text = std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+        effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
     } else if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
-        effective_text = std.mem.trimLeft(u8, text[think_end + 8 ..], "\n ");
+        effective_text = std.mem.trimStart(u8, text[think_end + 8 ..], "\n ");
     }
 
     var calls = std.ArrayList(ParsedToolCall).empty;
@@ -682,8 +686,8 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
         // Flat shape (e.g. Qwen MoE): {"name":"shell","command":"ls"} —
         // parameters live at top level. Synthesize an arguments object from
         // every non-metadata key.
-        var flat_map = std.json.ObjectMap.init(allocator);
-        defer flat_map.deinit();
+        var flat_map: std.json.ObjectMap = .empty;
+        defer flat_map.deinit(allocator);
         var it = obj.iterator();
         while (it.next()) |entry| {
             const k = entry.key_ptr.*;
@@ -693,7 +697,7 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
             {
                 continue;
             }
-            flat_map.put(k, entry.value_ptr.*) catch return null;
+            flat_map.put(allocator, k, entry.value_ptr.*) catch return null;
         }
         if (flat_map.count() == 0) return null;
         const flat_value = std.json.Value{ .object = flat_map };

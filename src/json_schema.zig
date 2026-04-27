@@ -309,11 +309,11 @@ fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), va
         .null => try buf.appendSlice(arena, "null"),
         .bool => |b| try buf.appendSlice(arena, if (b) "true" else "false"),
         .integer => |i| {
-            try std.fmt.format(buf.writer(arena), "{d}", .{i});
+            try buf.print(arena, "{d}", .{i});
         },
         .number_string => |s| try buf.appendSlice(arena, s),
         .float => |f| {
-            try std.fmt.format(buf.writer(arena), "{d}", .{f});
+            try buf.print(arena, "{d}", .{f});
         },
         .string => |s| try writeJsonString(arena, buf, s),
         .array => |arr| {

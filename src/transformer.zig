@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const mlx = @import("mlx.zig");
 
 // ── GatedDeltaNet fused Metal kernel ──
@@ -933,7 +934,7 @@ pub const Transformer = struct {
 
         // Batch eval all weights
         {
-            var eval_timer = std.time.Timer.start() catch unreachable;
+            var eval_timer = compat.Timer.start() catch unreachable;
             const all_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(all_vec);
 
@@ -4788,7 +4789,7 @@ fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 
     // Batch eval all BERT weights
     {
-        var eval_timer = std.time.Timer.start() catch unreachable;
+        var eval_timer = compat.Timer.start() catch unreachable;
         const all_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(all_vec);
 

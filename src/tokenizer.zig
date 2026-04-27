@@ -631,14 +631,16 @@ fn buildBytesToUnicode() [256]u21 {
 }
 
 /// Parse tokenizer.json and return a Tokenizer.
-pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
+pub fn loadTokenizer(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !Tokenizer {
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
 
-    const content = try file.readToEndAlloc(allocator, 256 * 1024 * 1024);
+    var file_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &file_buffer);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(content);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});

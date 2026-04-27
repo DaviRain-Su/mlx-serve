@@ -200,14 +200,16 @@ pub const ModelConfig = struct {
     }
 };
 
-pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
+pub fn parseConfig(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !ModelConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
 
-    const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    var file_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &file_buffer);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
@@ -698,27 +700,27 @@ pub const Weights = struct {
 
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
-pub fn loadWeights(allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(allocator, model_dir, false);
+pub fn loadWeights(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !Weights {
+    return loadWeightsOpt(allocator, io, model_dir, false);
 }
 
-pub fn loadWeightsWithVision(allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(allocator, model_dir, true);
+pub fn loadWeightsWithVision(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !Weights {
+    return loadWeightsOpt(allocator, io, model_dir, true);
 }
 
-fn loadWeightsOpt(allocator: std.mem.Allocator, model_dir: []const u8, load_vision: bool) !Weights {
+fn loadWeightsOpt(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, load_vision: bool) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
 
-    var dir = try std.fs.openDirAbsolute(model_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
 
     var file_count: u32 = 0;
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
 
