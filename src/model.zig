@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
@@ -204,7 +205,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    const file = try compat.openFile(io, path, .{});
     defer file.close(io);
 
     var file_buffer: [4096]u8 = undefined;
@@ -715,7 +716,7 @@ fn loadWeightsOpt(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
 
-    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    var dir = try compat.openDir(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
 
     var file_count: u32 = 0;

@@ -3,6 +3,7 @@ const jinja_c = @cImport({
     @cInclude("jinja_wrapper.h");
 });
 const tokenizer_mod = @import("tokenizer.zig");
+const compat = @import("compat.zig");
 const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -48,7 +49,7 @@ pub fn loadChatConfig(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    const file = try compat.openFile(io, path, .{});
     defer file.close(io);
 
     var file_buffer: [4096]u8 = undefined;
@@ -67,7 +68,7 @@ pub fn loadChatConfig(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
         const jinja_path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
         defer allocator.free(jinja_path);
-        if (std.Io.Dir.openFileAbsolute(io, jinja_path, .{})) |f| {
+        if (compat.openFile(io, jinja_path, .{})) |f| {
             defer f.close(io);
             var jinja_buffer: [4096]u8 = undefined;
             var jinja_reader = f.reader(io, &jinja_buffer);

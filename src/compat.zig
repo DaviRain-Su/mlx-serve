@@ -36,3 +36,17 @@ pub fn timestamp() i64 {
 pub fn milliTimestamp() i64 {
     return @intCast(@divTrunc(realtimeNs(), std.time.ns_per_ms));
 }
+
+pub fn openFile(io: std.Io, path: []const u8, options: std.Io.Dir.OpenFileOptions) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.Io.Dir.openFileAbsolute(io, path, options);
+    }
+    return std.Io.Dir.cwd().openFile(io, path, options);
+}
+
+pub fn openDir(io: std.Io, path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.Io.Dir.openDirAbsolute(io, path, options);
+    }
+    return std.Io.Dir.cwd().openDir(io, path, options);
+}

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const log = @import("log.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
@@ -635,7 +636,7 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, io: std.Io, model_dir: []cons
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    const file = try compat.openFile(io, path, .{});
     defer file.close(io);
 
     var file_buffer: [4096]u8 = undefined;
