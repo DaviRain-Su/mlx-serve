@@ -422,9 +422,9 @@ struct EndpointsSection: View {
         ("GET", "/health"),
         ("GET", "/v1/models"),
         ("POST", "/v1/chat/completions"),
-        ("POST", "/v1/completions"),
-        ("POST", "/v1/embeddings"),
+        ("POST", "/v1/responses"),
         ("POST", "/v1/messages"),
+        ("POST", "/v1/embeddings"),
     ]
 
     var body: some View {

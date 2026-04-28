@@ -1,5 +1,61 @@
 # Changelog
 
+## v26.4.30 — Gemma 4 Vision Fix, /v1/models Capabilities, Responses Streaming, Browse extractText
+
+### Gemma 4 Vision — Image Tokens Now Land in the Right Place
+- **Hard-coded Gemma 3 token IDs replaced with an architecture-aware marker**: `insertImageTokens` previously scanned for `[106, 1645]` (`<start_of_turn> user`), the Gemma 3 pattern. In every Gemma 4 tokenizer those IDs are entirely different (`<|turn>` is 105, `user` is 2364, `\n` is 107), so the search never matched and image tokens were inserted via the end-anchored fallback — i.e., inside the trailing `<|turn>model\n` generation prefix, where the model never sees them. Net effect: Gemma 4 was effectively blind to attached images even though the vision encoder ran successfully on every request.
+- **`populateUserTurnMarker` at startup**: New `ModelConfig.user_turn_marker_ids` is filled by encoding an architecture-specific user-turn prefix string with the actual tokenizer at server boot, then `insertImageTokens` searches for that subsequence with `std.mem.eql`. The prefix is picked from `chat_template` content so a model that ships an unusual template still tokenizes correctly:
+  - `<|turn>` in template → `<|turn>user\n` (Gemma 4)
+  - `<start_of_turn>` → `<start_of_turn>user\n` (Gemma 3)
+  - `<|im_start|>` → `<|im_start|>user\n` (Qwen / generic ChatML)
+  - `<|start_header_id|>` → `<|start_header_id|>user<|end_header_id|>\n\n` (Llama 3)
+  - none of the above → marker stays empty, fallback heuristic logs a warning so the silent miscompile no longer happens
+- **Verified end-to-end** on `gemma-4-e4b-it-4bit`: server now logs `User turn marker: "<|turn>user\n" -> 3 tokens` and `Inserted BOI + 256 image tokens + EOI at position 4` (right after BOS + 3-token marker), and the model produces real image descriptions instead of generic "I can't see images" text.
+
+### `/v1/models` Capabilities, Modalities, and Real Model IDs
+- **New `capabilities` array per model**: `chat`, `tool_use`, `streaming`, `vision`, `reasoning`, `json_schema`, `embeddings` — derived at request time from chat-template presence, vision-encoder loaded state, encoder-only mode, and a `chatTemplateSupportsThinking` heuristic that scans for `enable_thinking` / `<think>` / `thought` / `<|channel>`.
+- **`input_modalities` array**: `["text"]` or `["text","image"]` so clients know which content blocks they should send.
+- **`meta.architecture` field**: Exposes `model_type` (e.g. `gemma4`, `qwen3_5_moe`) alongside the existing vocab/hidden/layers/quantization/context_length values.
+- **Model id is now the directory basename** (e.g. `gemma-4-e4b-it-4bit`) instead of the architecture family — clients can finally distinguish quantizations of the same architecture. Falls back to the architecture family if `model_dir` is unavailable.
+- **`tests/test_models_capabilities.sh`**: New integration script asserting capability and modality presence per architecture.
+
+### Anthropic `/v1/messages` — Vision Support
+- **Base64 and URL image blocks accepted**: `{type:"image", source:{type:"base64", media_type, data}}` and `{type:"image", source:{type:"url", url}}` are now parsed alongside `text` blocks within the same user turn and routed through the existing vision pipeline (stb_image / libwebp decode → 768×768 float32 CHW → SigLIP encoder). Previously image blocks were silently dropped on the Anthropic endpoint.
+- **Same-message text + image bundling**: All blocks of a single user message are joined into one `Message` so vision embeddings attach to the right turn — fixes prompt-position drift when text and image arrive in one block.
+- **`tests/test_anthropic_vision.sh`**: New round-trip test against `/v1/messages` with a base64 image.
+
+### OpenAI `/v1/responses` — Live Streaming Deltas
+- **Reasoning, message, and function-call output items now stream incrementally**. New helpers `emitResponsesReasoningStart` / `emitResponsesReasoningDelta` / `emitResponsesReasoningEnd` (and matching message helpers) emit `output_item.added` + `reasoning_summary_part.added` / `content_part.added` once, fan out `reasoning_summary_text.delta` / `output_text.delta` per token chunk, and close with the matching `.done` events. Previously the entire reasoning/message text was buffered server-side and emitted as a single block at the end — defeating the point of SSE.
+- **Think-block streaming parity with chat completions**: 9-byte look-behind buffer for the longest close tag (`</think>` / `<channel|>`), template-pre-injected opener detection, dual-tag scan — same machinery as the chat-completions and Anthropic streaming paths, so reasoning is split cleanly from the final answer in all three endpoints.
+- **UTF-8 carry across BPE token boundaries**: Streaming path holds back partial multi-byte sequences so chunks always end on a valid codepoint.
+- **Tool-active requests still buffer fully**: We can't stream content deltas before knowing whether the output is a tool call.
+- **Chat-style `response_format` alias accepted**: Clients that point their existing `/v1/chat/completions` adapter at `/v1/responses` send `response_format = {type, json_schema:{schema}}` instead of `text.format = {type, schema}`. New `parseResponseFormatAlias` accepts both shapes (flat and nested under `json_schema`) on both fields, so the schema constraint isn't silently dropped. `parseTextFormat` also gained the nested-`json_schema` fallback.
+- **`tests/test_responses_streaming.sh`** + 4 new Zig tests in `responses.zig` covering nested and flat schema shapes on both fields.
+
+### Browse Tool — `extractText` for Data-Dense Pages
+- **Root cause of agent loops on small models**: Gemma 4 e4b looped 9 times trying to read GitHub trending. `readText` returned the first 3000 chars of `body.innerText`, dominated on `github.com/trending` by a `<details>` language picker (~200 language names) — actual `article.Box-row` repo entries appeared AFTER it, beyond the 3000-char cap. The repetition tracker eventually rate-limited the model. The model wasn't dumb; the tool was inadequate for data-dense pages.
+- **`readText` is now content-aware**: Picks `document.querySelector('main') || [role="main"] || article || document.body` as the root and adds `details, menu, datalist, [role="listbox"], [role="combobox"]` to the strip list so language pickers and combobox menus don't crowd out real content.
+- **New `extractText(selector)` browse action**: Runs `document.querySelectorAll(selector)`, joins the `innerText` of up to 50 matching elements with `\n---\n`, caps at 2900 chars. Returns `"No elements match selector: <sel>"` on empty so the model gets an unambiguous failure signal and can re-discover.
+- **Updated `web-interact` skill**: Step 1 now teaches `extractText` as the primary path for "give me X from this page" tasks with concrete selectors (`article.Box-row` / `tr.athing` / `.result, .g, [data-testid="result"]`). Drops the misleading "navigate → readHTML" advice (`readHTML` returns mostly `<head>`).
+- **Tool description rewritten**: Browse description in `AgentPrompt.swift` lists `extractText` and steers the model toward it for data-listing pages while keeping the existing key-order guarantees.
+
+### Schema Enforcement — Dropped-Schema Repair
+- **Bench runs surfaced silent schema drops**: Probing showed (a) flat `text.format.schema` was enforced, (b) nested `text.format.json_schema.schema` was silently dropped (no grammar log), (c) top-level `response_format` on `/v1/responses` was silently dropped, and (d) `tools + tool_choice:"none" + schema` skipped the mask. Fixed by `parseTextFormat` / `parseResponseFormatAlias` accepting both shapes on both fields.
+- **`tests/test_json_schema_enforcement.sh`**: New test that biases the model toward markdown code-fences and `additionalProperties` violations across all four request shapes — strong signal that the grammar mask is doing the work, not just the prompt-side instruction.
+
+### MLX Core App — Lifecycle & UX
+- **Default port 8080 → 11234**: Avoids conflict with the long list of dev tools that squat on 8080. Updated in `--port` default, `ServerManager.port`, README, and the displayed endpoints panel.
+- **Orphan-process reaper**: `ServerManager.startServer` now runs `lsof -nP -iTCP:<port> -sTCP:LISTEN -t`, filters PIDs whose `ps -o comm=` ends in `mlx-serve`, and SIGTERMs (then SIGKILLs after 2 s) any survivors before launching its own child. Recovers cleanly from a previous crash that left the port held, with no risk to unrelated apps that happen to bind the same port.
+- **Endpoints panel refreshed**: Replaced `/v1/completions` (rarely used) with `/v1/responses` (newly streaming) and reordered for the typical agent workflow.
+- **Chat input background uses `NSColor.textBackgroundColor`**: System-aware light/dark background instead of a hard-coded near-black, so light-mode users actually see the field.
+
+### Testing
+- **+10 new Zig unit tests** across `src/model.zig` (5: `pickUserTurnPrefix` for Gemma 3/4, ChatML, Llama 3, unknown; `userTurnMarkerSlice` length respect), `src/server.zig` (4: `insertImageTokens` happy path, multi-user-turn ordering, no-marker fallback, no-op cases), and `src/responses.zig` (4: text-format / response-format alias shapes).
+- **+4 new shell integration scripts**: `test_anthropic_vision.sh`, `test_json_schema_enforcement.sh`, `test_models_capabilities.sh`, `test_responses_streaming.sh`.
+- `zig build test` 0 failures, full Swift test suite green.
+
+---
+
 ## v26.4.28 — Grammar-Constrained JSON Schema Decoding
 
 ### Strict `response_format.json_schema` Enforcement

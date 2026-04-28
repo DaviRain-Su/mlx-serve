@@ -119,9 +119,12 @@ pub const TextFormat = struct {
     schema_value: ?std.json.Value,
 };
 
-/// Decode the `text` field of a Responses request. Returns text-format ("text"
-/// by default) — `json_schema` is FLAT here: `text.format = {type, name,
-/// schema, strict}` — not nested under another `json_schema` key.
+/// Decode the `text` field of a Responses request. Accepts both shapes:
+///   • flat (current OpenAI Responses spec):
+///       text.format = {type, name, schema, strict}
+///   • nested (chat-completions-style, used by some clients/benches):
+///       text.format = {type, json_schema: {name, schema, strict}}
+/// Returns text-format ("text" by default) and the schema value to enforce.
 pub fn parseTextFormat(text_val: ?std.json.Value) TextFormat {
     const v = text_val orelse return .{ .kind = "text", .schema_value = null };
     if (v != .object) return .{ .kind = "text", .schema_value = null };
@@ -129,7 +132,33 @@ pub fn parseTextFormat(text_val: ?std.json.Value) TextFormat {
     if (fmt_val != .object) return .{ .kind = "text", .schema_value = null };
     const t_val = fmt_val.object.get("type") orelse return .{ .kind = "text", .schema_value = null };
     const t = if (t_val == .string) t_val.string else "text";
-    const schema = fmt_val.object.get("schema");
+    // Prefer flat `schema`; fall back to nested `json_schema.schema`.
+    var schema = fmt_val.object.get("schema");
+    if (schema == null) {
+        if (fmt_val.object.get("json_schema")) |js| if (js == .object) {
+            schema = js.object.get("schema");
+        };
+    }
+    return .{ .kind = t, .schema_value = schema };
+}
+
+/// Decode a chat-completions-style `response_format` field as an alternative to
+/// `text.format` on /v1/responses. Some clients/benches send their /v1/chat/
+/// completions adapter body to /v1/responses; accept it as an alias to avoid
+/// silently dropping the schema constraint.
+///   response_format = {type, json_schema: {name, schema, strict}}
+///   response_format = {type, schema, name, strict}        (flat, also accepted)
+pub fn parseResponseFormatAlias(rf_val: ?std.json.Value) TextFormat {
+    const v = rf_val orelse return .{ .kind = "text", .schema_value = null };
+    if (v != .object) return .{ .kind = "text", .schema_value = null };
+    const t_val = v.object.get("type") orelse return .{ .kind = "text", .schema_value = null };
+    const t = if (t_val == .string) t_val.string else "text";
+    var schema = v.object.get("schema");
+    if (schema == null) {
+        if (v.object.get("json_schema")) |js| if (js == .object) {
+            schema = js.object.get("schema");
+        };
+    }
     return .{ .kind = t, .schema_value = schema };
 }
 
@@ -625,6 +654,45 @@ test "parseTextFormat extracts schema from flat shape" {
 
 test "parseTextFormat default is text" {
     const tf = parseTextFormat(null);
+    try testing.expectEqualStrings("text", tf.kind);
+    try testing.expect(tf.schema_value == null);
+}
+
+test "parseTextFormat extracts schema from nested json_schema shape" {
+    const json =
+        \\{"format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"},"strict":true}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const tf = parseTextFormat(parsed.value);
+    try testing.expectEqualStrings("json_schema", tf.kind);
+    try testing.expect(tf.schema_value != null);
+}
+
+test "parseResponseFormatAlias accepts chat-style nested shape" {
+    const json =
+        \\{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"},"strict":true}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const tf = parseResponseFormatAlias(parsed.value);
+    try testing.expectEqualStrings("json_schema", tf.kind);
+    try testing.expect(tf.schema_value != null);
+}
+
+test "parseResponseFormatAlias accepts flat shape too" {
+    const json =
+        \\{"type":"json_schema","name":"x","schema":{"type":"object"},"strict":true}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const tf = parseResponseFormatAlias(parsed.value);
+    try testing.expectEqualStrings("json_schema", tf.kind);
+    try testing.expect(tf.schema_value != null);
+}
+
+test "parseResponseFormatAlias default is text" {
+    const tf = parseResponseFormatAlias(null);
     try testing.expectEqualStrings("text", tf.kind);
     try testing.expect(tf.schema_value == null);
 }

@@ -25,7 +25,7 @@ fn printUsage() void {
         \\  --model <dir>       Path to MLX model directory (required)
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 0.0.0.0)
-        \\  --port <n>          Bind port (default: 8080)
+        \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --prompt <text>     Run single prompt (interactive mode)
         \\  --stream            Stream tokens as they are generated (with --prompt)
@@ -56,7 +56,7 @@ pub fn main() !void {
     }
 
     var model_dir: []const u8 = DEFAULT_MODEL_DIR;
-    var port: u16 = 8080;
+    var port: u16 = 11234;
     var host: []const u8 = "0.0.0.0";
     var serve_mode = false;
     var stream_mode = false;
@@ -193,6 +193,10 @@ pub fn main() !void {
         }
     }
 
+    // Pre-encode the user-turn marker so vision-image insertion can locate the
+    // latest user turn at request time, regardless of architecture.
+    try config.populateUserTurnMarker(allocator, &tok, chat_config.chat_template);
+
     // Load weights (include vision weights if model has vision config and not disabled)
     const load_vision = config.has_vision and !no_vision;
     log.info("Loading weights...\n", .{});
@@ -250,7 +254,7 @@ pub fn main() !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, host, port, ctx_size, timeout, reasoning_budget);
+        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{

@@ -305,7 +305,7 @@ struct ChatDetailView: View {
                                 inputFocused = true
                             }
                         }
-                        .background(Color(nsColor: NSColor(white: 0.10, alpha: 1)))
+                        .background(Color(nsColor: .textBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)

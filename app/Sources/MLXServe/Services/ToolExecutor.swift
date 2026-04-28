@@ -432,6 +432,10 @@ struct BrowseHandler: ToolHandler {
                     _ = try await browser.navigate(to: url)
                 }
                 return try await browser.readHTML()
+            case "extractText":
+                if let url = parameters["url"] { _ = try await browser.navigate(to: url) }
+                guard let selector = parameters["selector"] else { throw ToolError.missingParameter("selector") }
+                return try await browser.extractText(selector: selector)
             case "click":
                 guard let selector = parameters["selector"] else { throw ToolError.missingParameter("selector") }
                 return try await browser.click(selector: selector)

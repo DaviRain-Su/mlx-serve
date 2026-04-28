@@ -160,7 +160,7 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--model PATH` | required | Path to the MLX model directory |
 | `--serve` | off | Start the HTTP server |
 | `--host ADDR` | `127.0.0.1` | Host address to bind |
-| `--port N` | `8080` | Port for the HTTP server |
+| `--port N` | `11234` | Port for the HTTP server |
 | `--prompt TEXT` | `"Hello"` | Prompt for interactive mode |
 | `--max-tokens N` | `100` | Maximum tokens to generate |
 | `--temp F` | `0.0` | Sampling temperature (0 = greedy) |

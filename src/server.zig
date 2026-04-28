@@ -91,6 +91,11 @@ var last_generation_was_pad: bool = false;
 /// Vision encoder (null if model has no vision support).
 var global_vision_encoder: ?*VisionEncoder = null;
 
+/// Model identifier shown in /v1/models. Defaults to architecture family but
+/// is overridden in serve() to the model directory basename when known
+/// (e.g. "gemma-4-e4b-it-8bit") so clients can distinguish quantizations.
+var global_model_id: []const u8 = "";
+
 /// Tokenizer-vocabulary byte table for grammar-constrained sampling. Built
 /// lazily on the first JSON-schema request and reused for the lifetime of the
 /// server. Single-threaded inference path means no synchronization is needed.
@@ -146,6 +151,7 @@ pub fn serve(
     chat_config: *const chat_mod.ChatConfig,
     config: *const model_mod.ModelConfig,
     vision_encoder: ?*VisionEncoder,
+    model_dir: []const u8,
     host: []const u8,
     port: u16,
     ctx_size: u32,
@@ -156,6 +162,16 @@ pub fn serve(
     max_context_size = ctx_size;
     request_timeout_sec = timeout;
     default_reasoning_budget = reasoning_budget;
+    // Use the directory basename as the public model id (e.g. "gemma-4-e4b-it-8bit").
+    // Trim any trailing slash, then take everything after the final slash. Falls
+    // back to the architecture family if model_dir is empty.
+    global_model_id = blk: {
+        var p = model_dir;
+        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+        if (p.len == 0) break :blk config.model_type;
+        if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| break :blk p[i + 1 ..];
+        break :blk p;
+    };
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -366,7 +382,7 @@ fn handleConnection(
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
-        try handleModels(allocator, stream, config);
+        try handleModels(allocator, stream, config, chat_config);
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, config, chat_config);
@@ -585,16 +601,80 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize) u32 {
     return max_tokens;
 }
 
-fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig) !void {
+/// Heuristic: chat templates that contain a thinking-block opener indicate the
+/// model can produce reasoning_content. Covers Qwen (`enable_thinking`,
+/// `<think>`), Gemma 4 (`<|channel>thought`), and generic `<think>` templates.
+fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
+    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
+        std.mem.indexOf(u8, tmpl, "<think>") != null or
+        std.mem.indexOf(u8, tmpl, "thought") != null or
+        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
+}
+
+fn handleModels(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    config: *const model_mod.ModelConfig,
+    chat_config: *const chat_mod.ChatConfig,
+) !void {
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
     } else try std.fmt.allocPrint(allocator, "null", .{});
     defer allocator.free(ctx_str);
 
+    // ── compute capabilities ──
+    var caps = std.ArrayList(u8).empty;
+    defer caps.deinit(allocator);
+    try caps.append(allocator, '[');
+    var n_caps: usize = 0;
+    const append_cap = struct {
+        fn call(a: std.mem.Allocator, b: *std.ArrayList(u8), n: *usize, name: []const u8) !void {
+            if (n.* > 0) try b.append(a, ',');
+            try b.append(a, '"');
+            try b.appendSlice(a, name);
+            try b.append(a, '"');
+            n.* += 1;
+        }
+    }.call;
+
+    const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
+    const has_vision = global_vision_encoder != null;
+    const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
+
+    if (has_chat) try append_cap(allocator, &caps, &n_caps, "chat");
+    if (has_chat) try append_cap(allocator, &caps, &n_caps, "tool_use");
+    if (has_chat) try append_cap(allocator, &caps, &n_caps, "streaming");
+    if (has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
+    if (has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
+    if (has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
+    if (config.is_encoder_only) try append_cap(allocator, &caps, &n_caps, "embeddings");
+    try caps.append(allocator, ']');
+
+    // ── input modalities ──
+    var mods = std.ArrayList(u8).empty;
+    defer mods.deinit(allocator);
+    try mods.appendSlice(allocator, "[\"text\"");
+    if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
+    try mods.append(allocator, ']');
+
+    // ── id falls back to architecture family if serve() didn't set it ──
+    const model_id: []const u8 = if (global_model_id.len > 0) global_model_id else config.model_type;
+
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","meta":{{"vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
-    , .{ config.model_type, std.time.timestamp(), config.vocab_size, config.hidden_size, config.num_hidden_layers, config.quant_bits, ctx_str });
+        \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
+    , .{
+        model_id,
+        std.time.timestamp(),
+        caps.items,
+        mods.items,
+        config.model_type,
+        config.vocab_size,
+        config.hidden_size,
+        config.num_hidden_layers,
+        config.quant_bits,
+        ctx_str,
+    });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -2833,17 +2913,17 @@ fn processVisionImages(
 fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, image_token_id: u32, n_tokens: usize, config: *const model_mod.ModelConfig) ![]u32 {
     if (image_token_id == 0 or n_tokens == 0) return try allocator.dupe(u32, prompt_ids);
 
-    // Find the last USER turn to insert image tokens.
-    // For Gemma 4: pattern is <start_of_turn>(106) user(1645) \n(108).
-    // Scan backward to find the last user turn (not model turn).
+    // Find the last USER turn and insert image tokens immediately after it.
+    // The marker IDs come from encoding an architecture-specific prefix
+    // (e.g. "<|turn>user\n") at server startup — see populateUserTurnMarker.
+    const marker = config.userTurnMarkerSlice();
     var insert_pos: usize = 0;
     var found_turn = false;
-    if (prompt_ids.len >= 3) {
-        var i = prompt_ids.len - 3;
+    if (marker.len > 0 and prompt_ids.len >= marker.len) {
+        var i = prompt_ids.len - marker.len;
         while (true) {
-            if (prompt_ids[i] == 106 and prompt_ids[i + 1] == 1645) {
-                // Found <start_of_turn> user — insert after user\n
-                insert_pos = @min(i + 3, prompt_ids.len);
+            if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) {
+                insert_pos = i + marker.len;
                 found_turn = true;
                 break;
             }
@@ -2853,6 +2933,7 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
     }
     if (!found_turn) {
         // Fallback: insert after BOS + system prompt, before last few tokens
+        log.warn("insertImageTokens: user turn marker not found (marker_len={d}, prompt_len={d}); using end-anchored fallback\n", .{ marker.len, prompt_ids.len });
         insert_pos = if (prompt_ids.len > 5) prompt_ids.len - 5 else 0;
     }
 
@@ -3216,7 +3297,7 @@ fn handleAnthropicMessages(
                     try messages.append(allocator, .{ .role = "user", .content = s, .tool_calls = null, .tool_call_id = null });
                 },
                 .array => |arr| {
-                    // Process tool_result blocks first, then text blocks
+                    // Process tool_result blocks first, then text+image blocks.
                     for (arr.items) |block| {
                         if (block != .object) continue;
                         const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
@@ -3241,15 +3322,74 @@ fn handleAnthropicMessages(
                         };
                         try messages.append(allocator, .{ .role = "tool", .content = result_text, .tool_calls = null, .tool_call_id = tool_use_id });
                     }
-                    // Collect text blocks
+
+                    // Collect text + image blocks into a single user message so
+                    // the vision encoder sees them attached to the right turn.
+                    var msg_text = std.ArrayList(u8).empty;
+                    defer msg_text.deinit(allocator);
+                    var image_list = std.ArrayList(chat_mod.ImageData).empty;
+                    errdefer {
+                        for (image_list.items) |img| allocator.free(img.pixels);
+                        image_list.deinit(allocator);
+                    }
                     for (arr.items) |block| {
                         if (block != .object) continue;
                         const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-                        if (!std.mem.eql(u8, btype, "text")) continue;
-                        const text = if (block.object.get("text")) |t| (if (t == .string) t.string else "") else "";
-                        if (text.len > 0) {
-                            try messages.append(allocator, .{ .role = "user", .content = text, .tool_calls = null, .tool_call_id = null });
+                        if (std.mem.eql(u8, btype, "text")) {
+                            const text = if (block.object.get("text")) |t| (if (t == .string) t.string else "") else "";
+                            if (text.len > 0) {
+                                if (msg_text.items.len > 0) try msg_text.append(allocator, '\n');
+                                try msg_text.appendSlice(allocator, text);
+                            }
+                        } else if (std.mem.eql(u8, btype, "image")) {
+                            // Anthropic image block: source = {type:"base64", media_type, data}
+                            //                    or = {type:"url", url}
+                            const src_val = block.object.get("source") orelse continue;
+                            if (src_val != .object) continue;
+                            const stype = if (src_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+                            const data_url = blk: {
+                                if (std.mem.eql(u8, stype, "base64")) {
+                                    const media = if (src_val.object.get("media_type")) |v| (if (v == .string) v.string else "image/png") else "image/png";
+                                    const data = if (src_val.object.get("data")) |v| (if (v == .string) v.string else "") else "";
+                                    if (data.len == 0) break :blk @as(?[]const u8, null);
+                                    break :blk @as(?[]const u8, try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media, data }));
+                                } else if (std.mem.eql(u8, stype, "url")) {
+                                    const url = if (src_val.object.get("url")) |v| (if (v == .string) v.string else "") else "";
+                                    if (url.len == 0) break :blk @as(?[]const u8, null);
+                                    // Pass through as-is (parseImageUrlContent handles data URLs).
+                                    break :blk @as(?[]const u8, try allocator.dupe(u8, url));
+                                }
+                                break :blk @as(?[]const u8, null);
+                            };
+                            if (data_url) |du| {
+                                defer allocator.free(du);
+                                if (parseImageUrlContent(allocator, du)) |img| {
+                                    image_list.append(allocator, img) catch {
+                                        allocator.free(img.pixels);
+                                        continue;
+                                    };
+                                }
+                            }
                         }
+                    }
+                    if (msg_text.items.len > 0 or image_list.items.len > 0) {
+                        const owned_text = if (msg_text.items.len > 0) blk: {
+                            const s = try allocator.dupe(u8, msg_text.items);
+                            try content_allocs.append(allocator, s);
+                            break :blk s;
+                        } else "";
+                        const owned_images: ?[]const chat_mod.ImageData = if (image_list.items.len > 0) blk: {
+                            break :blk try image_list.toOwnedSlice(allocator);
+                        } else null;
+                        try messages.append(allocator, .{
+                            .role = "user",
+                            .content = owned_text,
+                            .tool_calls = null,
+                            .tool_call_id = null,
+                            .images = owned_images,
+                        });
+                    } else {
+                        image_list.deinit(allocator);
                     }
                 },
                 else => {},
@@ -3410,8 +3550,28 @@ fn handleAnthropicMessages(
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template
-    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, if (has_tools) tools_json else null, tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, if (has_tools) tools_json else null, tool_choice_instruction, enable_thinking);
+
+    // Vision encoder: encode any images on the last user message and splice
+    // image tokens into the prompt at the model's configured image_token_id.
+    if (global_vision_encoder) |ve| {
+        processVisionImages(allocator, ve, xfm, messages.items) catch |err| {
+            log.warn("Vision encoding failed: {}\n", .{err});
+        };
+        if (xfm.vision_embeddings != null) {
+            const ve_shape = mlx.getShape(xfm.vision_embeddings.?);
+            const n_img_tokens: usize = @intCast(ve_shape[1]);
+            const new_ids = try insertImageTokens(allocator, prompt_ids_raw, config.image_token_id, n_img_tokens, config);
+            allocator.free(prompt_ids_raw);
+            prompt_ids_raw = new_ids;
+        }
+    }
+    const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    defer {
+        if (xfm.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+        xfm.vision_embeddings = null;
+    }
 
     // Context size enforcement
     const effective_ctx = getEffectiveContextLength(config);
@@ -4241,8 +4401,17 @@ fn handleResponses(
     // ── streaming ──
     const is_stream = if (root.get("stream")) |v| (v == .bool and v.bool) else false;
 
-    // ── text.format ──
-    const text_format = responses_mod.parseTextFormat(root.get("text"));
+    // ── text.format (or chat-style response_format alias) ──
+    var text_format = responses_mod.parseTextFormat(root.get("text"));
+    if (text_format.schema_value == null and !std.mem.eql(u8, text_format.kind, "json_schema") and !std.mem.eql(u8, text_format.kind, "json_object")) {
+        // Fall back to top-level `response_format` (some clients reuse their
+        // chat-completions adapter for /v1/responses).
+        const alias = responses_mod.parseResponseFormatAlias(root.get("response_format"));
+        if (alias.schema_value != null or std.mem.eql(u8, alias.kind, "json_schema") or std.mem.eql(u8, alias.kind, "json_object")) {
+            text_format = alias;
+            log.debug("[responses] using top-level response_format as text.format alias\n", .{});
+        }
+    }
     const grammar_schema_val: ?std.json.Value = text_format.schema_value;
     const wants_json = std.mem.eql(u8, text_format.kind, "json_schema") or std.mem.eql(u8, text_format.kind, "json_object");
     const has_current_tool_output = responses_mod.inputContainsFunctionCallOutput(input_val);
@@ -4482,10 +4651,216 @@ fn handleResponses(
         try sendAnthropicEvent(stream, "response.in_progress", ip_payload);
     }
 
-    // ── generate ──
+    // ── generate (streaming path: emit deltas live; non-streaming: existing) ──
     const eos_slice = config.eosTokenSlice();
-    var result = try generate_mod.generate(allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), 0);
-    result.prompt_tokens += cache_result.cached_tokens;
+
+    // Streaming bookkeeping. When we live-stream a reasoning or message item,
+    // we record its id + index so the post-loop block emits just the END
+    // events instead of full start+delta+end via emit*Events.
+    var streamed_reasoning_id: ?[]u8 = null;
+    var streamed_reasoning_index: u32 = 0;
+    var streamed_reasoning_started = false;
+    var streamed_message_id: ?[]u8 = null;
+    var streamed_message_index: u32 = 0;
+    var streamed_message_started = false;
+    defer if (streamed_reasoning_id) |id| allocator.free(id);
+    defer if (streamed_message_id) |id| allocator.free(id);
+
+    var result: generate_mod.GenerationResult = undefined;
+    if (is_stream) {
+        var gen = try generate_mod.Generator.init(allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice);
+        gen.timeout_ns = getTimeoutNs();
+        defer gen.deinit(allocator);
+
+        var raw_buf = std.ArrayList(u8).empty;
+        defer raw_buf.deinit(allocator);
+        var token_ids_buf = std.ArrayList(u32).empty;
+        defer token_ids_buf.deinit(allocator);
+
+        var utf8_carry: [3]u8 = undefined;
+        var utf8_carry_len: u8 = 0;
+        var stopped = false;
+        var in_think_block = enable_thinking;
+        var think_buf = std.ArrayList(u8).empty;
+        defer think_buf.deinit(allocator);
+        var skipped_think_open = false;
+        var live_output_index: u32 = 0;
+
+        while (try gen.next(allocator)) |token_id| {
+            try token_ids_buf.append(allocator, token_id);
+            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, false);
+
+            // UTF-8 carry across BPE-token boundaries (matches chat-completion).
+            const token_text = blk: {
+                const with_carry = if (utf8_carry_len > 0) cc: {
+                    const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
+                    @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
+                    @memcpy(combined[utf8_carry_len..], raw_decoded);
+                    allocator.free(raw_decoded);
+                    utf8_carry_len = 0;
+                    break :cc combined;
+                } else raw_decoded;
+                const tail = utf8TrailingIncomplete(with_carry);
+                if (tail > 0) {
+                    @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
+                    utf8_carry_len = @intCast(tail);
+                }
+                if (with_carry.len == tail) {
+                    allocator.free(with_carry);
+                    continue;
+                }
+                if (tail > 0) {
+                    const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
+                    allocator.free(with_carry);
+                    break :blk trimmed;
+                }
+                break :blk with_carry;
+            };
+            defer allocator.free(token_text);
+
+            try raw_buf.appendSlice(allocator, token_text);
+
+            if (stop_sequences.items.len > 0) {
+                for (stop_sequences.items) |stop_seq| {
+                    if (std.mem.indexOf(u8, raw_buf.items, stop_seq) != null) {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if (stopped) break;
+            }
+
+            // Tool-active requests buffer entirely — we cannot emit text deltas
+            // before knowing whether the output is a tool call.
+            if (active_has_tools) continue;
+
+            if (in_think_block) {
+                try think_buf.appendSlice(allocator, token_text);
+
+                // Skip a literal think opener if the template did not pre-inject one.
+                if (!skipped_think_open and think_buf.items.len >= 7) {
+                    if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
+                        var skip: usize = 7;
+                        while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                        const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                        think_buf.clearAndFree(allocator);
+                        try think_buf.appendSlice(allocator, remaining);
+                        allocator.free(remaining);
+                        skipped_think_open = true;
+                    } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
+                        var skip: usize = 17;
+                        while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                        const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                        think_buf.clearAndFree(allocator);
+                        try think_buf.appendSlice(allocator, remaining);
+                        allocator.free(remaining);
+                        skipped_think_open = true;
+                    } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
+                        // partial prefix of channel-thought tag; wait for more
+                    } else {
+                        skipped_think_open = true;
+                    }
+                }
+
+                // Detect close tag (</think> or <channel|>).
+                const tp = std.mem.indexOf(u8, think_buf.items, "</think>");
+                const cp = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+                const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
+                    if (tp == null and cp == null) break :blk null;
+                    if (tp == null) break :blk .{ .pos = cp.?, .tag = "<channel|>" };
+                    if (cp == null) break :blk .{ .pos = tp.?, .tag = "</think>" };
+                    if (tp.? <= cp.?) break :blk .{ .pos = tp.?, .tag = "</think>" };
+                    break :blk .{ .pos = cp.?, .tag = "<channel|>" };
+                };
+
+                if (close_match) |m| {
+                    const before = think_buf.items[0..m.pos];
+                    if (before.len > 0) {
+                        if (!streamed_reasoning_started) {
+                            streamed_reasoning_id = try responses_mod.makeId(allocator, "rs");
+                            streamed_reasoning_index = live_output_index;
+                            try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
+                            streamed_reasoning_started = true;
+                        }
+                        try emitResponsesReasoningDelta(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, before);
+                    }
+                    if (streamed_reasoning_started) live_output_index += 1;
+
+                    const after = m.pos + m.tag.len;
+                    var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                    if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
+                        content_after = content_after[11..];
+                    } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
+                        content_after = content_after[10..];
+                    }
+                    content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                    if (content_after.len > 0) {
+                        if (!streamed_message_started) {
+                            streamed_message_id = try responses_mod.makeId(allocator, "msg");
+                            streamed_message_index = live_output_index;
+                            try emitResponsesMessageStart(allocator, stream, streamed_message_index, streamed_message_id.?);
+                            streamed_message_started = true;
+                        }
+                        try emitResponsesMessageDelta(allocator, stream, streamed_message_index, streamed_message_id.?, content_after);
+                    }
+                    think_buf.clearRetainingCapacity();
+                    in_think_block = false;
+                } else if (skipped_think_open) {
+                    // Hold back the longest possible partial-tag suffix (max 9 bytes
+                    // covers both "</think>" and "<channel|>").
+                    const max_partial: usize = 9;
+                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    if (safe_len > 0) {
+                        if (!streamed_reasoning_started) {
+                            streamed_reasoning_id = try responses_mod.makeId(allocator, "rs");
+                            streamed_reasoning_index = live_output_index;
+                            try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
+                            streamed_reasoning_started = true;
+                        }
+                        try emitResponsesReasoningDelta(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
+                        const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
+                        think_buf.clearRetainingCapacity();
+                        try think_buf.appendSlice(allocator, remaining);
+                        allocator.free(remaining);
+                    }
+                }
+            } else {
+                // Skip Gemma 4 channel tags that may leak after the thinking block.
+                if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
+                if (!streamed_message_started) {
+                    streamed_message_id = try responses_mod.makeId(allocator, "msg");
+                    streamed_message_index = live_output_index;
+                    try emitResponsesMessageStart(allocator, stream, streamed_message_index, streamed_message_id.?);
+                    streamed_message_started = true;
+                }
+                try emitResponsesMessageDelta(allocator, stream, streamed_message_index, streamed_message_id.?, token_text);
+            }
+        }
+
+        // Flush any remaining think buffer (no close tag found) as reasoning.
+        if (in_think_block and think_buf.items.len > 0 and !active_has_tools) {
+            if (!streamed_reasoning_started) {
+                streamed_reasoning_id = try responses_mod.makeId(allocator, "rs");
+                streamed_reasoning_index = live_output_index;
+                try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
+                streamed_reasoning_started = true;
+            }
+            try emitResponsesReasoningDelta(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
+        }
+
+        result = .{
+            .text = try raw_buf.toOwnedSlice(allocator),
+            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
+            .prompt_tokens = gen.prompt_tokens + cache_result.cached_tokens,
+            .completion_tokens = gen.completion_tokens,
+            .finish_reason = if (stopped) "stop" else gen.finish_reason,
+            .prefill_tps = 0.0,
+            .decode_tps = 0.0,
+        };
+    } else {
+        result = try generate_mod.generate(allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), 0);
+        result.prompt_tokens += cache_result.cached_tokens;
+    }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -4541,14 +4916,21 @@ fn handleResponses(
     }
 
     if (reasoning_text) |rt| if (rt.len > 0) {
-        const rid = try responses_mod.makeId(allocator, "rs");
-        defer allocator.free(rid);
         if (emitted > 0) try out_buf.append(allocator, ',');
-        try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
-        emitted += 1;
-        if (is_stream) {
-            try emitResponsesReasoningEvents(allocator, stream, output_index, rid, rt);
+        if (is_stream and streamed_reasoning_started) {
+            // Live deltas already streamed; emit just the closing events with
+            // the canonical reasoning text from splitThinkBlock.
+            try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
+            try emitResponsesReasoningEnd(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, rt);
+        } else {
+            const rid = try responses_mod.makeId(allocator, "rs");
+            defer allocator.free(rid);
+            try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
+            if (is_stream) {
+                try emitResponsesReasoningEvents(allocator, stream, output_index, rid, rt);
+            }
         }
+        emitted += 1;
         output_index += 1;
     };
 
@@ -4583,14 +4965,20 @@ fn handleResponses(
 
     const has_tool_calls = emitted_tool_calls.items.len > 0;
     if (!has_tool_calls) {
-        const mid = try responses_mod.makeId(allocator, "msg");
-        defer allocator.free(mid);
         if (emitted > 0) try out_buf.append(allocator, ',');
-        try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
-        emitted += 1;
-        if (is_stream) {
-            try emitResponsesMessageEvents(allocator, stream, output_index, mid, visible_text);
+        if (is_stream and streamed_message_started) {
+            // Live deltas already streamed; emit just the closing events.
+            try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
+            try emitResponsesMessageEnd(allocator, stream, streamed_message_index, streamed_message_id.?, visible_text);
+        } else {
+            const mid = try responses_mod.makeId(allocator, "msg");
+            defer allocator.free(mid);
+            try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
+            if (is_stream) {
+                try emitResponsesMessageEvents(allocator, stream, output_index, mid, visible_text);
+            }
         }
+        emitted += 1;
         output_index += 1;
     }
 
@@ -4685,21 +5073,16 @@ fn buildResponsesEnvelope(
     });
 }
 
-/// Emit the SSE event sequence for a reasoning output item: output_item.added,
-/// reasoning_summary_part.added, reasoning_summary_text.delta (single delta),
-/// .done, summary_part.done, output_item.done.
-fn emitResponsesReasoningEvents(
+/// Emit output_item.added (type=reasoning) + reasoning_summary_part.added.
+/// Pair with `emitResponsesReasoningEnd` after deltas are streamed.
+fn emitResponsesReasoningStart(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
     output_index: u32,
     item_id: []const u8,
-    reasoning_text: []const u8,
 ) !void {
     const esc_id = try jsonEscape(allocator, item_id);
     defer allocator.free(esc_id);
-    const esc_text = try jsonEscape(allocator, reasoning_text);
-    defer allocator.free(esc_text);
-
     {
         const item_added = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"reasoning","id":{s},"summary":[]}}}}
@@ -4714,13 +5097,40 @@ fn emitResponsesReasoningEvents(
         defer allocator.free(part_added);
         try sendAnthropicEvent(stream, "response.reasoning_summary_part.added", part_added);
     }
-    {
-        const delta = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.reasoning_summary_text.delta","item_id":{s},"output_index":{d},"summary_index":0,"delta":{s}}}
-        , .{ esc_id, output_index, esc_text });
-        defer allocator.free(delta);
-        try sendAnthropicEvent(stream, "response.reasoning_summary_text.delta", delta);
-    }
+}
+
+/// Emit a single reasoning_summary_text.delta event with the given chunk.
+fn emitResponsesReasoningDelta(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    delta_text: []const u8,
+) !void {
+    if (delta_text.len == 0) return;
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_delta = try jsonEscape(allocator, delta_text);
+    defer allocator.free(esc_delta);
+    const delta = try std.fmt.allocPrint(allocator,
+        \\{{"type":"response.reasoning_summary_text.delta","item_id":{s},"output_index":{d},"summary_index":0,"delta":{s}}}
+    , .{ esc_id, output_index, esc_delta });
+    defer allocator.free(delta);
+    try sendAnthropicEvent(stream, "response.reasoning_summary_text.delta", delta);
+}
+
+/// Emit reasoning_summary_text.done + reasoning_summary_part.done + output_item.done.
+fn emitResponsesReasoningEnd(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    full_text: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_text = try jsonEscape(allocator, full_text);
+    defer allocator.free(esc_text);
     {
         const done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.reasoning_summary_text.done","item_id":{s},"output_index":{d},"summary_index":0,"text":{s}}}
@@ -4742,6 +5152,20 @@ fn emitResponsesReasoningEvents(
         defer allocator.free(item_done);
         try sendAnthropicEvent(stream, "response.output_item.done", item_done);
     }
+}
+
+/// Emit a full reasoning output item in one shot. Used when the entire
+/// reasoning text is known up-front (non-streaming generation paths).
+fn emitResponsesReasoningEvents(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    reasoning_text: []const u8,
+) !void {
+    try emitResponsesReasoningStart(allocator, stream, output_index, item_id);
+    try emitResponsesReasoningDelta(allocator, stream, output_index, item_id, reasoning_text);
+    try emitResponsesReasoningEnd(allocator, stream, output_index, item_id, reasoning_text);
 }
 
 /// Emit the SSE event sequence for a function_call output item: output_item.added,
@@ -4794,21 +5218,16 @@ fn emitResponsesFunctionCallEvents(
     }
 }
 
-/// Emit the SSE event sequence for a message output item: output_item.added,
-/// content_part.added, output_text.delta (single full-text delta), .done,
-/// content_part.done, output_item.done.
-fn emitResponsesMessageEvents(
+/// Emit output_item.added (type=message) + content_part.added.
+/// Pair with `emitResponsesMessageEnd` after output_text.delta events stream.
+fn emitResponsesMessageStart(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
     output_index: u32,
     item_id: []const u8,
-    text: []const u8,
 ) !void {
     const esc_id = try jsonEscape(allocator, item_id);
     defer allocator.free(esc_id);
-    const esc_text = try jsonEscape(allocator, text);
-    defer allocator.free(esc_text);
-
     {
         const item_added = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"message","id":{s},"role":"assistant","status":"in_progress","content":[]}}}}
@@ -4823,13 +5242,40 @@ fn emitResponsesMessageEvents(
         defer allocator.free(part_added);
         try sendAnthropicEvent(stream, "response.content_part.added", part_added);
     }
-    {
-        const delta = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.output_text.delta","item_id":{s},"output_index":{d},"content_index":0,"delta":{s}}}
-        , .{ esc_id, output_index, esc_text });
-        defer allocator.free(delta);
-        try sendAnthropicEvent(stream, "response.output_text.delta", delta);
-    }
+}
+
+/// Emit a single output_text.delta event for an in-progress message.
+fn emitResponsesMessageDelta(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    delta_text: []const u8,
+) !void {
+    if (delta_text.len == 0) return;
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_delta = try jsonEscape(allocator, delta_text);
+    defer allocator.free(esc_delta);
+    const delta = try std.fmt.allocPrint(allocator,
+        \\{{"type":"response.output_text.delta","item_id":{s},"output_index":{d},"content_index":0,"delta":{s}}}
+    , .{ esc_id, output_index, esc_delta });
+    defer allocator.free(delta);
+    try sendAnthropicEvent(stream, "response.output_text.delta", delta);
+}
+
+/// Emit output_text.done + content_part.done + output_item.done.
+fn emitResponsesMessageEnd(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    full_text: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_text = try jsonEscape(allocator, full_text);
+    defer allocator.free(esc_text);
     {
         const done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_text.done","item_id":{s},"output_index":{d},"content_index":0,"text":{s}}}
@@ -4851,6 +5297,20 @@ fn emitResponsesMessageEvents(
         defer allocator.free(item_done);
         try sendAnthropicEvent(stream, "response.output_item.done", item_done);
     }
+}
+
+/// Emit a full message output item in one shot. Used when the entire visible
+/// text is known up-front (non-streaming generation paths).
+fn emitResponsesMessageEvents(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    text: []const u8,
+) !void {
+    try emitResponsesMessageStart(allocator, stream, output_index, item_id);
+    try emitResponsesMessageDelta(allocator, stream, output_index, item_id, text);
+    try emitResponsesMessageEnd(allocator, stream, output_index, item_id, text);
 }
 
 /// Persist a finished response to the in-memory store. The stored history is
@@ -5214,4 +5674,105 @@ test "isJsonObjectString only accepts JSON objects" {
     try testing.expect(isJsonObjectString(testing.allocator, "{\"destination\":\"CARIBBEAN\"}"));
     try testing.expect(!isJsonObjectString(testing.allocator, "[]"));
     try testing.expect(!isJsonObjectString(testing.allocator, "not-json"));
+}
+
+test "insertImageTokens lands right after the user-turn marker (Gemma 4)" {
+    var config = model_mod.ModelConfig{};
+    // Simulate the marker that populateUserTurnMarker would store for Gemma 4:
+    // <|turn>(105) user(2364) \n(107).
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_ids[1] = 2364;
+    config.user_turn_marker_ids[2] = 107;
+    config.user_turn_marker_len = 3;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    // Prompt: BOS, system text, then a user turn followed by its content tokens
+    // and the trailing model-generation prompt. The marker [105, 2364, 107]
+    // appears once at the start of the user turn (positions 5-7).
+    const prompt = [_]u32{
+        2,   500, 501, 502, 503, // BOS + system prefix
+        105, 2364, 107,          // <|turn>user\n
+        900, 901, 902,           // user content
+        106, 107,                // <turn|>\n
+        105, 4368, 107,          // <|turn>model\n (generation prompt)
+    };
+
+    const out = try insertImageTokens(testing.allocator, &prompt, 999, 4, &config);
+    defer testing.allocator.free(out);
+
+    // Image tokens should be inserted right after position 7 (end of marker),
+    // i.e., between "<|turn>user\n" and the user content.
+    // Expected: prompt[0..8] + BOI + image*4 + EOI + prompt[8..]
+    try testing.expectEqual(@as(usize, prompt.len + 6), out.len);
+    try testing.expectEqual(@as(u32, 200), out[8]);  // BOI
+    try testing.expectEqual(@as(u32, 999), out[9]);  // image
+    try testing.expectEqual(@as(u32, 999), out[10]);
+    try testing.expectEqual(@as(u32, 999), out[11]);
+    try testing.expectEqual(@as(u32, 999), out[12]);
+    try testing.expectEqual(@as(u32, 201), out[13]); // EOI
+    try testing.expectEqual(@as(u32, 900), out[14]); // first user content token preserved
+}
+
+test "insertImageTokens picks the LAST user turn when multiple are present" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_ids[1] = 2364;
+    config.user_turn_marker_ids[2] = 107;
+    config.user_turn_marker_len = 3;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    // Two user turns. Vision tokens must land inside the LATER one.
+    const prompt = [_]u32{
+        105, 2364, 107, 800, 801, // first user turn
+        106, 107,
+        105, 4368, 107, 850, 851, // first model turn
+        106, 107,
+        105, 2364, 107, 900,      // second user turn (the one we're answering)
+    };
+
+    const out = try insertImageTokens(testing.allocator, &prompt, 999, 1, &config);
+    defer testing.allocator.free(out);
+
+    // Marker at positions 14-16; insert after position 17.
+    // Original first-user-turn content (800, 801) must be untouched.
+    try testing.expectEqual(@as(u32, 800), out[3]);
+    try testing.expectEqual(@as(u32, 801), out[4]);
+    // BOI at position 17, image at 18, EOI at 19, then original 900 at 20.
+    try testing.expectEqual(@as(u32, 200), out[17]);
+    try testing.expectEqual(@as(u32, 999), out[18]);
+    try testing.expectEqual(@as(u32, 201), out[19]);
+    try testing.expectEqual(@as(u32, 900), out[20]);
+}
+
+test "insertImageTokens falls back gracefully when marker is unset" {
+    var config = model_mod.ModelConfig{};
+    // user_turn_marker_len stays 0 — simulates an architecture we don't know
+    // how to detect a turn boundary for. Should still produce a valid prompt.
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const out = try insertImageTokens(testing.allocator, &prompt, 999, 2, &config);
+    defer testing.allocator.free(out);
+
+    // Should be original len + 2 image + 2 BOI/EOI = +4
+    try testing.expectEqual(@as(usize, prompt.len + 4), out.len);
+}
+
+test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+
+    const prompt = [_]u32{ 1, 2, 105, 3, 4 };
+
+    const out_zero_id = try insertImageTokens(testing.allocator, &prompt, 0, 4, &config);
+    defer testing.allocator.free(out_zero_id);
+    try testing.expectEqualSlices(u32, &prompt, out_zero_id);
+
+    const out_zero_n = try insertImageTokens(testing.allocator, &prompt, 999, 0, &config);
+    defer testing.allocator.free(out_zero_n);
+    try testing.expectEqualSlices(u32, &prompt, out_zero_n);
 }

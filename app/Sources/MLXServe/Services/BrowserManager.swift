@@ -58,8 +58,9 @@ class BrowserManager: ObservableObject {
     func readText() async throws -> String {
         let js = """
         (function() {
-            var clone = document.body.cloneNode(true);
-            var remove = clone.querySelectorAll('script,style,nav,header,footer,form,iframe,noscript,svg,img,video,audio,canvas,button,input,select,textarea,[role="navigation"],[role="banner"],[role="contentinfo"],[role="complementary"],[aria-hidden="true"],.nav,.navbar,.menu,.sidebar,.footer,.header,.ad,.ads,.advert,.cookie,.popup,.modal,.overlay,.social,.share,.comment,.related');
+            var root = document.querySelector('main') || document.querySelector('[role="main"]') || document.querySelector('article') || document.body;
+            var clone = root.cloneNode(true);
+            var remove = clone.querySelectorAll('script,style,nav,header,footer,form,iframe,noscript,svg,img,video,audio,canvas,button,input,select,textarea,details,menu,datalist,[role="navigation"],[role="banner"],[role="contentinfo"],[role="complementary"],[role="listbox"],[role="combobox"],[aria-hidden="true"],.nav,.navbar,.menu,.sidebar,.footer,.header,.ad,.ads,.advert,.cookie,.popup,.modal,.overlay,.social,.share,.comment,.related');
             for (var i = 0; i < remove.length; i++) remove[i].remove();
             var text = clone.innerText || '';
             // Aggressive cleanup: trim each line, collapse blank lines, remove noise
@@ -73,6 +74,28 @@ class BrowserManager: ObservableObject {
         })()
         """
         return try await evaluateJSWithTimeout(js, description: "readText")
+    }
+
+    func extractText(selector: String) async throws -> String {
+        let escaped = selector
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+        let js = """
+        (function() {
+            var els = document.querySelectorAll('\(escaped)');
+            if (!els || els.length === 0) return 'No elements match selector: \(escaped)';
+            var parts = [];
+            var max = Math.min(els.length, 50);
+            for (var i = 0; i < max; i++) {
+                var t = (els[i].innerText || '').trim();
+                if (t.length > 0) parts.push(t);
+            }
+            if (parts.length === 0) return 'No elements match selector: \(escaped)';
+            var joined = parts.join('\\n---\\n');
+            return joined.substring(0, 2900);
+        })()
+        """
+        return try await evaluateJSWithTimeout(js, description: "extractText")
     }
 
     func readHTML() async throws -> String {

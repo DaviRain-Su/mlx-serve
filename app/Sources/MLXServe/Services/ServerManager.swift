@@ -1,12 +1,13 @@
 import Foundation
 import AppKit
+import Darwin
 
 @MainActor
 class ServerManager: ObservableObject {
     @Published var status: ServerStatus = .stopped
     @Published var modelInfo: ModelInfo?
     @Published var memoryInfo: MemoryInfo?
-    @Published var port: UInt16 = 8080
+    @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
     @Published var lastError: String = ""
 
@@ -28,6 +29,12 @@ class ServerManager: ObservableObject {
         status = .starting
         lastError = ""
         serverLog = ""
+
+        // Reap orphaned mlx-serve processes still bound to our port (e.g. left
+        // behind after a crash). We only target processes whose command name is
+        // `mlx-serve` so we never kill an unrelated app that happens to be on
+        // the port.
+        killOrphanedServers(on: port)
 
         let binaryPath = resolveBinaryPath()
         guard FileManager.default.fileExists(atPath: binaryPath) else {
@@ -201,6 +208,52 @@ class ServerManager: ObservableObject {
         if let mem = try? await api.fetchProps(port: port) {
             memoryInfo = mem
         }
+    }
+
+    private func killOrphanedServers(on port: UInt16) {
+        let pids = pidsListening(on: port)
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        for pid in pids where pid != myPid {
+            guard processName(pid: pid).hasPrefix("mlx-serve") else { continue }
+            kill(pid, SIGTERM)
+            for _ in 0..<20 {
+                if kill(pid, 0) != 0 { break } // process gone
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        }
+    }
+
+    private func pidsListening(on port: UInt16) -> [pid_t] {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return [] }
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.split(whereSeparator: { $0.isNewline || $0.isWhitespace })
+            .compactMap { pid_t($0) }
+    }
+
+    private func processName(pid: pid_t) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-p", "\(pid)", "-o", "comm="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return "" }
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let raw = (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // `ps -o comm=` returns the full path of the executable on macOS;
+        // take the last path component for prefix matching.
+        return (raw as NSString).lastPathComponent
     }
 
     private func resolveBinaryPath() -> String {
