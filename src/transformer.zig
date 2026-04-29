@@ -722,11 +722,13 @@ pub const Transformer = struct {
     bits_cache: BitsCache = .{},
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
-        // Create a dedicated GPU stream for generation (matches mlx-lm pattern).
-        // This allows better scheduling of computation vs memory operations.
-        var dev = mlx.mlx_device{ .ctx = null };
-        _ = mlx.mlx_get_default_device(&dev);
-        const s = mlx.mlx_stream_new_device(dev);
+        // Use the current thread's default GPU stream rather than a dedicated stream.
+        // mlx 0.31.2 made streams thread-local — a stream created on one thread isn't
+        // visible to other threads, so a long-lived dedicated stream stored on Transformer
+        // would break as soon as a different thread (e.g. an HTTP connection handler)
+        // tried to use it. We re-bind `self.s` to the connection thread's default stream
+        // via `useCurrentThreadStream` before each request.
+        const s = mlx.gpuStream();
         const prefix = config.weight_prefix;
 
         var name_buf: [256]u8 = undefined;
@@ -1390,7 +1392,17 @@ pub const Transformer = struct {
             self.allocator.free(entries);
         }
         if (self.moe_layers) |ml| self.allocator.free(ml);
+        // self.s is the thread's default GPU stream (not owned by us) — don't free it.
         _ = mlx.mlx_stream_free(self.s);
+        // The free above is a no-op on the default stream's wrapper but we keep it for symmetry
+        // with the Zig copy of the mlx_stream struct that init handed us.
+    }
+
+    /// Re-bind `self.s` to the *current* thread's default GPU stream. Must be called from any
+    /// thread that's about to use this Transformer for inference, since mlx 0.31.2 made streams
+    /// thread-local (a stream created on thread A is invisible to thread B).
+    pub fn useCurrentThreadStream(self: *Transformer) void {
+        self.s = mlx.gpuStream();
     }
 
     // ── Core ops ──

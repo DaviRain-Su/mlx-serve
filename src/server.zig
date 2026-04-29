@@ -333,17 +333,22 @@ pub fn serve(
             continue;
         };
 
-        // Spawn a thread to handle the connection so we can accept new ones immediately.
-        // This allows health checks and 503 responses while generation is running.
-        const thread = std.Thread.spawn(.{}, connectionThread, .{ io, allocator, accepted_stream, xfm, tok, chat_config, config }) catch {
-            // If thread spawn fails, handle synchronously
-            var conn: Conn = undefined;
-            Conn.init(&conn, accepted_stream, io);
-            handleConnection(allocator, &conn, xfm, tok, chat_config, config) catch {};
-            conn.close();
-            continue;
+        // Handle connections synchronously on the listener thread. We previously spawned a thread
+        // per connection so health checks could land during generation, but mlx 0.31.2 made
+        // streams thread-local — the model weights are bound to the thread that loaded them, and
+        // calling `mlx_eval` on a different thread fails with "no Stream(gpu, 1) in current thread".
+        // Inference was already serialized by `inference_mutex`, so multi-threaded accept didn't add
+        // real concurrency to the slow path; only quick endpoints (/health, /v1/models, /props) get
+        // briefly delayed during generation, which is acceptable.
+        var conn: Conn = undefined;
+        Conn.init(&conn, accepted_stream, io);
+        handleConnection(allocator, &conn, xfm, tok, chat_config, config) catch |err| {
+            switch (err) {
+                error.WriteFailed, error.ReadFailed => log.debug("  -> client disconnected\n", .{}),
+                else => log.err("  -> error: {}\n", .{err}),
+            }
         };
-        thread.detach();
+        conn.close();
     }
 
     // Free cached prompt on shutdown
@@ -355,30 +360,6 @@ pub fn serve(
     deinitGlobalTokenBytes();
 
     log.info("\nShutting down gracefully...\n", .{});
-}
-
-fn connectionThread(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    raw_stream: std.Io.net.Stream,
-    xfm: *Transformer,
-    tok: *const Tokenizer,
-    chat_config: *const chat_mod.ChatConfig,
-    config: *const model_mod.ModelConfig,
-) void {
-    var conn: Conn = undefined;
-    Conn.init(&conn, raw_stream, io);
-    defer conn.close();
-    handleConnection(allocator, &conn, xfm, tok, chat_config, config) catch |err| {
-        switch (err) {
-            error.WriteFailed, error.ReadFailed => {
-                log.debug("  -> client disconnected\n", .{});
-            },
-            else => {
-                log.err("  -> error: {}\n", .{err});
-            },
-        }
-    };
 }
 
 fn handleConnection(
@@ -468,6 +449,7 @@ fn handleConnection(
             return;
         }
         defer releaseInferenceSlot(stream.io);
+        xfm.useCurrentThreadStream();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, xfm, tok, chat_config, config);
@@ -482,6 +464,7 @@ fn handleConnection(
             return;
         }
         defer releaseInferenceSlot(stream.io);
+        xfm.useCurrentThreadStream();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleCompletions(allocator, stream, body, xfm, tok, config);
@@ -492,6 +475,7 @@ fn handleConnection(
             return;
         }
         defer releaseInferenceSlot(stream.io);
+        xfm.useCurrentThreadStream();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, xfm, tok, config);
@@ -506,6 +490,7 @@ fn handleConnection(
             return;
         }
         defer releaseInferenceSlot(stream.io);
+        xfm.useCurrentThreadStream();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, xfm, tok, chat_config, config);
@@ -520,6 +505,7 @@ fn handleConnection(
             return;
         }
         defer releaseInferenceSlot(stream.io);
+        xfm.useCurrentThreadStream();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleResponses(allocator, stream, body, xfm, tok, chat_config, config);

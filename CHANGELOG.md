@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.4.33 — Hotfix: thread-local streams in mlx 0.31.2
+
+- **Inference now runs on the listener thread.** mlx 0.31.2 made GPU streams thread-local — model weights loaded on the main thread couldn't be evaluated from connection threads, so any chat completion crashed with `MLX error: There is no Stream(gpu, 1) in current thread.`. Removed the thread-per-connection spawn in `server.zig` and handle connections inline. The `inference_mutex` was already serializing the slow path, so this doesn't reduce real concurrency — only quick endpoints (`/health`, `/v1/models`, `/props`) get briefly delayed during generation, which is fine.
+- **Transformer uses the current thread's default GPU stream** (`mlx.gpuStream()`) instead of a dedicated stream created at init time. Adds `useCurrentThreadStream()` for any future call sites that need to rebind.
+- v26.4.32 fixed the `libjaccl.dylib` bundling issue but still hit this stream issue at the first inference. v26.4.33 is the actual working build.
+
+---
+
 ## v26.4.32 — Hotfix: `libjaccl.dylib` not found at startup
 
 - **Bundle all sibling dylibs from `/opt/homebrew/opt/mlx/lib/`**, not just `libmlx.dylib`. mlx 0.31.2 (the version on the macOS-26 GitHub runner) added a new `@rpath/libjaccl.dylib` dependency that we weren't copying — caused the v26.4.31 binary to fail at startup with `Library not loaded: @rpath/libjaccl.dylib`.

@@ -102,10 +102,14 @@ for lib in libmlxc.dylib; do
     fi
 done
 
-for lib in libmlx.dylib; do
-    if [ -f "$MLX_LIB/$lib" ]; then
-        cp "$MLX_LIB/$lib" "$CONTENTS/Frameworks/"
-    fi
+# Copy ALL dylibs from mlx's lib dir, not just libmlx.dylib — newer mlx (0.31.2+) introduced
+# sibling deps like libjaccl.dylib referenced via @rpath. Missing them causes a "Library not loaded"
+# dyld error at startup. We deliberately use the keg-only path (`brew --prefix mlx`/lib) instead
+# of `$MLX_LIB` because the latter can fall back to `/opt/homebrew/lib` (the symlink dir for ALL
+# Homebrew libs), which would copy thousands of unrelated dylibs.
+MLX_KEG_LIB="$(brew --prefix mlx 2>/dev/null || echo "/opt/homebrew/opt/mlx")/lib"
+for f in "$MLX_KEG_LIB"/*.dylib; do
+    [ -f "$f" ] && cp "$f" "$CONTENTS/Frameworks/"
 done
 
 # Metal shader library
@@ -131,6 +135,10 @@ install_name_tool -change \
     "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \
     "@loader_path/libmlx.dylib" \
     "$CONTENTS/Frameworks/libmlxc.dylib" 2>/dev/null || true
+
+# Add @loader_path to libmlx.dylib's rpath so its @rpath/libjaccl.dylib (and any future @rpath
+# sibling deps from mlx) resolves to the bundled Frameworks dir.
+install_name_tool -add_rpath @loader_path "$CONTENTS/Frameworks/libmlx.dylib" 2>/dev/null || true
 
 # Fix mlx-serve -> libwebp dependency
 if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
