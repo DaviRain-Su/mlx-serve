@@ -84,7 +84,10 @@ jobs:
 
           cp zig-out/bin/mlx-serve "$STAGING/"
           cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$STAGING/lib/"
-          cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$STAGING/lib/"
+          # Copy ALL dylibs from mlx's lib dir, not just libmlx.dylib — newer mlx (0.31.2+)
+          # introduced sibling deps like libjaccl.dylib referenced via @rpath. Missing them
+          # causes a "no such file" dyld error at startup on the user's machine.
+          cp /opt/homebrew/opt/mlx/lib/*.dylib "$STAGING/lib/" 2>/dev/null || true
           cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$STAGING/lib/"
 
           # WebP libraries for vision pipeline
@@ -101,6 +104,10 @@ jobs:
             /opt/homebrew/opt/mlx/lib/libmlx.dylib \
             @loader_path/libmlx.dylib \
             "$STAGING/lib/libmlxc.dylib"
+
+          # Add @loader_path to libmlx.dylib's rpath so its @rpath/libjaccl.dylib (and any
+          # future @rpath sibling deps) resolves to the same lib/ dir we just populated.
+          install_name_tool -add_rpath @loader_path "$STAGING/lib/libmlx.dylib" 2>/dev/null || true
 
           # Fix webp rpaths
           if [ -f "$STAGING/lib/libwebp.dylib" ]; then
@@ -157,7 +164,9 @@ jobs:
 
           # Bundled libraries
           cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$CONTENTS/Frameworks/"
-          cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$CONTENTS/Frameworks/"
+          # Copy ALL dylibs from mlx's lib dir (libmlx.dylib + sibling deps like libjaccl.dylib
+          # introduced in mlx 0.31.2). Missing siblings cause a dyld "no such file" error at startup.
+          cp /opt/homebrew/opt/mlx/lib/*.dylib "$CONTENTS/Frameworks/" 2>/dev/null || true
           cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$CONTENTS/Frameworks/"
 
           # WebP libraries for vision pipeline
@@ -175,6 +184,10 @@ jobs:
             "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \
             "@loader_path/libmlx.dylib" \
             "$CONTENTS/Frameworks/libmlxc.dylib" 2>/dev/null || true
+
+          # Add @loader_path to libmlx.dylib's rpath so its @rpath/libjaccl.dylib (and any other
+          # @rpath sibling deps mlx introduces) resolves to the bundled Frameworks dir.
+          install_name_tool -add_rpath @loader_path "$CONTENTS/Frameworks/libmlx.dylib" 2>/dev/null || true
 
           # Fix webp rpaths
           if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
