@@ -16,9 +16,7 @@ struct ChatSession: Identifiable, Codable {
         self.createdAt = Date()
         self.updatedAt = Date()
         self.mode = .chat
-        let wsDir = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
-        try? FileManager.default.createDirectory(atPath: wsDir, withIntermediateDirectories: true)
-        self.workingDirectory = wsDir
+        self.workingDirectory = ChatSession.defaultWorkingDirectory
     }
 
     enum CodingKeys: String, CodingKey {
@@ -33,8 +31,19 @@ struct ChatSession: Identifiable, Codable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         mode = try c.decodeIfPresent(ChatMode.self, forKey: .mode) ?? .chat
-        workingDirectory = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
+        // Backfill: sessions saved before workingDirectory had a default come back as nil. Anchor them
+        // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
+        let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
+        workingDirectory = decoded ?? ChatSession.defaultWorkingDirectory
     }
+
+    /// Shared default cwd for all chat sessions. Same path used by CLILauncher, AgentEngine,
+    /// and MCPManager.resolveWorkingDirectory.
+    static let defaultWorkingDirectory: String = {
+        let path = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        return path
+    }()
 }
 
 /// A tool call made by the assistant, stored on the assistant message for history replay.

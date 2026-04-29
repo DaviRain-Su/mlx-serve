@@ -31,6 +31,10 @@ class AppState: ObservableObject {
     @Published var contextSize: Int {
         didSet { UserDefaults.standard.set(contextSize, forKey: "contextSize") }
     }
+    @Published var mcpMode: Bool {
+        didSet { UserDefaults.standard.set(mcpMode, forKey: "mcpMode") }
+    }
+    let mcpManager = MCPManager()
 
     private let historyPath: String = {
         let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
@@ -45,6 +49,7 @@ class AppState: ObservableObject {
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
         self.maxTokens = stored > 0 ? stored : 32768
         self.contextSize = UserDefaults.standard.integer(forKey: "contextSize") // 0 = auto
+        self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)

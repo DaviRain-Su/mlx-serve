@@ -24,3 +24,4 @@ transformer.o
 test_zig
 app/MLXCore.dmg
 server_err.log
+.vscode

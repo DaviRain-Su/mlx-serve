@@ -721,7 +721,7 @@ pub const Transformer = struct {
     // after the first touch.
     bits_cache: BitsCache = .{},
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
         // Create a dedicated GPU stream for generation (matches mlx-lm pattern).
         // This allows better scheduling of computation vs memory operations.
         var dev = mlx.mlx_device{ .ctx = null };
@@ -731,7 +731,7 @@ pub const Transformer = struct {
 
         var name_buf: [256]u8 = undefined;
 
-        if (config.is_encoder_only) return initBert(allocator, config, weights, &name_buf, s);
+        if (config.is_encoder_only) return initBert(io, allocator, config, weights, &name_buf, s);
 
         // Embeddings: Nemotron-H uses "backbone.embeddings", others use "{prefix}.embed_tokens"
         const is_nemotron = std.mem.eql(u8, config.model_type, "nemotron_h");
@@ -933,7 +933,7 @@ pub const Transformer = struct {
 
         // Batch eval all weights
         {
-            var eval_timer = std.time.Timer.start() catch unreachable;
+            const eval_start = std.Io.Timestamp.now(io, .awake);
             const all_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(all_vec);
 
@@ -1006,7 +1006,7 @@ pub const Transformer = struct {
             }
 
             try mlx.check(mlx.mlx_eval(all_vec));
-            const eval_ms = eval_timer.read() / std.time.ns_per_ms;
+            const eval_ms: i64 = @intCast(@divTrunc(eval_start.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
             log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
         }
 
@@ -4764,7 +4764,7 @@ fn initBertLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *c
     return layers;
 }
 
-fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !Transformer {
+fn initBert(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !Transformer {
     // Word embeddings (reuse standard emb_w/s/b fields)
     const emb_w = getBertWeight(weights, name_buf, "embeddings.word_embeddings.weight");
     const emb_s = getBertWeight(weights, name_buf, "embeddings.word_embeddings.scales");
@@ -4788,7 +4788,7 @@ fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 
     // Batch eval all BERT weights
     {
-        var eval_timer = std.time.Timer.start() catch unreachable;
+        const eval_start = std.Io.Timestamp.now(io, .awake);
         const all_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(all_vec);
 
@@ -4809,7 +4809,7 @@ fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
         }
 
         try mlx.check(mlx.mlx_eval(all_vec));
-        const eval_ms = eval_timer.read() / std.time.ns_per_ms;
+        const eval_ms: i64 = @intCast(@divTrunc(eval_start.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
         log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
     }
 

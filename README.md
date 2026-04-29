@@ -91,16 +91,7 @@ Outputs go to `~/.mlx-serve/generations/images/YYYY-MM-DD/` and `.../videos/YYYY
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B | ChatML | -- |
 
-Any quantized MLX model using one of the above architectures should work. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.
-
-### Not Yet Supported
-
-| Architecture | `model_type` | Examples | Reason |
-|---|---|---|---|
-| **LFM2-VL** | `lfm2-vl` | LFM2.5-VL-450M | Needs vision encoder integration |
-| **Phi** | `phi`, `phi3` | Phi-3, Phi-4 | Different attention/MLP layout, untested |
-| **Cohere** | `command-r` | Command R+ | Different architecture, untested |
-| **BERT** (partial) | `bert` | -- | Encoder-only, config parsing exists but no serving endpoint |
+Any quantized MLX model using one of the above architectures should work. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded. Architectures we haven't implemented yet are tracked in [TODO.md](TODO.md).
 
 ## Prerequisites
 

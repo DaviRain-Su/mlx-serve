@@ -152,10 +152,12 @@ struct ChatDetailView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var toolExecutor: ToolExecutor
+    @EnvironmentObject var mcpManager: MCPManager
     @State private var inputText = ""
     @State private var isGenerating = false
     @State private var enableThinking = false
     @State private var isAgentMode = false
+    @State private var showMCPMarketplace = false
     @State private var executingPlanMessageId: UUID?
     @State private var generationTask: Task<Void, Never>?
     @State private var isNearBottom = true
@@ -395,12 +397,45 @@ struct ChatDetailView: View {
                 .help("Agent Mode (\(isAgentMode ? "ON" : "OFF"))")
             }
             ToolbarItem(placement: .automatic) {
+                HStack(spacing: 0) {
+                    Button { appState.mcpMode.toggle() } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "puzzlepiece.extension")
+                                .font(.system(size: 11, weight: .medium))
+                            Text("MCP")
+                                .font(.caption.weight(.medium))
+                        }
+                        .foregroundStyle(appState.mcpMode ? .white : .secondary)
+                        .padding(.leading, 8)
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    Button { showMCPMarketplace = true } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(appState.mcpMode ? .white.opacity(0.85) : .secondary)
+                            .padding(.trailing, 8)
+                            .padding(.leading, 4)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open MCP Marketplace")
+                }
+                .background(appState.mcpMode ? .purple : Color.secondary.opacity(0.12))
+                .clipShape(Capsule())
+                .help("MCP Mode (\(appState.mcpMode ? "ON" : "OFF")) — gear opens marketplace")
+            }
+            ToolbarItem(placement: .automatic) {
                 Circle()
                     .fill(server.status == .running ? .green : .red)
                     .frame(width: 8, height: 8)
                     .padding(.horizontal, 8)
                     .help(server.status == .running ? "Server running" : "Server stopped")
             }
+        }
+        .sheet(isPresented: $showMCPMarketplace) {
+            MCPMarketplaceView()
+                .environmentObject(mcpManager)
         }
         .onAppear {
             inputFocused = true
@@ -551,7 +586,7 @@ struct ChatDetailView: View {
 
     private func sendMessage() {
         isNearBottom = true // snap to bottom on send
-        if isAgentMode {
+        if isAgentMode || appState.mcpMode {
             sendAgentMessage()
             return
         }
@@ -644,13 +679,39 @@ struct ChatDetailView: View {
         let workDir = session?.workingDirectory
 
         generationTask = Task {
+            // Lazy-spawn MCP servers if MCP mode is on. Idempotent — already-connected servers are skipped.
+            if appState.mcpMode {
+                // Inherit the chat's working directory so filesystem/shell MCP servers anchor at the
+                // same dir the agent's built-in tools use. Per-entry `cwd` in mcp.json still wins.
+                mcpManager.defaultCwd = session?.workingDirectory
+                await mcpManager.startEnabled()
+                // Surface startup failures inline in chat — otherwise they're hidden behind the
+                // marketplace gear icon and the user just sees "MCP doesn't seem to do anything".
+                if !mcpManager.startErrors.isEmpty {
+                    let lines = mcpManager.startErrors
+                        .sorted(by: { $0.key < $1.key })
+                        .map { "• **\($0.key)**: \($0.value)" }
+                        .joined(separator: "\n")
+                    let hint = mcpManager.sessions.isEmpty
+                        ? "No MCP servers are connected — the model has no MCP tools available for this turn. Open the gear icon on the MCP pill to fix or disable broken servers."
+                        : "Some MCP servers couldn't start. The model will only see tools from the ones that did connect."
+                    let warning = ChatMessage(
+                        role: .assistant,
+                        content: "⚠️ MCP startup issues:\n\n\(lines)\n\n\(hint)"
+                    )
+                    appState.appendMessage(to: sessionId, message: warning)
+                }
+            }
             do {
                 try await runAgentLoop(api: api, workingDirectory: workDir)
             } catch is CancellationError {
-                // Stopped by user
+                // Stopped by user — stopGenerating() already cleared the streaming flag.
             } catch {
                 print("[ChatView] Agent error: \(error)")
                 try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
+                // Clear the spinner on the in-flight assistant message before appending the error;
+                // otherwise GeneratingIndicator stays visible on the orphaned streaming bubble.
+                appState.updateLastMessage(in: sessionId, streaming: false)
                 var errorMsg = ChatMessage(role: .assistant, content: "[Error: \(error.localizedDescription)]")
                 errorMsg.isStreaming = false
                 appState.appendMessage(to: sessionId, message: errorMsg)
@@ -691,10 +752,21 @@ struct ChatDetailView: View {
                 buildMultimodalContent: Self.buildMultimodalContent
             )
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
-            let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
-            var systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
-            if let wd = workingDirectory {
-                systemPrompt += AgentEngine.workingDirectoryContext(wd)
+            let mcpToolsJSON = appState.mcpMode ? mcpManager.toolDefinitionsJSON() : nil
+            let mcpListing = appState.mcpMode ? mcpManager.toolListingForPrompt() : ""
+            var systemPrompt: String
+            if isAgentMode {
+                let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
+                systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
+                if let wd = workingDirectory {
+                    systemPrompt += AgentEngine.workingDirectoryContext(wd)
+                }
+                if !mcpListing.isEmpty {
+                    systemPrompt += "\n\n# MCP Tools\nIn addition to the built-in tools above, the user has connected these MCP servers. Their tools are namespaced as `<server>__<tool>`:\n\n\(mcpListing)"
+                }
+            } else {
+                // MCP-only mode: minimal system prompt focused on MCP tool use, no shell/file rules.
+                systemPrompt = AgentPrompt.mcpOnlySystemPrompt(toolListing: mcpListing)
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
@@ -716,13 +788,17 @@ struct ChatDetailView: View {
             // Stream model response with tools
             var receivedToolCalls: [APIClient.ToolCall] = []
             var maxTokensHit = false
+            let combinedToolsJSON = Self.combinedToolsJSON(
+                agentMode: isAgentMode,
+                mcpToolsJSON: mcpToolsJSON
+            )
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
                 enableThinking: enableThinking,
-                toolsJSON: AgentPrompt.toolDefinitionsJSON
+                toolsJSON: combinedToolsJSON
             )
 
             // Watchdog: cancel the stream if no SSE event arrives within 90s.
@@ -890,7 +966,9 @@ struct ChatDetailView: View {
                 }
             }
 
-            // Show tool call summary as display-only message
+            // Show tool call summary as display-only message. Mark streaming so the GeneratingIndicator
+            // keeps rendering underneath while tools execute — otherwise a slow / hung MCP tool looks
+            // like the chat just froze with no feedback.
             let callSummary = receivedToolCalls.map { tc in
                 let args = tc.arguments.map { "\($0.key): \($0.value.prefix(80))" }.joined(separator: ", ")
                 let display = args.isEmpty ? tc.rawArguments.prefix(200) : args[...]
@@ -898,16 +976,34 @@ struct ChatDetailView: View {
             }.joined(separator: "\n")
             var summaryMsg = ChatMessage(role: .assistant, content: callSummary)
             summaryMsg.isAgentSummary = true
+            summaryMsg.isStreaming = true
+            let summaryId = summaryMsg.id
             appState.appendMessage(to: sessionId, message: summaryMsg)
+            // Stop the spinner on the summary regardless of how we leave the loop (success, throw, cancel).
+            defer {
+                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                   let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == summaryId }) {
+                    appState.chatSessions[sIdx].messages[mIdx].isStreaming = false
+                }
+            }
 
-            // Execute each tool call
+            // Execute each tool call. MCP-namespaced names (`<server>__<tool>`) route to MCPManager;
+            // everything else flows through the existing AgentEngine dispatch.
             for tc in receivedToolCalls {
                 try Task.checkCancellation()
-                let result = await AgentEngine.executeToolCall(
-                    tc, workingDirectory: &workingDirectory,
-                    repetition: repetition, iteration: iteration,
-                    agentMemory: appState.agentMemory
-                )
+                let result: AgentEngine.ToolResult
+                if mcpManager.owns(toolName: tc.name) {
+                    let output = await mcpManager.executeToolCall(
+                        name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments
+                    )
+                    result = AgentEngine.ToolResult(id: tc.id, name: tc.name, output: output)
+                } else {
+                    result = await AgentEngine.executeToolCall(
+                        tc, workingDirectory: &workingDirectory,
+                        repetition: repetition, iteration: iteration,
+                        agentMemory: appState.agentMemory
+                    )
+                }
 
                 // Show result in chat (display-only)
                 var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")
@@ -947,6 +1043,27 @@ struct ChatDetailView: View {
         appState.appendMessage(to: sessionId, message: msg)
     }
 
+    /// Build the JSON tools array sent to the model. Concatenates agent tools (when agent mode is on) and
+    /// MCP tools (when MCP mode is on). Returns nil when no tools should be advertised.
+    static func combinedToolsJSON(agentMode: Bool, mcpToolsJSON: String?) -> String? {
+        let agent = agentMode ? AgentPrompt.toolDefinitionsJSON : nil
+        switch (agent, mcpToolsJSON) {
+        case (nil, nil): return nil
+        case (let a?, nil): return a
+        case (nil, let m?): return m
+        case (let a?, let m?):
+            // Strip outer brackets and re-wrap. Both inputs are guaranteed to be JSON arrays.
+            let aInner = a.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            let mInner = m.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            let aTrimmed = aInner.trimmingCharacters(in: .whitespacesAndNewlines)
+            let mTrimmed = mInner.trimmingCharacters(in: .whitespacesAndNewlines)
+            if aTrimmed.isEmpty { return "[\(mTrimmed)]" }
+            if mTrimmed.isEmpty { return "[\(aTrimmed)]" }
+            return "[\(aTrimmed),\(mTrimmed)]"
+        }
+    }
 }
 
 // MARK: - Context Monitor

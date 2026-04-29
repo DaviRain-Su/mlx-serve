@@ -85,7 +85,11 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
                 .environmentObject(appState.toolExecutor)
                 .environmentObject(appState.agentMemory)
+                .environmentObject(appState.mcpManager)
                 .frame(minWidth: 700, minHeight: 500)
+                .onDisappear {
+                    Task { await appState.mcpManager.stopAll() }
+                }
         }
         .defaultSize(width: 900, height: 650)
 

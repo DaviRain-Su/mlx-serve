@@ -14,9 +14,10 @@ pub const VERSION: []const u8 = build_options.version;
 
 const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
-fn printUsage() void {
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll(
+fn printUsage(io: std.Io) void {
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+    stdout_w.interface.writeAll(
         \\mlx-serve — MLX inference server for Apple Silicon
         \\
         \\Usage: mlx-serve [options]
@@ -39,19 +40,28 @@ fn printUsage() void {
         \\  --help              Show this help
         \\
     ) catch {};
+    stdout_w.interface.flush() catch {};
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    // Parse CLI args (before model loading for --version/--help)
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Materialize CLI args from the iterator API into a flat slice
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (args_list.items) |a| allocator.free(a);
+        args_list.deinit(allocator);
+    }
+    while (args_iter.next()) |arg| {
+        try args_list.append(allocator, try allocator.dupe(u8, arg));
+    }
+    const args = args_list.items;
 
     if (args.len == 1) {
-        printUsage();
+        printUsage(io);
         return;
     }
 
@@ -70,11 +80,13 @@ pub fn main() !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
-            const stdout = std.fs.File.stdout();
-            stdout.writeAll("mlx-serve " ++ VERSION ++ "\n") catch {};
+            var ver_buf: [64]u8 = undefined;
+            var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
+            ver_w.interface.writeAll("mlx-serve " ++ VERSION ++ "\n") catch {};
+            ver_w.interface.flush() catch {};
             return;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
-            printUsage();
+            printUsage(io);
             return;
         } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
@@ -120,7 +132,7 @@ pub fn main() !void {
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
     if (serve_mode) {
-        if (portInUse(port)) {
+        if (portInUse(io, port)) {
             log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
@@ -144,11 +156,11 @@ pub fn main() !void {
         try mlx.check(mlx.mlx_set_default_device(gpu_dev));
     }
 
-    // Seed MLX RNG with current time for non-deterministic sampling
-    _ = mlx.mlx_random_seed(@intCast(std.time.milliTimestamp()));
+    // Seed MLX RNG with current wall-clock time for non-deterministic sampling
+    _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
     // Parse config
-    var config = try model_mod.parseConfig(allocator, model_dir);
+    var config = try model_mod.parseConfig(io, allocator, model_dir);
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -161,11 +173,11 @@ pub fn main() !void {
 
     // Load tokenizer
     log.info("Loading tokenizer...\n", .{});
-    var tok = try tokenizer_mod.loadTokenizer(allocator, model_dir);
+    var tok = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
     defer tok.deinit();
 
     // Load chat config
-    var chat_config = try chat_mod.loadChatConfig(allocator, model_dir);
+    var chat_config = try chat_mod.loadChatConfig(io, allocator, model_dir);
     defer chat_config.deinit();
 
     // Resolve EOS tokens from tokenizer if config.json didn't specify any
@@ -201,13 +213,13 @@ pub fn main() !void {
     const load_vision = config.has_vision and !no_vision;
     log.info("Loading weights...\n", .{});
     var weights = if (load_vision)
-        try model_mod.loadWeightsWithVision(allocator, model_dir)
+        try model_mod.loadWeightsWithVision(io, allocator, model_dir)
     else
-        try model_mod.loadWeights(allocator, model_dir);
+        try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
 
     // Initialize transformer
-    var xfm = try transformer_mod.Transformer.init(allocator, config, &weights);
+    var xfm = try transformer_mod.Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
 
     // Initialize vision encoder if model supports it (and not disabled)
@@ -254,7 +266,7 @@ pub fn main() !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget);
+        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
@@ -269,78 +281,70 @@ pub fn main() !void {
 
         const eos_slice = config.eosTokenSlice();
         const sampling = generate_mod.SamplingParams{ .temperature = temperature };
-        const stdout = std.fs.File.stdout();
+
+        var stdout_buf: [16 * 1024]u8 = undefined;
+        var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);
+        const stdout_w = &stdout_w_state.interface;
+        defer stdout_w.flush() catch {};
 
         if (stream_mode) {
             // Streaming: print tokens as they're generated
-            var timer = try std.time.Timer.start();
-            var gen = try generate_mod.Generator.init(allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice);
+            const prefill_start = std.Io.Timestamp.now(io, .awake);
+            var gen = try generate_mod.Generator.init(io, allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice);
             defer gen.deinit(allocator);
 
-            const prefill_ns = timer.read();
+            const prefill_ns: u64 = @intCast(prefill_start.untilNow(io, .awake).nanoseconds);
             const prefill_tps: f64 = if (prefill_ns > 0)
                 @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
             else
                 0.0;
 
-            try stdout.writeAll("==========\n");
-            var decode_timer = try std.time.Timer.start();
+            try stdout_w.writeAll("==========\n");
+            const decode_start = std.Io.Timestamp.now(io, .awake);
             var completion_tokens: u32 = 0;
             while (try gen.next(allocator)) |token_id| {
                 const ids = [_]u32{token_id};
                 const piece = try tok.decode(allocator, &ids, completion_tokens == 0);
                 defer allocator.free(piece);
                 if (piece.len > 0) {
-                    try stdout.writeAll(piece);
+                    try stdout_w.writeAll(piece);
+                    try stdout_w.flush();
                 }
                 completion_tokens += 1;
             }
-            const decode_ns = decode_timer.read();
+            const decode_ns: u64 = @intCast(decode_start.untilNow(io, .awake).nanoseconds);
             const decode_tps: f64 = if (decode_ns > 0)
                 @as(f64, @floatFromInt(completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
             else
                 0.0;
 
-            try stdout.writeAll("\n==========\n");
-
-            var stat_buf: [256]u8 = undefined;
-            var msg = std.fmt.bufPrint(&stat_buf, "Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ prompt_ids.len, prefill_tps }) catch unreachable;
-            try stdout.writeAll(msg);
-            msg = std.fmt.bufPrint(&stat_buf, "Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps }) catch unreachable;
-            try stdout.writeAll(msg);
+            try stdout_w.writeAll("\n==========\n");
+            try stdout_w.print("Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ prompt_ids.len, prefill_tps });
+            try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = try generate_mod.generate(allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = try generate_mod.generate(io, allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
             defer allocator.free(result.token_ids);
 
-            try stdout.writeAll("==========\n");
-            try stdout.writeAll(result.text);
-            try stdout.writeAll("\n==========\n");
-
-            var stat_buf: [256]u8 = undefined;
-            var msg = std.fmt.bufPrint(&stat_buf, "Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.prompt_tokens, result.prefill_tps }) catch unreachable;
-            try stdout.writeAll(msg);
-            msg = std.fmt.bufPrint(&stat_buf, "Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.completion_tokens, result.decode_tps }) catch unreachable;
-            try stdout.writeAll(msg);
+            try stdout_w.writeAll("==========\n");
+            try stdout_w.writeAll(result.text);
+            try stdout_w.writeAll("\n==========\n");
+            try stdout_w.print("Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.prompt_tokens, result.prefill_tps });
+            try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.completion_tokens, result.decode_tps });
         }
 
         var peak_mem: usize = 0;
         _ = mlx.mlx_get_peak_memory(&peak_mem);
         const peak_gb = @as(f64, @floatFromInt(peak_mem)) / (1024.0 * 1024.0 * 1024.0);
-        var stat_buf2: [256]u8 = undefined;
-        const msg2 = std.fmt.bufPrint(&stat_buf2, "Peak memory: {d:.3} GB\n", .{peak_gb}) catch unreachable;
-        try stdout.writeAll(msg2);
+        try stdout_w.print("Peak memory: {d:.3} GB\n", .{peak_gb});
     }
 }
 
 /// Check if a port is already in use by trying to connect to it.
-fn portInUse(port: u16) bool {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
-    defer std.posix.close(sock);
-
-    // If connect succeeds, something is already listening
-    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+fn portInUse(io: std.Io, port: u16) bool {
+    const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
     return true;
 }

@@ -153,6 +153,24 @@ enum AgentPrompt {
     ]
     """#
 
+    /// Lightweight system prompt for MCP-only mode (Agent toggle off, MCP toggle on).
+    /// Tells the model what MCP servers are available without dragging in the heavy agent rules.
+    static func mcpOnlySystemPrompt(toolListing: String) -> String {
+        var prompt = """
+            You are a helpful assistant with access to external tools provided by Model Context Protocol (MCP) servers.
+
+            Tools are namespaced as `<server>__<tool>`. Call them with valid JSON arguments matching each tool's schema. Only invoke a tool when it directly helps answer the user's request — otherwise reply normally.
+
+            When you receive tool results, summarize them clearly for the user. If a tool returns an error, briefly explain what went wrong and either retry with corrected args or ask the user for clarification.
+            """
+        if !toolListing.isEmpty {
+            prompt += "\n\n# Available MCP servers\n\n\(toolListing)"
+        } else {
+            prompt += "\n\nNote: no MCP servers are currently connected. The user can enable servers via the gear icon on the MCP toggle."
+        }
+        return prompt
+    }
+
     /// Parsed tool definitions for param validation and example extraction.
     /// Key order is NOT preserved here (Swift dictionaries); use `toolDefinitionsJSON` for API requests.
     static let toolDefinitions: [[String: Any]] = {

@@ -7,6 +7,7 @@ const log = @import("log.zig");
 const json_grammar = @import("json_grammar.zig");
 const json_schema = @import("json_schema.zig");
 const token_mask = @import("token_mask.zig");
+const io_util = @import("io_util.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -123,7 +124,7 @@ pub const Generator = struct {
     generated_ids: std.ArrayList(u32),
     consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
     timeout_ns: u64, // 0 = no timeout
-    timer: std.time.Timer,
+    timer: io_util.Stopwatch,
     logprobs_n: u32 = 0, // 0 = disabled, >0 = number of top_logprobs to return
     last_logprob: ?LogprobResult = null, // logprob result for the most recently returned token
     // Async pipeline state: pre-computed forward pass logits for next decode step
@@ -135,6 +136,7 @@ pub const Generator = struct {
 
     /// Prefill the prompt and prepare for token-by-token generation.
     pub fn init(
+        io: std.Io,
         allocator: std.mem.Allocator,
         xfm: *Transformer,
         tok: *const Tokenizer,
@@ -225,7 +227,7 @@ pub const Generator = struct {
                 .eos_token_ids = eos_token_ids,
                 .generated_ids = std.ArrayList(u32).empty,
                 .timeout_ns = 0,
-                .timer = try std.time.Timer.start(),
+                .timer = io_util.Stopwatch.init(io),
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
@@ -267,7 +269,7 @@ pub const Generator = struct {
             .eos_token_ids = eos_token_ids,
             .generated_ids = std.ArrayList(u32).empty,
             .timeout_ns = 0,
-            .timer = try std.time.Timer.start(),
+            .timer = io_util.Stopwatch.init(io),
         };
 
         gen.pending_logits = next_logits;
@@ -685,6 +687,7 @@ fn sampleTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_s
 
 /// Convenience: generate all tokens at once (non-streaming).
 pub fn generate(
+    io: std.Io,
     allocator: std.mem.Allocator,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -695,8 +698,8 @@ pub fn generate(
     timeout_ns: u64,
     logprobs_n: u32,
 ) !GenerationResult {
-    var timer = try std.time.Timer.start();
-    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    var timer = io_util.Stopwatch.init(io);
+    var gen = try Generator.init(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = timeout_ns;
     gen.logprobs_n = logprobs_n;
     defer gen.deinit(allocator);

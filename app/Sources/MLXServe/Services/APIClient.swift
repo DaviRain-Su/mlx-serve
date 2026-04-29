@@ -16,6 +16,40 @@ enum SSEEvent {
     case done
 }
 
+/// Surfacing real HTTP errors instead of the cryptic NSURLErrorDomain -1011. The body snippet is
+/// truncated server output (typically a JSON error from mlx-serve, e.g. "Prompt too long").
+enum APIError: LocalizedError {
+    case badStatus(code: Int, detail: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .badStatus(let code, let detail):
+            // Friendly message for the most common failure: combined system prompt + tools blew past the
+            // model's context window. Tool-heavy MCP servers can do this on their own.
+            if Self.looksLikeContextOverflow(detail) {
+                return """
+                Your prompt + tool definitions are larger than the model's context window. Try one of:
+                  • Increase context size: menu bar → Settings → bump Context (needs more RAM)
+                  • Use a model with a larger context window
+                  • Disable some MCP servers (gear icon on the MCP pill) or turn off Agent mode
+                """
+            }
+            if detail.isEmpty {
+                return "HTTP \(code) from mlx-serve. Check the server log (menu bar → log icon)."
+            }
+            return "HTTP \(code) from mlx-serve\(detail)"
+        }
+    }
+
+    private static func looksLikeContextOverflow(_ detail: String) -> Bool {
+        let lower = detail.lowercased()
+        return lower.contains("exceeds maximum context length")
+            || lower.contains("context length exceeded")
+            || lower.contains("prompt too long")
+            || lower.contains("maximum context")
+    }
+}
+
 struct RetryPolicy {
     let maxRetries: Int
     let baseDelayMs: Int
@@ -199,9 +233,19 @@ class APIClient {
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-            print("[APIClient] Bad response: HTTP \(statusCode)")
-            try? "Bad response: HTTP \(statusCode)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
-            continuation.finish(throwing: URLError(.badServerResponse))
+            // Drain a small slice of the body for context — the server typically returns a JSON error.
+            var body = ""
+            do {
+                for try await line in bytes.lines.prefix(10) {
+                    body += line + "\n"
+                    if body.count > 800 { break }
+                }
+            } catch {}
+            let snippet = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("[APIClient] Bad response: HTTP \(statusCode) body=\(snippet.prefix(400))")
+            try? "Bad response: HTTP \(statusCode)\nBody: \(snippet)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
+            let detail = snippet.isEmpty ? "" : " — \(snippet.prefix(300))"
+            continuation.finish(throwing: APIError.badStatus(code: statusCode, detail: String(detail)))
             return
         }
 

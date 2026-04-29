@@ -85,8 +85,8 @@ pub fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8),
 
 var id_counter: std.atomic.Value(u64) = .{ .raw = 0 };
 
-pub fn makeId(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
-    const ms = std.time.milliTimestamp();
+pub fn makeId(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    const ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
     const seq = id_counter.fetchAdd(1, .monotonic);
     return std.fmt.allocPrint(allocator, "{s}_{d}_{x}", .{ prefix, ms, seq });
 }
@@ -552,19 +552,20 @@ pub const StoredResponse = struct {
 };
 
 pub const ResponseStore = struct {
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
     map: std.StringHashMapUnmanaged(*StoredResponse) = .{},
     lru: std.DoublyLinkedList = .{},
     cap: usize,
     gpa: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(gpa: std.mem.Allocator, cap: usize) ResponseStore {
-        return .{ .gpa = gpa, .cap = cap };
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, cap: usize) ResponseStore {
+        return .{ .io = io, .gpa = gpa, .cap = cap };
     }
 
     pub fn deinit(self: *ResponseStore) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         var node = self.lru.first;
         while (node) |n| {
             const next = n.next;
@@ -579,8 +580,8 @@ pub const ResponseStore = struct {
     /// Take ownership of `sr`. Evicts the LRU tail if at capacity.
     /// `sr.id` must already be set.
     pub fn put(self: *ResponseStore, sr: *StoredResponse) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
 
         // If id already exists, evict the old entry first
         if (self.map.fetchRemove(sr.id)) |kv| {
@@ -605,8 +606,8 @@ pub const ResponseStore = struct {
 
     /// Returns a borrowed reference (do not free). Touches LRU.
     pub fn get(self: *ResponseStore, id: []const u8) ?*StoredResponse {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         const sr = self.map.get(id) orelse return null;
         self.lru.remove(&sr.list_node);
         self.lru.prepend(&sr.list_node);
@@ -615,8 +616,8 @@ pub const ResponseStore = struct {
 
     /// Returns true if removed.
     pub fn delete(self: *ResponseStore, id: []const u8) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         const kv = self.map.fetchRemove(id) orelse return false;
         self.lru.remove(&kv.value.list_node);
         kv.value.deinit();
@@ -831,7 +832,7 @@ fn makeTestStored(gpa: std.mem.Allocator, id: []const u8) !*StoredResponse {
 
 test "ResponseStore basic put/get/delete" {
     const gpa = testing.allocator;
-    var store = ResponseStore.init(gpa, 4);
+    var store = ResponseStore.init(testing.io, gpa, 4);
     defer store.deinit();
 
     const sr = try makeTestStored(gpa, "resp_1");
@@ -845,7 +846,7 @@ test "ResponseStore basic put/get/delete" {
 
 test "ResponseStore evicts LRU at cap" {
     const gpa = testing.allocator;
-    var store = ResponseStore.init(gpa, 2);
+    var store = ResponseStore.init(testing.io, gpa, 2);
     defer store.deinit();
 
     var ids: [3][]const u8 = undefined;

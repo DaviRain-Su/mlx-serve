@@ -22,17 +22,17 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 
 /// Single-slot inference gate: mutex + condition variable for request queuing.
 /// Requests wait in line instead of getting 503 when the server is busy.
-var inference_mutex: std.Thread.Mutex = .{};
-var inference_cond: std.Thread.Condition = .{};
+var inference_mutex: std.Io.Mutex = .init;
+var inference_cond: std.Io.Condition = .init;
 var inference_busy: bool = false;
 var inference_queue_len: u32 = 0;
 const max_queue_size: u32 = 32;
 
 /// Acquire the inference slot, blocking until available.
 /// Returns false if the queue is full or shutdown was requested.
-fn acquireInferenceSlot() bool {
-    inference_mutex.lock();
-    defer inference_mutex.unlock();
+fn acquireInferenceSlot(io: std.Io) bool {
+    inference_mutex.lockUncancelable(io);
+    defer inference_mutex.unlock(io);
 
     if (inference_queue_len >= max_queue_size) return false;
     inference_queue_len += 1;
@@ -46,7 +46,7 @@ fn acquireInferenceSlot() bool {
             inference_queue_len -= 1;
             return false;
         }
-        inference_cond.wait(&inference_mutex);
+        inference_cond.waitUncancelable(io, &inference_mutex);
     }
 
     inference_queue_len -= 1;
@@ -55,15 +55,80 @@ fn acquireInferenceSlot() bool {
 }
 
 /// Release the inference slot and wake the next waiting request.
-fn releaseInferenceSlot() void {
-    inference_mutex.lock();
-    defer inference_mutex.unlock();
+fn releaseInferenceSlot(io: std.Io) void {
+    inference_mutex.lockUncancelable(io);
+    defer inference_mutex.unlock(io);
 
     inference_busy = false;
-    inference_cond.signal();
+    inference_cond.signal(io);
 }
 
-fn signalHandler(_: c_int) callconv(.c) void {
+const io_util = @import("io_util.zig");
+const nowSecs = io_util.nowSecs;
+const nowMs = io_util.nowMs;
+const Stopwatch = io_util.Stopwatch;
+
+fn startStopwatch(io: std.Io) Stopwatch {
+    return Stopwatch.init(io);
+}
+
+/// Connection wrapper bundling a TCP stream with its `Io` and per-connection
+/// reader/writer buffers. Replaces `std.net.Stream` in 0.16 — methods that took
+/// a bare stream now take `*Conn` so the IO interface and buffers travel together.
+pub const Conn = struct {
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    write_buf: [16 * 1024]u8,
+    read_buf: [16 * 1024]u8,
+    write_state: std.Io.net.Stream.Writer,
+    read_state: std.Io.net.Stream.Reader,
+
+    pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
+        c.stream = stream;
+        c.io = io;
+        c.write_state = stream.writer(io, &c.write_buf);
+        c.read_state = stream.reader(io, &c.read_buf);
+    }
+
+    pub fn writer(c: *Conn) *std.Io.Writer {
+        return &c.write_state.interface;
+    }
+
+    pub fn reader(c: *Conn) *std.Io.Reader {
+        return &c.read_state.interface;
+    }
+
+    pub fn writeAll(c: *Conn, data: []const u8) !void {
+        try c.writer().writeAll(data);
+        try c.writer().flush();
+    }
+
+    pub fn writeAllNoFlush(c: *Conn, data: []const u8) !void {
+        try c.writer().writeAll(data);
+    }
+
+    pub fn flush(c: *Conn) !void {
+        try c.writer().flush();
+    }
+
+    /// Read up to buf.len bytes; may return fewer (HTTP-style short read). Returns 0 on EOF.
+    /// Uses `readVec` because `readSliceShort` blocks until the buffer is full or EOF —
+    /// wrong semantics for HTTP request parsing where we read until headers terminate.
+    pub fn read(c: *Conn, buf: []u8) !usize {
+        var bufs: [1][]u8 = .{buf};
+        return c.reader().readVec(&bufs) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => |e| e,
+        };
+    }
+
+    pub fn close(c: *Conn) void {
+        c.flush() catch {};
+        c.stream.close(c.io);
+    }
+};
+
+fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
@@ -127,9 +192,9 @@ const RESPONSE_STORE_CAP: usize = 256;
 const DEFAULT_API_MAX_TOKENS: u32 = 1024;
 const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
 
-fn getOrInitResponseStore(gpa: std.mem.Allocator) *responses_mod.ResponseStore {
+fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
     if (global_response_store == null) {
-        global_response_store = responses_mod.ResponseStore.init(gpa, RESPONSE_STORE_CAP);
+        global_response_store = responses_mod.ResponseStore.init(io, gpa, RESPONSE_STORE_CAP);
         global_response_store_gpa = gpa;
     }
     return &global_response_store.?;
@@ -145,6 +210,7 @@ fn deinitGlobalResponseStore() void {
 
 /// Start the HTTP server on the given host and port.
 pub fn serve(
+    io: std.Io,
     allocator: std.mem.Allocator,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -194,9 +260,9 @@ pub fn serve(
         }
     }
 
-    const addr = std.net.Address.initIp4(ip4_bytes, port);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
+    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
+    var server = try ip_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
 
     // Log context size (auto-computed or explicit)
     const safe_ctx = computeMaxSafeContext(config);
@@ -246,7 +312,7 @@ pub fn serve(
     }
 
     var poll_fds = [_]std.posix.pollfd{.{
-        .fd = server.stream.handle,
+        .fd = server.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
@@ -261,7 +327,7 @@ pub fn serve(
         if (poll_result == 0) continue; // timeout, re-check shutdown flag
         if (shutdown_requested.load(.acquire)) break;
 
-        const conn = server.accept() catch |err| {
+        const accepted_stream = server.accept(io) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
             log.err("accept error: {}\n", .{err});
             continue;
@@ -269,10 +335,12 @@ pub fn serve(
 
         // Spawn a thread to handle the connection so we can accept new ones immediately.
         // This allows health checks and 503 responses while generation is running.
-        const thread = std.Thread.spawn(.{}, connectionThread, .{ allocator, conn.stream, xfm, tok, chat_config, config }) catch {
+        const thread = std.Thread.spawn(.{}, connectionThread, .{ io, allocator, accepted_stream, xfm, tok, chat_config, config }) catch {
             // If thread spawn fails, handle synchronously
-            handleConnection(allocator, conn.stream, xfm, tok, chat_config, config) catch {};
-            conn.stream.close();
+            var conn: Conn = undefined;
+            Conn.init(&conn, accepted_stream, io);
+            handleConnection(allocator, &conn, xfm, tok, chat_config, config) catch {};
+            conn.close();
             continue;
         };
         thread.detach();
@@ -290,17 +358,20 @@ pub fn serve(
 }
 
 fn connectionThread(
+    io: std.Io,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    raw_stream: std.Io.net.Stream,
     xfm: *Transformer,
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
     config: *const model_mod.ModelConfig,
 ) void {
-    defer stream.close();
-    handleConnection(allocator, stream, xfm, tok, chat_config, config) catch |err| {
+    var conn: Conn = undefined;
+    Conn.init(&conn, raw_stream, io);
+    defer conn.close();
+    handleConnection(allocator, &conn, xfm, tok, chat_config, config) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {
+            error.WriteFailed, error.ReadFailed => {
                 log.debug("  -> client disconnected\n", .{});
             },
             else => {
@@ -312,7 +383,7 @@ fn connectionThread(
 
 fn handleConnection(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
@@ -391,12 +462,12 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
             return;
         }
-        if (!acquireInferenceSlot()) {
+        if (!acquireInferenceSlot(stream.io)) {
             log.warn("POST /v1/chat/completions -> 503 (queue full)\n", .{});
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
             return;
         }
-        defer releaseInferenceSlot();
+        defer releaseInferenceSlot(stream.io);
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, xfm, tok, chat_config, config);
@@ -405,22 +476,22 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
             return;
         }
-        if (!acquireInferenceSlot()) {
+        if (!acquireInferenceSlot(stream.io)) {
             log.warn("POST /v1/completions -> 503 (queue full)\n", .{});
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
             return;
         }
-        defer releaseInferenceSlot();
+        defer releaseInferenceSlot(stream.io);
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleCompletions(allocator, stream, body, xfm, tok, config);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/embeddings")) {
-        if (!acquireInferenceSlot()) {
+        if (!acquireInferenceSlot(stream.io)) {
             log.warn("POST /v1/embeddings -> 503 (queue full)\n", .{});
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
             return;
         }
-        defer releaseInferenceSlot();
+        defer releaseInferenceSlot(stream.io);
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, xfm, tok, config);
@@ -429,12 +500,12 @@ fn handleConnection(
             try sendAnthropicError(allocator, stream, "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
             return;
         }
-        if (!acquireInferenceSlot()) {
+        if (!acquireInferenceSlot(stream.io)) {
             log.warn("POST /v1/messages -> 529 (queue full)\n", .{});
             try sendAnthropicError(allocator, stream, "overloaded_error", "Server is overloaded. Try again shortly.", 529);
             return;
         }
-        defer releaseInferenceSlot();
+        defer releaseInferenceSlot(stream.io);
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, xfm, tok, chat_config, config);
@@ -443,12 +514,12 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
             return;
         }
-        if (!acquireInferenceSlot()) {
+        if (!acquireInferenceSlot(stream.io)) {
             log.warn("POST /v1/responses -> 503 (queue full)\n", .{});
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
             return;
         }
-        defer releaseInferenceSlot();
+        defer releaseInferenceSlot(stream.io);
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleResponses(allocator, stream, body, xfm, tok, chat_config, config);
@@ -529,7 +600,7 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// that tiles over seq and never materializes the full [heads, seq, seq] attention matrix.
 /// So peak memory is dominated by (a) the persistent KV cache and (b) per-layer working
 /// tensors (QKV projections, MLP intermediates). There is no seq² term.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: std.net.Stream, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
 
@@ -613,7 +684,7 @@ fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
 
 fn handleModels(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     config: *const model_mod.ModelConfig,
     chat_config: *const chat_mod.ChatConfig,
 ) !void {
@@ -665,7 +736,7 @@ fn handleModels(
         \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
     , .{
         model_id,
-        std.time.timestamp(),
+        nowSecs(stream.io),
         caps.items,
         mods.items,
         config.model_type,
@@ -679,7 +750,7 @@ fn handleModels(
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig, chat_config: *const chat_mod.ChatConfig) !void {
+fn handleProps(allocator: std.mem.Allocator, stream: *Conn, config: *const model_mod.ModelConfig, chat_config: *const chat_mod.ChatConfig) !void {
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
@@ -717,7 +788,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *co
 
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -827,7 +898,7 @@ fn handleEmbeddings(
 
 fn handleTokenize(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     tok: *const Tokenizer,
 ) !void {
@@ -864,7 +935,7 @@ fn handleTokenize(
 
 fn handleDetokenize(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     tok: *const Tokenizer,
 ) !void {
@@ -915,7 +986,7 @@ fn handleDetokenize(
 
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -1180,7 +1251,7 @@ fn handleChatCompletions(
                     if (js == .object) {
                         if (js.object.get("schema")) |schema_val| {
                             grammar_schema_val = schema_val;
-                            var out: std.io.Writer.Allocating = .init(allocator);
+                            var out: std.Io.Writer.Allocating = .init(allocator);
                             defer out.deinit();
                             var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
                             schema_val.jsonStringify(&jws) catch {};
@@ -1378,7 +1449,7 @@ fn handleChatCompletions(
 
 fn handleCompletions(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -1538,7 +1609,7 @@ fn handleCompletions(
 
 fn handleNonStreamingCompletion(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1549,9 +1620,9 @@ fn handleNonStreamingCompletion(
     model_name: []const u8,
     cached_tokens: u32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = startStopwatch(stream.io);
 
-    var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
+    var result = try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
     result.prompt_tokens += cached_tokens;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -1577,8 +1648,8 @@ fn handleNonStreamingCompletion(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
-        std.time.milliTimestamp(),
-        std.time.timestamp(),
+        nowMs(stream.io),
+        nowSecs(stream.io),
         model_name,
         escaped_text,
         finish_reason,
@@ -1593,7 +1664,7 @@ fn handleNonStreamingCompletion(
 
 fn handleStreamingCompletion(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1605,11 +1676,11 @@ fn handleStreamingCompletion(
     include_usage: bool,
     cached_tokens: u32,
 ) !void {
-    const cmpl_id = std.time.milliTimestamp();
-    const created_ts = std.time.timestamp();
-    var timer = try std.time.Timer.start();
+    const cmpl_id = nowMs(stream.io);
+    const created_ts = nowSecs(stream.io);
+    var timer = startStopwatch(stream.io);
 
-    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    var gen = try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
     defer gen.deinit(allocator);
 
@@ -1731,7 +1802,7 @@ fn handleStreamingCompletion(
 
 fn handleNonStreamingGeneration(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1746,9 +1817,9 @@ fn handleNonStreamingGeneration(
     enable_thinking: bool,
     reasoning_budget: i32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = startStopwatch(stream.io);
 
-    var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), logprobs_n);
+    var result = try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), logprobs_n);
     result.prompt_tokens += cached_tokens; // Include cached tokens in total prompt count
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -1828,7 +1899,7 @@ fn handleNonStreamingGeneration(
             try tc_buf.appendSlice(allocator, "[");
             for (tool_calls, 0..) |tc, i| {
                 if (i > 0) try tc_buf.appendSlice(allocator, ",");
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ nowMs(stream.io), i });
                 defer allocator.free(tc_id);
                 const escaped_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(escaped_name);
@@ -1859,8 +1930,8 @@ fn handleNonStreamingGeneration(
             const response = try std.fmt.allocPrint(allocator,
                 \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
-                std.time.milliTimestamp(),
-                std.time.timestamp(),
+                nowMs(stream.io),
+                nowSecs(stream.io),
                 model_name,
                 tc_reasoning_json,
                 tc_buf.items,
@@ -1912,8 +1983,8 @@ fn handleNonStreamingGeneration(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
-        std.time.milliTimestamp(),
-        std.time.timestamp(),
+        nowMs(stream.io),
+        nowSecs(stream.io),
         model_name,
         escaped_text,
         reasoning_json,
@@ -1930,7 +2001,7 @@ fn handleNonStreamingGeneration(
 
 fn handleStreamingGeneration(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -1946,11 +2017,11 @@ fn handleStreamingGeneration(
     enable_thinking: bool,
     reasoning_budget: i32,
 ) !void {
-    const chat_id = std.time.milliTimestamp();
-    var timer = try std.time.Timer.start();
+    const chat_id = nowMs(stream.io);
+    var timer = startStopwatch(stream.io);
 
     // Prefill + init generator
-    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    var gen = try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
     gen.logprobs_n = logprobs_n;
     defer gen.deinit(allocator);
@@ -2204,14 +2275,14 @@ fn handleStreamingGeneration(
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null);
                 }
                 const after = m.pos + m.tag.len;
-                var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 // Strip Gemma 4 content channel tag: <|channel>\n or <|channel>
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
                     content_after = content_after[11..];
                 } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                     content_after = content_after[10..];
                 }
-                content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null);
                 }
@@ -2397,7 +2468,7 @@ const DeltaFields = struct {
 
 fn sendSSEChunk(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     chat_id: i64,
     model_name: []const u8,
     delta: DeltaFields,
@@ -2457,7 +2528,7 @@ fn sendSSEChunk(
     // Build the full SSE chunk
     const chunk = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"delta":{s},"finish_reason":{s}}}],"usage":{s}}}
-    , .{ chat_id, std.time.timestamp(), model_name, delta_buf.items, fr_str, usage_str });
+    , .{ chat_id, nowSecs(stream.io), model_name, delta_buf.items, fr_str, usage_str });
     defer allocator.free(chunk);
 
     // Write as SSE event
@@ -2554,7 +2625,7 @@ fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32, has
     cached_has_tools = has_tools;
 }
 
-fn sendResponse(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
+fn sendResponse(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     logHttpResponse(status, content_type, body);
 
     var hdr_buf: [512]u8 = undefined;
@@ -2671,7 +2742,7 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
-fn sendErrorResponse(allocator: std.mem.Allocator, stream: std.net.Stream, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -3097,7 +3168,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8) ?chat_
 
 // ── Anthropic Messages API ──
 
-fn sendAnthropicError(allocator: std.mem.Allocator, stream: std.net.Stream, err_type: []const u8, message: []const u8, status_code: u32) !void {
+fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
     const body = try std.fmt.allocPrint(allocator,
@@ -3109,7 +3180,7 @@ fn sendAnthropicError(allocator: std.mem.Allocator, stream: std.net.Stream, err_
     try sendResponse(stream, status, "application/json", body);
 }
 
-fn sendAnthropicEvent(stream: std.net.Stream, event_name: []const u8, data: []const u8) !void {
+fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
     logHttpSseEvent(event_name, data);
     try stream.writeAll("event: ");
     try stream.writeAll(event_name);
@@ -3205,7 +3276,7 @@ fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Arra
 
 fn handleAnthropicMessages(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -3630,7 +3701,7 @@ fn handleAnthropicMessages(
 
 fn handleAnthropicNonStreaming(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -3645,9 +3716,9 @@ fn handleAnthropicNonStreaming(
     reasoning_budget: i32,
     prompt_token_count: u32,
 ) !void {
-    var timer = try std.time.Timer.start();
+    var timer = startStopwatch(stream.io);
 
-    var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
+    var result = try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
     result.prompt_tokens += cached_tokens;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -3732,7 +3803,7 @@ fn handleAnthropicNonStreaming(
             // Emit tool_use content blocks
             for (tool_calls, 0..) |tc, i| {
                 if (block_count > 0) try content.append(allocator, ',');
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
                 defer allocator.free(tc_id);
                 const esc_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(esc_name);
@@ -3777,7 +3848,7 @@ fn handleAnthropicNonStreaming(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
     , .{
-        std.time.milliTimestamp(),
+        nowMs(stream.io),
         content.items,
         model_name,
         stop_reason,
@@ -3790,7 +3861,7 @@ fn handleAnthropicNonStreaming(
 
 fn handleAnthropicStreaming(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -3805,8 +3876,8 @@ fn handleAnthropicStreaming(
     reasoning_budget: i32,
     prompt_token_count: u32,
 ) !void {
-    var timer = try std.time.Timer.start();
-    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    var timer = startStopwatch(stream.io);
+    var gen = try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
     defer gen.deinit(allocator);
 
@@ -3834,7 +3905,7 @@ fn handleAnthropicStreaming(
     {
         const data = try std.fmt.allocPrint(allocator,
             \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ std.time.milliTimestamp(), model_name, prompt_token_count });
+        , .{ nowMs(stream.io), model_name, prompt_token_count });
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -4036,10 +4107,10 @@ fn handleAnthropicStreaming(
                     block_index += 1;
                 }
                 const after = m.pos + m.tag.len;
-                var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
-                content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     if (!text_block_open) {
                         const sd = try std.fmt.allocPrint(allocator,
@@ -4132,7 +4203,7 @@ fn handleAnthropicStreaming(
             }
 
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
                 defer allocator.free(tc_id);
                 const esc_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(esc_name);
@@ -4247,7 +4318,7 @@ fn handleAnthropicStreaming(
 }
 
 /// Emit a text_delta event for Anthropic streaming.
-fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32, text: []const u8) !void {
+fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: *Conn, index: u32, text: []const u8) !void {
     const esc = try jsonEscape(allocator, text);
     defer allocator.free(esc);
     const inner = esc[1 .. esc.len - 1];
@@ -4259,7 +4330,7 @@ fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: std.net.Stream, 
 }
 
 /// Emit a thinking_delta event for Anthropic streaming.
-fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32, thinking: []const u8) !void {
+fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: *Conn, index: u32, thinking: []const u8) !void {
     const esc = try jsonEscape(allocator, thinking);
     defer allocator.free(esc);
     const inner = esc[1 .. esc.len - 1];
@@ -4271,7 +4342,7 @@ fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: std.net.Stre
 }
 
 /// Close a thinking block with a fake signature and content_block_stop.
-fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32) !void {
+fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: *Conn, index: u32) !void {
     const sig = try std.fmt.allocPrint(allocator,
         \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"signature_delta","signature":"mlx-serve-local"}}}}
     , .{index});
@@ -4284,8 +4355,8 @@ fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: std.net.Str
 
 // ─── /v1/responses (OpenAI Responses API) ────────────────────────────────
 
-fn handleResponsesGet(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !void {
-    const store = getOrInitResponseStore(allocator);
+fn handleResponsesGet(allocator: std.mem.Allocator, stream: *Conn, id: []const u8) !void {
+    const store = getOrInitResponseStore(stream.io, allocator);
     if (store.get(id)) |sr| {
         try sendResponse(stream, "200 OK", "application/json", sr.body_json);
     } else {
@@ -4293,8 +4364,8 @@ fn handleResponsesGet(allocator: std.mem.Allocator, stream: std.net.Stream, id: 
     }
 }
 
-fn handleResponsesDelete(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !void {
-    const store = getOrInitResponseStore(allocator);
+fn handleResponsesDelete(allocator: std.mem.Allocator, stream: *Conn, id: []const u8) !void {
+    const store = getOrInitResponseStore(stream.io, allocator);
     if (store.delete(id)) {
         const esc_id = try jsonEscape(allocator, id);
         defer allocator.free(esc_id);
@@ -4334,7 +4405,7 @@ fn buildResponsesJsonInstruction(allocator: std.mem.Allocator, schema_val: ?std.
     }
 
     if (schema_val) |sv| {
-        var out: std.io.Writer.Allocating = .init(allocator);
+        var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
         sv.jsonStringify(&jws) catch {};
@@ -4362,7 +4433,7 @@ fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
 
 fn handleResponses(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     body: []const u8,
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -4500,7 +4571,7 @@ fn handleResponses(
     // ── previous response — fetch stored history ──
     var prev_messages: ?[]const chat_mod.Message = null;
     if (prev_id) |pid| {
-        const store = getOrInitResponseStore(allocator);
+        const store = getOrInitResponseStore(stream.io, allocator);
         if (store.get(pid)) |sr| {
             prev_messages = sr.history;
         } else {
@@ -4619,7 +4690,7 @@ fn handleResponses(
     }
 
     // ── pre-allocate response id (used in streaming envelopes too) ──
-    const resp_id = try responses_mod.makeId(allocator, "resp");
+    const resp_id = try responses_mod.makeId(stream.io, allocator, "resp");
     defer allocator.free(resp_id);
     const esc_resp_id = try jsonEscape(allocator, resp_id);
     defer allocator.free(esc_resp_id);
@@ -4641,7 +4712,7 @@ fn handleResponses(
         logHttpStreamStart("responses");
 
         // Skeleton envelope (status:in_progress, output:[])
-        const skel = try buildResponsesEnvelope(allocator, esc_resp_id, esc_model, "in_progress", "[]", 0, 0, should_store, prev_id, false);
+        const skel = try buildResponsesEnvelope(stream.io, allocator, esc_resp_id, esc_model, "in_progress", "[]", 0, 0, should_store, prev_id, false);
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
         defer allocator.free(created_payload);
@@ -4668,7 +4739,7 @@ fn handleResponses(
 
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
-        var gen = try generate_mod.Generator.init(allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice);
+        var gen = try generate_mod.Generator.init(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice);
         gen.timeout_ns = getTimeoutNs();
         defer gen.deinit(allocator);
 
@@ -4777,7 +4848,7 @@ fn handleResponses(
                     const before = think_buf.items[0..m.pos];
                     if (before.len > 0) {
                         if (!streamed_reasoning_started) {
-                            streamed_reasoning_id = try responses_mod.makeId(allocator, "rs");
+                            streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
                             try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
@@ -4787,16 +4858,16 @@ fn handleResponses(
                     if (streamed_reasoning_started) live_output_index += 1;
 
                     const after = m.pos + m.tag.len;
-                    var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                    var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                     if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
                         content_after = content_after[11..];
                     } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                         content_after = content_after[10..];
                     }
-                    content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                    content_after = std.mem.trimStart(u8, content_after, "\n ");
                     if (content_after.len > 0) {
                         if (!streamed_message_started) {
-                            streamed_message_id = try responses_mod.makeId(allocator, "msg");
+                            streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                             streamed_message_index = live_output_index;
                             try emitResponsesMessageStart(allocator, stream, streamed_message_index, streamed_message_id.?);
                             streamed_message_started = true;
@@ -4812,7 +4883,7 @@ fn handleResponses(
                     const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
                     if (safe_len > 0) {
                         if (!streamed_reasoning_started) {
-                            streamed_reasoning_id = try responses_mod.makeId(allocator, "rs");
+                            streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
                             try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
@@ -4828,7 +4899,7 @@ fn handleResponses(
                 // Skip Gemma 4 channel tags that may leak after the thinking block.
                 if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
                 if (!streamed_message_started) {
-                    streamed_message_id = try responses_mod.makeId(allocator, "msg");
+                    streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
                     try emitResponsesMessageStart(allocator, stream, streamed_message_index, streamed_message_id.?);
                     streamed_message_started = true;
@@ -4840,7 +4911,7 @@ fn handleResponses(
         // Flush any remaining think buffer (no close tag found) as reasoning.
         if (in_think_block and think_buf.items.len > 0 and !active_has_tools) {
             if (!streamed_reasoning_started) {
-                streamed_reasoning_id = try responses_mod.makeId(allocator, "rs");
+                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                 streamed_reasoning_index = live_output_index;
                 try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
                 streamed_reasoning_started = true;
@@ -4858,7 +4929,7 @@ fn handleResponses(
             .decode_tps = 0.0,
         };
     } else {
-        result = try generate_mod.generate(allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), 0);
+        result = try generate_mod.generate(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), 0);
         result.prompt_tokens += cache_result.cached_tokens;
     }
     defer allocator.free(result.text);
@@ -4923,7 +4994,7 @@ fn handleResponses(
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
             try emitResponsesReasoningEnd(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
-            const rid = try responses_mod.makeId(allocator, "rs");
+            const rid = try responses_mod.makeId(stream.io, allocator, "rs");
             defer allocator.free(rid);
             try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
             if (is_stream) {
@@ -4944,9 +5015,9 @@ fn handleResponses(
                 log.warn("[responses] dropping tool call with non-object arguments: {s}\n", .{tc.name});
                 continue;
             }
-            const fc_id = try responses_mod.makeId(allocator, "fc");
+            const fc_id = try responses_mod.makeId(stream.io, allocator, "fc");
             defer allocator.free(fc_id);
-            const call_id = try responses_mod.makeId(allocator, "call");
+            const call_id = try responses_mod.makeId(stream.io, allocator, "call");
             defer allocator.free(call_id);
             const stored_call_id = try allocator.dupe(u8, call_id);
             emitted_tool_calls.append(allocator, .{ .id = stored_call_id, .name = tc.name, .arguments = tc.arguments }) catch |err| {
@@ -4971,7 +5042,7 @@ fn handleResponses(
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
             try emitResponsesMessageEnd(allocator, stream, streamed_message_index, streamed_message_id.?, visible_text);
         } else {
-            const mid = try responses_mod.makeId(allocator, "msg");
+            const mid = try responses_mod.makeId(stream.io, allocator, "msg");
             defer allocator.free(mid);
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
             if (is_stream) {
@@ -4986,6 +5057,7 @@ fn handleResponses(
 
     // ── envelope ──
     const envelope = try buildResponsesEnvelope(
+        stream.io,
         allocator,
         esc_resp_id,
         esc_model,
@@ -5002,7 +5074,7 @@ fn handleResponses(
     // ── store response ──
     if (should_store) {
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls) catch |err| {
+        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -5030,6 +5102,7 @@ fn handleResponses(
 /// Build the Responses envelope JSON body. Used for both the response.created
 /// skeleton (in_progress, output:[]) and the final response.completed body.
 fn buildResponsesEnvelope(
+    io: std.Io,
     allocator: std.mem.Allocator,
     esc_resp_id: []const u8,
     esc_model: []const u8,
@@ -5060,7 +5133,7 @@ fn buildResponsesEnvelope(
         \\{{"id":{s},"object":"response","created_at":{d},"status":"{s}","model":{s},"output":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"total_tokens":{d}}},"store":{}{s}{s}}}
     , .{
         esc_resp_id,
-        std.time.timestamp(),
+        nowSecs(io),
         status_str,
         esc_model,
         output_json,
@@ -5077,7 +5150,7 @@ fn buildResponsesEnvelope(
 /// Pair with `emitResponsesReasoningEnd` after deltas are streamed.
 fn emitResponsesReasoningStart(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
 ) !void {
@@ -5102,7 +5175,7 @@ fn emitResponsesReasoningStart(
 /// Emit a single reasoning_summary_text.delta event with the given chunk.
 fn emitResponsesReasoningDelta(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
     delta_text: []const u8,
@@ -5122,7 +5195,7 @@ fn emitResponsesReasoningDelta(
 /// Emit reasoning_summary_text.done + reasoning_summary_part.done + output_item.done.
 fn emitResponsesReasoningEnd(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
     full_text: []const u8,
@@ -5158,7 +5231,7 @@ fn emitResponsesReasoningEnd(
 /// reasoning text is known up-front (non-streaming generation paths).
 fn emitResponsesReasoningEvents(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
     reasoning_text: []const u8,
@@ -5172,7 +5245,7 @@ fn emitResponsesReasoningEvents(
 /// function_call_arguments.delta (single full-args delta), .done, output_item.done.
 fn emitResponsesFunctionCallEvents(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     fc_id: []const u8,
     call_id: []const u8,
@@ -5222,7 +5295,7 @@ fn emitResponsesFunctionCallEvents(
 /// Pair with `emitResponsesMessageEnd` after output_text.delta events stream.
 fn emitResponsesMessageStart(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
 ) !void {
@@ -5247,7 +5320,7 @@ fn emitResponsesMessageStart(
 /// Emit a single output_text.delta event for an in-progress message.
 fn emitResponsesMessageDelta(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
     delta_text: []const u8,
@@ -5267,7 +5340,7 @@ fn emitResponsesMessageDelta(
 /// Emit output_text.done + content_part.done + output_item.done.
 fn emitResponsesMessageEnd(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
     full_text: []const u8,
@@ -5303,7 +5376,7 @@ fn emitResponsesMessageEnd(
 /// text is known up-front (non-streaming generation paths).
 fn emitResponsesMessageEvents(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *Conn,
     output_index: u32,
     item_id: []const u8,
     text: []const u8,
@@ -5317,6 +5390,7 @@ fn emitResponsesMessageEvents(
 /// the input messages plus the assistant turn, deep-copied into the entry's
 /// arena so it stays valid across the request that produced it.
 fn storeResponse(
+    io: std.Io,
     gpa: std.mem.Allocator,
     resp_id: []const u8,
     model_name: []const u8,
@@ -5386,7 +5460,7 @@ fn storeResponse(
 
     sr.* = .{
         .id = try a.dupe(u8, resp_id),
-        .created_at = std.time.timestamp(),
+        .created_at = nowSecs(io),
         .model = try a.dupe(u8, model_name),
         .status = try a.dupe(u8, status_str),
         .body_json = try a.dupe(u8, body_json),
@@ -5395,7 +5469,7 @@ fn storeResponse(
     };
     errdefer sr.deinit();
 
-    const store = getOrInitResponseStore(gpa);
+    const store = getOrInitResponseStore(io, gpa);
     try store.put(sr);
 }
 
@@ -5658,7 +5732,7 @@ test "deinitGlobalResponseStore frees stored responses" {
     defer deinitGlobalResponseStore();
 
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try storeResponse(testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null);
+    try storeResponse(testing.io, testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null);
 
     if (global_response_store) |*store| {
         try testing.expectEqual(@as(usize, 1), store.map.count());

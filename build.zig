@@ -36,13 +36,13 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("mlxc", .{});
     mod.linkSystemLibrary("webp", .{});
 
+    mod.linkFramework("IOKit", .{});
+    mod.linkFramework("CoreFoundation", .{});
+
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
         .root_module = mod,
     });
-
-    exe.linkFramework("IOKit");
-    exe.linkFramework("CoreFoundation");
 
     // Ensure Mach-O header has room for install_name_tool path changes (app bundling)
     exe.headerpad_max_install_names = true;
@@ -79,11 +79,12 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("mlxc", .{});
     test_mod.linkSystemLibrary("webp", .{});
 
+    test_mod.linkFramework("IOKit", .{});
+    test_mod.linkFramework("CoreFoundation", .{});
+
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
     });
-    unit_tests.linkFramework("IOKit");
-    unit_tests.linkFramework("CoreFoundation");
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
