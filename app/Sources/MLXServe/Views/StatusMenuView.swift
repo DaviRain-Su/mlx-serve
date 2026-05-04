@@ -138,8 +138,21 @@ struct StatusMenuView: View {
                         .foregroundStyle(.tertiary)
                 } else {
                     Picker("Model", selection: $appState.selectedModelPath) {
-                        ForEach(appState.localModels) { model in
-                            Text(model.name).tag(model.path)
+                        let mlxServe = appState.localModels.filter { $0.source == .mlxServe }
+                        let lmStudio = appState.localModels.filter { $0.source == .lmStudio }
+                        if !mlxServe.isEmpty {
+                            Section("MLX-Serve Models") {
+                                ForEach(mlxServe) { model in
+                                    Text(model.name).tag(model.path)
+                                }
+                            }
+                        }
+                        if !lmStudio.isEmpty {
+                            Section("Other Discovered Models") {
+                                ForEach(lmStudio) { model in
+                                    Text(model.name).tag(model.path)
+                                }
+                            }
                         }
                     }
                     .labelsHidden()

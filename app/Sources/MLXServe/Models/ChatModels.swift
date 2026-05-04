@@ -184,12 +184,18 @@ enum ServerStatus: Equatable {
     }
 }
 
+enum LocalModelSource: String, Codable, Hashable {
+    case mlxServe
+    case lmStudio
+}
+
 struct LocalModel: Identifiable, Hashable {
     let id: String
     let name: String
     let path: String
     let sizeFormatted: String
     let modelType: String
+    let source: LocalModelSource
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType)

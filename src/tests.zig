@@ -14,4 +14,5 @@ test {
     _ = @import("json_grammar.zig");
     _ = @import("token_mask.zig");
     _ = @import("responses.zig");
+    _ = @import("ws.zig");
 }

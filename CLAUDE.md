@@ -23,7 +23,9 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `src/generate.zig` | Autoregressive generation, sampling (temperature, top-k, top-p, repeat penalty, presence penalty, logprobs) |
 | `src/chat.zig` | Chat template formatting (ChatML, Gemma turns, Llama-3, Jinja2 via llama.cpp engine); thinking/reasoning tags; tool call parsing |
 | `src/vision.zig` | Vision encoder (Gemma 4 SigLIP): patch embedding, 2D RoPE, clipped linears, position pooling, embedding projection |
-| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages` (OpenAI + Anthropic compat, stream + non-stream, tool calling, KV cache, vision) |
+| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, `/v1/responses/compact`, plus a WebSocket transport on `/v1/responses` (OpenAI Chat + Responses + Anthropic Messages, stream + non-stream, tool calling, KV cache, vision) |
+| `src/responses.zig` | OpenAI Responses API: input-item parser (incl. `compaction` items), tool-shape translation, output-item builders, in-memory `ResponseStore`, `encodeCompactionBlob` (HTTP/streaming live in `server.zig`) |
+| `src/ws.zig` | RFC 6455 WebSocket framing + handshake (server-side only). Generic over a `Conn`-shaped type so it stays test-friendly without depending on `server.zig`. |
 | `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
 | `build.zig` | Zig build; links mlx-c, libjinja.a, libwebp, stb_image |
@@ -138,6 +140,37 @@ Model support is determined by `model_type` in the model's `config.json`. The se
 | `command-r` | Cohere Command R | Different architecture | Medium |
 
 Models with `vision_config` in config.json but no vision weights (e.g., text-only quantized Qwen 3.5) are handled gracefully — the vision encoder init detects missing weights early and disables vision. The Swift app flags unsupported architectures in the Model Browser via `supportedModelTypes` in `HFModels.swift`.
+
+## OpenAI Responses API
+
+The server exposes `POST /v1/responses` (plus `GET`/`DELETE /v1/responses/{id}`) — OpenAI's stateful Responses API. Pure data handling (input parsing, output-item builders, in-memory store) lives in `src/responses.zig`; HTTP and generation orchestration in `src/server.zig`.
+
+### Envelope shape (`buildResponsesEnvelope` + `ResponseEcho`)
+The response body must echo most request configuration to satisfy OpenAI's strict ResponseResource schema. Every response includes: `tools`, `tool_choice`, `text`, `reasoning`, `usage` (with `input_tokens_details.cached_tokens` + `output_tokens_details.reasoning_tokens`), `truncation`, `parallel_tool_calls`, `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `top_logprobs`, `max_output_tokens`, `max_tool_calls`, `background`, `service_tier`, `metadata`, `safety_identifier`, `prompt_cache_key`, `instructions`, `error`, `completed_at`. Renderers `renderResponsesToolsEcho`/`renderResponsesToolChoiceEcho`/`renderResponsesTextEcho`/`renderResponsesReasoningEcho`/`renderResponsesMetadataEcho` reshape the request JSON into the exact schema-conformant form (e.g., flat `{type, name, description, parameters, strict}` for tools — not the nested chat-completions form).
+
+### Streaming SSE
+Events are: `response.created`, `response.in_progress`, `response.output_item.added` (per item), per-type deltas (`response.reasoning_summary_text.delta`, `response.output_text.delta`, `response.function_call_arguments.delta`), per-type `.done`, `response.output_item.done`, `response.completed`. **Every event must carry a `sequence_number` field** (incrementing integer). `sendResponsesEvent` injects it before send; the POST handler keeps a per-request `seq_num` counter that's threaded through every emit helper (`emitResponses*`).
+
+### Stateful chains
+`ResponseStore` (capacity `RESPONSE_STORE_CAP`) keeps prior responses keyed by id. When a request supplies `previous_response_id`, history is replayed; if the id is missing → 404. `parseInput` accepts both string and content-block array shapes, and `inputContainsFunctionCallOutput` triggers final-answer mode (tools disabled) when the user is supplying tool outputs for a structured-output turn.
+
+### Compatibility quirks
+- The compliance suite at `experiments/openresponses` (run via `bun run test:compliance --base-url http://host:port/v1 --api-key X --model mlx-serve`) validates against the strict ResponseResource schema and the per-event streaming union — currently passes 17/17.
+- `top_level response_format` is accepted as an alias for `text.format` (some clients reuse their chat-completions adapter).
+
+### Compaction (`POST /v1/responses/compact`)
+
+Pure data transformation — no LLM call, no inference slot. The server reuses `responses_mod.parseInput` to materialize the resolved message history (including any `previous_response_id` lookup) and synthesizes an opaque `encrypted_content` blob: base64 over `{"v":1,"msgs":[{"role":..., "content":...}, ...]}`. Feeding the returned `compaction` item back into `response.create` as an `input` element (handled by `appendCompactionInputItem` in `responses.zig`) reconstitutes the messages — exercising the round-trip without an LLM call. `model` is required (422 on missing). Tool calls and images are dropped when encoding (the blob is text-only).
+
+### WebSocket transport (`ws[s]://host/v1/responses`)
+
+Same endpoint, opt-in via the standard `Upgrade: websocket` handshake. Each text frame is a `response.create`-shaped JSON message; the server bridges the per-frame turn through `handleResponses` and emits each SSE event as a single WS text frame.
+
+- **No `[DONE]` on success.** `response.completed` (or `.failed`/`.incomplete`) is the per-response terminator, and the compliance suite advances turns the moment it sees one. A trailing `[DONE]` would land in the next turn's bucket and break chained sessions. `[DONE]` is reserved for error fallbacks where no terminal event is sent.
+- **Sequence numbers reset per response**, not per connection. `seq_num` lives inside `handleResponses`, fresh each call.
+- **Per-connection store-false cache.** `WsLocalCache` holds responses requested with `store: false` for the lifetime of the WS connection. After each turn, if the user requested `store: false`, the freshly-stored response is moved from the global `ResponseStore` into the connection-local cache; on connection close, all entries are freed. Cross-connection lookups of those ids correctly return `previous_response_not_found`.
+- **Cache eviction on failed continuation.** A failed continuation (status != "completed", or invalid `function_call_output`) evicts the chain root from the local cache.
+- **Bridge mechanism.** A `WsBridge` value (function pointer + opaque impl) is attached to `Conn.ws_mode` for the duration of a turn. `sendResponse` and `sendAnthropicEvent` branch on `ws_mode` so SSE bytes never hit the wire when bridging — instead the JSON payload becomes a single WS text frame. The SSE-headers write at the top of `handleResponses` is similarly guarded.
 
 ## Anthropic Messages API
 

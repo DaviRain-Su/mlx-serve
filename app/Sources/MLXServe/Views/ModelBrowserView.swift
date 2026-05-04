@@ -8,8 +8,11 @@ struct ModelBrowserView: View {
     @State private var localFilter = ""
 
     private var filteredLocalModels: [LocalModel] {
-        if localFilter.isEmpty { return appState.localModels }
-        return appState.localModels.filter { $0.name.localizedCaseInsensitiveContains(localFilter) }
+        // The "Downloaded" tab represents what mlx-serve itself fetched.
+        // Externally-discovered models (LM Studio) live in the dropdown but not here.
+        let mlxServeOnly = appState.localModels.filter { $0.source == .mlxServe }
+        if localFilter.isEmpty { return mlxServeOnly }
+        return mlxServeOnly.filter { $0.name.localizedCaseInsensitiveContains(localFilter) }
     }
 
     private var activeDownloads: [(repoId: String, state: DownloadManager.DownloadState)] {

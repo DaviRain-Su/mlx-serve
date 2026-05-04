@@ -1,4 +1,6 @@
 import SwiftUI
+import PDFKit
+import UniformTypeIdentifiers
 
 private struct ContentBottomKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
@@ -165,6 +167,7 @@ struct ChatDetailView: View {
     @State private var contentBottom: CGFloat = 0
     @State private var scrollMonitor: Any?
     @State private var pendingImages: [NSImage] = []
+    @State private var pendingPDFs: [(name: String, text: String)] = []
     @FocusState private var inputFocused: Bool
 
 
@@ -241,8 +244,8 @@ struct ChatDetailView: View {
 
             // Input area — iMessage style
             VStack(spacing: 4) {
-                // Pending image thumbnails
-                if !pendingImages.isEmpty {
+                // Pending attachment thumbnails (images + PDFs)
+                if !pendingImages.isEmpty || !pendingPDFs.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
                             ForEach(Array(pendingImages.enumerated()), id: \.offset) { idx, img in
@@ -264,6 +267,42 @@ struct ChatDetailView: View {
                                     .offset(x: 4, y: -4)
                                 }
                             }
+                            ForEach(Array(pendingPDFs.enumerated()), id: \.offset) { idx, pdf in
+                                ZStack(alignment: .topTrailing) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "doc.text.fill")
+                                            .font(.system(size: 18))
+                                            .foregroundStyle(.white)
+                                            .frame(width: 32, height: 32)
+                                            .background(Color.red.opacity(0.85))
+                                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(pdf.name)
+                                                .font(.caption.weight(.medium))
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            Text("PDF · \(pdf.text.count) chars")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .frame(maxWidth: 200, minHeight: 56, maxHeight: 56)
+                                    .background(Color.secondary.opacity(0.15))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    Button {
+                                        pendingPDFs.remove(at: idx)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.system(size: 14))
+                                            .foregroundStyle(.white)
+                                            .background(Circle().fill(.black.opacity(0.5)))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .offset(x: 4, y: -4)
+                                }
+                            }
                         }
                         .padding(.horizontal, 4)
                     }
@@ -271,8 +310,8 @@ struct ChatDetailView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
-                    // Image attachment button
-                    Button { pickImage() } label: {
+                    // Attachment button (images + PDFs)
+                    Button { pickAttachment() } label: {
                         Image(systemName: "paperclip")
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.secondary)
@@ -281,7 +320,7 @@ struct ChatDetailView: View {
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .help("Attach image")
+                    .help("Attach image or PDF")
 
                     // Dark pill input
                     TextField("Message", text: $inputText, axis: .vertical)
@@ -326,17 +365,31 @@ struct ChatDetailView: View {
                             .foregroundStyle(isGenerating ? .red : .accentColor)
                     }
                     .buttonStyle(.plain)
-                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && !isGenerating))
+                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && pendingPDFs.isEmpty && !isGenerating))
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .onDrop(of: [.image], isTargeted: nil) { providers in
+        .onDrop(of: [.image, .pdf], isTargeted: nil) { providers in
             for provider in providers {
-                provider.loadObject(ofClass: NSImage.self) { image, _ in
-                    if let image = image as? NSImage {
-                        DispatchQueue.main.async { pendingImages.append(image) }
+                if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { url, _ in
+                        guard let url = url else { return }
+                        let name = url.lastPathComponent
+                        if let text = Self.extractPDFText(from: url) {
+                            DispatchQueue.main.async {
+                                pendingPDFs.append((name: name, text: text))
+                            }
+                        } else {
+                            DispatchQueue.main.async { showPDFError(name) }
+                        }
+                    }
+                } else {
+                    provider.loadObject(ofClass: NSImage.self) { image, _ in
+                        if let image = image as? NSImage {
+                            DispatchQueue.main.async { pendingImages.append(image) }
+                        }
                     }
                 }
             }
@@ -475,19 +528,53 @@ struct ChatDetailView: View {
 
     // MARK: - Image Helpers
 
-    private func pickImage() {
+    private func pickAttachment() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image]
+        panel.allowedContentTypes = [.image, .pdf]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.begin { response in
             guard response == .OK else { return }
             for url in panel.urls {
-                if let image = NSImage(contentsOf: url) {
+                if url.pathExtension.lowercased() == "pdf" {
+                    if let text = Self.extractPDFText(from: url) {
+                        pendingPDFs.append((name: url.lastPathComponent, text: text))
+                    } else {
+                        showPDFError(url.lastPathComponent)
+                    }
+                } else if let image = NSImage(contentsOf: url) {
                     pendingImages.append(image)
                 }
             }
         }
+    }
+
+    /// Returns nil if the PDF is unreadable, encrypted, or contains no extractable text
+    /// (e.g. scanned-image-only PDFs without an OCR layer).
+    static func extractPDFText(from url: URL) -> String? {
+        guard let pdf = PDFDocument(url: url),
+              let text = pdf.string,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return text
+    }
+
+    private func showPDFError(_ name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't read PDF"
+        alert.informativeText = "\(name) is empty, encrypted, or contains only scanned images (no extractable text)."
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
+    /// Build a preamble string that joins all pending PDFs and clears the list.
+    /// Returns "" when nothing is pending.
+    private func consumePendingPDFsAsText() -> String {
+        guard !pendingPDFs.isEmpty else { return "" }
+        let combined = pendingPDFs.map { "[PDF: \($0.name)]\n\($0.text)" }.joined(separator: "\n\n")
+        pendingPDFs = []
+        return combined
     }
 
     /// Convert NSImage to JPEG data suitable for API transport.
@@ -591,10 +678,14 @@ struct ChatDetailView: View {
             return
         }
 
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
-        guard !text.isEmpty || attachedImages != nil, !isGenerating, server.status == .running else { return }
+        let pdfText = consumePendingPDFsAsText()
+        guard !text.isEmpty || attachedImages != nil || !pdfText.isEmpty, !isGenerating, server.status == .running else { return }
         inputText = ""
+        if !pdfText.isEmpty {
+            text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        }
 
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.images = attachedImages
@@ -665,10 +756,14 @@ struct ChatDetailView: View {
     // MARK: - Agent Mode (Native Tool Calling)
 
     private func sendAgentMessage() {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
-        guard !text.isEmpty || attachedImages != nil, !isGenerating, server.status == .running else { return }
+        let pdfText = consumePendingPDFsAsText()
+        guard !text.isEmpty || attachedImages != nil || !pdfText.isEmpty, !isGenerating, server.status == .running else { return }
         inputText = ""
+        if !pdfText.isEmpty {
+            text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        }
 
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.images = attachedImages

@@ -64,9 +64,78 @@ fn releaseInferenceSlot(io: std.Io) void {
 }
 
 const io_util = @import("io_util.zig");
+const ws_mod = @import("ws.zig");
 const nowSecs = io_util.nowSecs;
 const nowMs = io_util.nowMs;
 const Stopwatch = io_util.Stopwatch;
+
+/// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
+/// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
+/// and `sendAnthropicEvent` send the JSON payload as a single WS text frame
+/// instead of an HTTP body or SSE event line.
+pub const WsBridge = struct {
+    impl: *anyopaque,
+    sendTextFn: *const fn (impl: *anyopaque, data: []const u8) anyerror!void,
+    /// Captured response id from the first event seen this turn (for moving
+    /// the entry between global and connection-local caches afterwards).
+    /// Owned by `allocator`; freed by the WS handler at end of turn.
+    captured_resp_id: ?[]u8 = null,
+    allocator: ?std.mem.Allocator = null,
+    /// Status emitted in the most recent `response.completed`-class event,
+    /// or null if no terminal event was seen.
+    captured_status: ?[]u8 = null,
+
+    pub fn sendText(self: *WsBridge, data: []const u8) !void {
+        if (self.captured_resp_id == null) {
+            if (self.allocator) |a| {
+                if (extractResponseId(a, data)) |id| self.captured_resp_id = id;
+            }
+        }
+        if (self.allocator) |a| {
+            if (extractCompletedStatus(a, data)) |st| {
+                if (self.captured_status) |old| a.free(old);
+                self.captured_status = st;
+            }
+        }
+        try self.sendTextFn(self.impl, data);
+    }
+
+    pub fn reset(self: *WsBridge) void {
+        if (self.allocator) |a| {
+            if (self.captured_resp_id) |id| a.free(id);
+            if (self.captured_status) |st| a.free(st);
+        }
+        self.captured_resp_id = null;
+        self.captured_status = null;
+    }
+};
+
+/// Pull the value of the first `"id":"resp_..."` field out of a JSON
+/// payload. Returns an owned copy or null. Used by `WsBridge.sendText` to
+/// learn the response id without parsing the whole envelope.
+fn extractResponseId(allocator: std.mem.Allocator, data: []const u8) ?[]u8 {
+    const needle = "\"id\":\"resp_";
+    const start = std.mem.indexOf(u8, data, needle) orelse return null;
+    const v_start = start + "\"id\":\"".len;
+    const v_end = std.mem.indexOfScalarPos(u8, data, v_start, '"') orelse return null;
+    return allocator.dupe(u8, data[v_start..v_end]) catch null;
+}
+
+/// Pull the value of `"status":"..."` (response-level, not item-level)
+/// from a `response.completed`/`.failed`/`.incomplete` payload.
+fn extractCompletedStatus(allocator: std.mem.Allocator, data: []const u8) ?[]u8 {
+    // Only look in completed/failed/incomplete events.
+    const is_terminal = std.mem.indexOf(u8, data, "\"type\":\"response.completed\"") != null or
+        std.mem.indexOf(u8, data, "\"type\":\"response.failed\"") != null or
+        std.mem.indexOf(u8, data, "\"type\":\"response.incomplete\"") != null;
+    if (!is_terminal) return null;
+    // Status field appears after the response object; first match is fine.
+    const needle = "\"status\":\"";
+    const start = std.mem.indexOf(u8, data, needle) orelse return null;
+    const v_start = start + needle.len;
+    const v_end = std.mem.indexOfScalarPos(u8, data, v_start, '"') orelse return null;
+    return allocator.dupe(u8, data[v_start..v_end]) catch null;
+}
 
 fn startStopwatch(io: std.Io) Stopwatch {
     return Stopwatch.init(io);
@@ -82,12 +151,17 @@ pub const Conn = struct {
     read_buf: [16 * 1024]u8,
     write_state: std.Io.net.Stream.Writer,
     read_state: std.Io.net.Stream.Reader,
+    /// Non-null when this connection is bridged onto a WebSocket. Output that
+    /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
+    /// `sendResponse` / `sendAnthropicEvent` chokepoints.
+    ws_mode: ?*WsBridge = null,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
+        c.ws_mode = null;
     }
 
     pub fn writer(c: *Conn) *std.Io.Writer {
@@ -161,6 +235,10 @@ var global_vision_encoder: ?*VisionEncoder = null;
 /// (e.g. "gemma-4-e4b-it-8bit") so clients can distinguish quantizations.
 var global_model_id: []const u8 = "";
 
+/// Port the HTTP server is bound to. Used by the landing page's curl
+/// example so users can copy-paste a working command.
+var global_port: u16 = 0;
+
 /// Tokenizer-vocabulary byte table for grammar-constrained sampling. Built
 /// lazily on the first JSON-schema request and reused for the lifetime of the
 /// server. Single-threaded inference path means no synchronization is needed.
@@ -228,6 +306,7 @@ pub fn serve(
     max_context_size = ctx_size;
     request_timeout_sec = timeout;
     default_reasoning_budget = reasoning_budget;
+    global_port = port;
     // Use the directory basename as the public model id (e.g. "gemma-4-e4b-it-8bit").
     // Trim any trailing slash, then take everything after the final slash. Falls
     // back to the architecture family if model_dir is empty.
@@ -285,6 +364,7 @@ pub fn serve(
         log.info("Reasoning budget: unlimited\n", .{});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
+    log.info("  GET  /\n", .{});
     log.info("  GET  /health\n", .{});
     log.info("  GET  /props\n", .{});
     log.info("  GET  /v1/models\n", .{});
@@ -293,6 +373,7 @@ pub fn serve(
     log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
+    log.info("  POST /v1/responses/compact\n", .{});
     log.info("  GET  /v1/responses/{{id}}\n", .{});
     log.info("  DEL  /v1/responses/{{id}}\n", .{});
     log.info("  POST /tokenize\n", .{});
@@ -425,10 +506,26 @@ fn handleConnection(
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
     logHttpRequest(method, raw_path, request_body);
 
+    // ── WebSocket upgrade for /v1/responses ──
+    // Detect Upgrade: websocket BEFORE the regular route dispatch so the
+    // GET method (used for the upgrade handshake) doesn't fall through to
+    // the 404 branch.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
+        if (config.is_encoder_only) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+            return;
+        }
+        try handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], xfm, tok, chat_config, config);
+        return;
+    }
+
     if (std.mem.eql(u8, method, "HEAD") and std.mem.eql(u8, path, "/")) {
         // Connectivity check (Claude Code sends HEAD / before any API call)
         log.debug("HEAD / -> 200\n", .{});
         try sendResponse(stream, "200 OK", "text/plain", "");
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
+        log.debug("GET  / -> 200 (status page)\n", .{});
+        try handleStatusPage(allocator, stream, config, chat_config);
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
@@ -494,6 +591,11 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, xfm, tok, chat_config, config);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses/compact")) {
+        // Compaction is a pure data transformation — no inference slot required.
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleResponsesCompact(allocator, stream, body);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
         if (config.is_encoder_only) {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
@@ -770,6 +872,192 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, config: *const model
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// Render the human-friendly landing page at `GET /`. Lists the API
+/// surface (OpenAI Chat + Responses, Anthropic Messages, embeddings,
+/// utility endpoints) and the loaded model's key facts. No JS, no
+/// external assets — single self-contained document.
+fn handleStatusPage(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    config: *const model_mod.ModelConfig,
+    chat_config: *const chat_mod.ChatConfig,
+) !void {
+    const main_mod = @import("main.zig");
+
+    // Memory + capabilities
+    var active_mem: usize = 0;
+    var peak_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    _ = mlx.mlx_get_peak_memory(&peak_mem);
+    const ctx_len = getEffectiveContextLength(config);
+    const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
+    const has_vision = global_vision_encoder != null;
+    const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
+
+    const model_id: []const u8 = if (global_model_id.len > 0) global_model_id else config.model_type;
+    const model_id_esc = try htmlEscape(allocator, model_id);
+    defer allocator.free(model_id_esc);
+    const arch_esc = try htmlEscape(allocator, config.model_type);
+    defer allocator.free(arch_esc);
+    const version_esc = try htmlEscape(allocator, main_mod.VERSION);
+    defer allocator.free(version_esc);
+
+    // Capability pills
+    var caps_buf = std.ArrayList(u8).empty;
+    defer caps_buf.deinit(allocator);
+    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>chat</span>");
+    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>tool use</span>");
+    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>streaming</span>");
+    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>json schema</span>");
+    if (has_vision) try caps_buf.appendSlice(allocator, "<span class=cap>vision</span>");
+    if (has_reasoning) try caps_buf.appendSlice(allocator, "<span class=cap>reasoning</span>");
+    if (config.is_encoder_only) try caps_buf.appendSlice(allocator, "<span class=cap>embeddings</span>");
+
+    const mem_mb: usize = active_mem / (1024 * 1024);
+    const peak_mb: usize = peak_mem / (1024 * 1024);
+
+    const body = try std.fmt.allocPrint(allocator,
+        \\<!doctype html>
+        \\<html lang=en>
+        \\<head>
+        \\<meta charset=utf-8>
+        \\<meta name=viewport content="width=device-width,initial-scale=1">
+        \\<title>mlx-serve — {s}</title>
+        \\<style>
+        \\*{{box-sizing:border-box}}
+        \\body{{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"SF Pro Text",Inter,sans-serif;background:#0b0d10;color:#e6e9ee}}
+        \\.wrap{{max-width:880px;margin:0 auto;padding:32px 20px 64px}}
+        \\h1{{margin:0 0 4px;font-size:22px;font-weight:600;letter-spacing:-.01em}}
+        \\h1 .ver{{color:#7d8794;font-weight:400;font-size:14px;margin-left:8px}}
+        \\.sub{{color:#7d8794;margin-bottom:28px}}
+        \\.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-right:6px;vertical-align:middle;box-shadow:0 0 0 4px rgba(16,185,129,.15)}}
+        \\h2{{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#9aa4b2;margin:24px 0 10px}}
+        \\.card{{background:#13161b;border:1px solid #1f242c;border-radius:10px;padding:14px 16px;margin-bottom:10px}}
+        \\.row{{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid #1a1e25}}
+        \\.row:last-child{{border-bottom:0}}
+        \\.row .k{{color:#9aa4b2}}
+        \\.row .v{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
+        \\.caps{{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}}
+        \\.cap{{background:#1a2330;color:#86b8ff;border:1px solid #1f3a5f;border-radius:999px;padding:2px 10px;font-size:12px}}
+        \\.ep{{display:grid;grid-template-columns:60px 1fr;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid #1a1e25}}
+        \\.ep:last-child{{border-bottom:0}}
+        \\.ep .m{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;letter-spacing:.04em;text-align:center;border-radius:4px;padding:2px 0}}
+        \\.m.get{{background:#173d33;color:#7ee2b8}}
+        \\.m.post{{background:#1c2e57;color:#86b8ff}}
+        \\.m.del{{background:#3d1d23;color:#ff95a8}}
+        \\.m.ws{{background:#3a2a4d;color:#caa6ff}}
+        \\.ep .p{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
+        \\.ep .d{{color:#7d8794;font-size:13px;margin-top:2px}}
+        \\code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#1a1e25;color:#86b8ff;padding:1px 6px;border-radius:4px;font-size:12px}}
+        \\pre{{background:#13161b;border:1px solid #1f242c;border-radius:8px;padding:12px;overflow-x:auto;font-size:12px;color:#cfd6df}}
+        \\a{{color:#86b8ff;text-decoration:none}}
+        \\a:hover{{text-decoration:underline}}
+        \\footer{{margin-top:36px;color:#5b6470;font-size:12px;text-align:center}}
+        \\</style></head><body>
+        \\<div class=wrap>
+        \\<h1><span class=dot></span>mlx-serve<span class=ver>v{s}</span></h1>
+        \\<div class=sub>Native MLX inference for Apple Silicon · No Python · OpenAI &amp; Anthropic compatible</div>
+        \\
+        \\<h2>Loaded model</h2>
+        \\<div class=card>
+        \\<div class=row><span class=k>id</span><span class=v>{s}</span></div>
+        \\<div class=row><span class=k>architecture</span><span class=v>{s}</span></div>
+        \\<div class=row><span class=k>quantization</span><span class=v>{d}-bit (group {d})</span></div>
+        \\<div class=row><span class=k>layers · hidden · heads</span><span class=v>{d} · {d} · {d}/{d}kv</span></div>
+        \\<div class=row><span class=k>head dim · vocab</span><span class=v>{d} · {d}</span></div>
+        \\<div class=row><span class=k>context length</span><span class=v>{d} tokens (model max {d})</span></div>
+        \\<div class=row><span class=k>GPU memory</span><span class=v>{d} MB active · {d} MB peak</span></div>
+        \\<div class=caps>{s}</div>
+        \\</div>
+        \\
+        \\<h2>OpenAI Chat Completions</h2>
+        \\<div class=card>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/chat/completions</div><div class=d>Streaming and non-streaming · tool calling · JSON mode · vision (when supported)</div></div></div>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/completions</div><div class=d>Legacy text completions</div></div></div>
+        \\</div>
+        \\
+        \\<h2>OpenAI Responses</h2>
+        \\<div class=card>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses</div><div class=d>Stateful responses with tool calling · stream/non-stream · vision</div></div></div>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses/compact</div><div class=d>Compact a conversation into a round-trippable opaque blob</div></div></div>
+        \\<div class=ep><span class="m get">GET</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Retrieve a stored response envelope</div></div></div>
+        \\<div class=ep><span class="m del">DEL</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Delete a stored response</div></div></div>
+        \\<div class=ep><span class="m ws">WS</span><div><div class=p>/v1/responses</div><div class=d>WebSocket transport · per-connection store-false cache · sequential turns</div></div></div>
+        \\</div>
+        \\
+        \\<h2>Anthropic Messages</h2>
+        \\<div class=card>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/messages</div><div class=d>Claude SDK / Claude Code compatible · stream &amp; non-stream · tool use · thinking blocks</div></div></div>
+        \\</div>
+        \\
+        \\<h2>Embeddings &amp; utilities</h2>
+        \\<div class=card>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/embeddings</div><div class=d>Vector embeddings (encoder-only models)</div></div></div>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/tokenize</div><div class=d>Tokenize a string</div></div></div>
+        \\<div class=ep><span class="m post">POST</span><div><div class=p>/detokenize</div><div class=d>Detokenize an id sequence</div></div></div>
+        \\</div>
+        \\
+        \\<h2>Discovery</h2>
+        \\<div class=card>
+        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length)</div></div></div>
+        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/props>/props</a></div><div class=d>llama.cpp-style server props (chat template, memory)</div></div></div>
+        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
+        \\</div>
+        \\
+        \\<h2>Quick start</h2>
+        \\<pre>curl http://localhost:{d}/v1/chat/completions \
+        \\  -H 'Content-Type: application/json' \
+        \\  -d '&#123;"model":"{s}","messages":[&#123;"role":"user","content":"hello"&#125;]&#125;'</pre>
+        \\
+        \\<footer>mlx-serve · serving <code>{s}</code></footer>
+        \\</div></body></html>
+    , .{
+        // <title>
+        model_id_esc,
+        // version
+        version_esc,
+        // model card
+        model_id_esc,
+        arch_esc,
+        config.quant_bits,
+        config.quant_group_size,
+        config.num_hidden_layers,
+        config.hidden_size,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.head_dim,
+        config.vocab_size,
+        ctx_len,
+        config.max_position_embeddings,
+        mem_mb,
+        peak_mb,
+        caps_buf.items,
+        // curl example
+        global_port,
+        model_id_esc,
+        // footer
+        model_id_esc,
+    });
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
+}
+
+/// Minimal HTML escape — covers the five chars that matter inside element
+/// content + double-quoted attribute values. Caller frees.
+fn htmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    for (input) |c| switch (c) {
+        '&' => try buf.appendSlice(allocator, "&amp;"),
+        '<' => try buf.appendSlice(allocator, "&lt;"),
+        '>' => try buf.appendSlice(allocator, "&gt;"),
+        '"' => try buf.appendSlice(allocator, "&quot;"),
+        '\'' => try buf.appendSlice(allocator, "&#39;"),
+        else => try buf.append(allocator, c),
+    };
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn handleEmbeddings(
@@ -1224,6 +1512,11 @@ fn handleChatCompletions(
     // Parse response_format — inject JSON schema constraint into system message,
     // and capture the schema value for grammar-constrained sampling below.
     var grammar_schema_val: ?std.json.Value = null;
+    // Backing storage for the synthetic `{"type":"object"}` schema used for
+    // `response_format: {type: "json_object"}`. Lives for the request and is
+    // freed at the bottom; the schema parser arena copies what it needs.
+    var json_object_schema_holder: ?std.json.Parsed(std.json.Value) = null;
+    defer if (json_object_schema_holder) |*p| p.deinit();
     if (root.get("response_format")) |rf| {
         if (rf == .object) {
             const rf_type = if (rf.object.get("type")) |t| (if (t == .string) t.string else "") else "";
@@ -1257,13 +1550,25 @@ fn handleChatCompletions(
                     try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
                 }
             } else if (std.mem.eql(u8, rf_type, "json_object")) {
-                const instruction = "Respond with valid JSON only. No other text, no markdown, no explanation.";
+                const instruction = "Respond with valid JSON only. No other text, no markdown fences (no ``` or ```json), no explanation. Begin your response with `{` or `[`.";
                 if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
                     const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, instruction });
                     try rf_allocs.append(allocator, combined);
                     messages.items[0].content = combined;
                 } else {
                     try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
+                }
+                // Belt + braces: also constrain decoding with a permissive
+                // object schema so the very first token cannot be a leading
+                // backtick (Gemma 4 ignores the prompt-side instruction
+                // otherwise). `additionalProperties: true` allows any keys
+                // and values — `json_object` only constrains JSON-ness, not
+                // a specific shape.
+                if (json_object_schema_holder == null) {
+                    json_object_schema_holder = std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"object\",\"additionalProperties\":true}", .{}) catch null;
+                }
+                if (json_object_schema_holder) |*p| {
+                    grammar_schema_val = p.value;
                 }
             }
         }
@@ -2614,6 +2919,13 @@ fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32, has
 fn sendResponse(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     logHttpResponse(status, content_type, body);
 
+    if (stream.ws_mode) |bridge| {
+        // WS transport: skip HTTP framing, send body as a single text frame.
+        // Compliance suite expects errors as `{"type":"error", ...}` text frames.
+        if (body.len > 0) try bridge.sendText(body);
+        return;
+    }
+
     var hdr_buf: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
         status,
@@ -3167,12 +3479,55 @@ fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []c
 }
 
 fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
+    if (stream.ws_mode) |bridge| {
+        // WS transport: emit only the JSON payload as a text frame; the
+        // event name lives inside the JSON as `"type": "..."`. (Anthropic
+        // events are not currently WS-bridged — only Responses.)
+        try bridge.sendText(data);
+        return;
+    }
     logHttpSseEvent(event_name, data);
     try stream.writeAll("event: ");
     try stream.writeAll(event_name);
     try stream.writeAll("\ndata: ");
     try stream.writeAll(data);
     try stream.writeAll("\n\n");
+}
+
+/// Wrap a Responses-API streaming event payload with `sequence_number` (which
+/// the OpenAI Responses streaming schema requires on every event), then send.
+/// The `payload` is expected to be a JSON object string ending in `}`.
+fn sendResponsesEvent(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    seq: *u64,
+    event_name: []const u8,
+    payload: []const u8,
+) !void {
+    if (payload.len < 2 or payload[0] != '{' or payload[payload.len - 1] != '}') {
+        // Malformed payload — fall back to raw send (defensive; should not happen).
+        try sendAnthropicEvent(stream, event_name, payload);
+        return;
+    }
+    var num_buf: [32]u8 = undefined;
+    const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{seq.*});
+    seq.* += 1;
+    // Detect whether the object has any existing fields (decides leading comma).
+    var has_fields = false;
+    for (payload[1 .. payload.len - 1]) |c| {
+        if (!std.ascii.isWhitespace(c)) {
+            has_fields = true;
+            break;
+        }
+    }
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, payload[0 .. payload.len - 1]);
+    if (has_fields) try buf.append(allocator, ',');
+    try buf.appendSlice(allocator, "\"sequence_number\":");
+    try buf.appendSlice(allocator, num_str);
+    try buf.append(allocator, '}');
+    try sendAnthropicEvent(stream, event_name, buf.items);
 }
 
 fn mapFinishToStopReason(finish_reason: []const u8) []const u8 {
@@ -4417,6 +4772,102 @@ fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
     return parsed.value == .object;
 }
 
+/// Compact a conversation into a single opaque, round-trippable item.
+///
+/// The OpenAI Responses spec treats `encrypted_content` as provider-defined.
+/// We synthesize a base64-encoded JSON envelope of the resolved messages so
+/// the returned `compaction` item can be fed back into `response.create` as
+/// an `input` item — exercising the full round-trip without an LLM call.
+fn handleResponsesCompact(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.warn("POST /v1/responses/compact -> 400 (invalid JSON)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", 400);
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
+    const root = parsed.value.object;
+
+    // ── model (required) ──
+    const model_val = root.get("model");
+    const has_model = model_val != null and model_val.? == .string and model_val.?.string.len > 0;
+    if (!has_model) {
+        try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "model is required", 422);
+        return;
+    }
+
+    // ── input (required) ──
+    const input_val = root.get("input") orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
+        return;
+    };
+
+    // ── instructions (optional) ──
+    const instructions: ?[]const u8 = if (root.get("instructions")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
+
+    // ── previous_response_id (optional) ──
+    const prev_id: ?[]const u8 = if (root.get("previous_response_id")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
+
+    var prev_messages: ?[]const chat_mod.Message = null;
+    if (prev_id) |pid| {
+        const store = getOrInitResponseStore(stream.io, allocator);
+        if (store.get(pid)) |sr| {
+            prev_messages = sr.history;
+        } else {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
+            return;
+        }
+    }
+
+    // ── parse → resolved message history ──
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent) catch |err| {
+        log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
+        return;
+    };
+    defer pi.deinit();
+
+    // ── synthesize the opaque blob ──
+    const blob = try responses_mod.encodeCompactionBlob(allocator, pi.messages.items);
+    defer allocator.free(blob);
+
+    // ── mint ids ──
+    const resp_id = try responses_mod.makeId(stream.io, allocator, "comp");
+    defer allocator.free(resp_id);
+    const item_id = try responses_mod.makeId(stream.io, allocator, "cmp");
+    defer allocator.free(item_id);
+
+    const esc_resp_id = try jsonEscape(allocator, resp_id);
+    defer allocator.free(esc_resp_id);
+    const esc_item_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_item_id);
+    const esc_blob = try jsonEscape(allocator, blob);
+    defer allocator.free(esc_blob);
+
+    const created_ts = nowSecs(stream.io);
+
+    const out = try std.fmt.allocPrint(allocator,
+        \\{{"id":{s},"object":"response.compaction","created_at":{d},"output":[{{"type":"compaction","id":{s},"encrypted_content":{s}}}],"usage":{{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{{"cached_tokens":0}},"output_tokens_details":{{"reasoning_tokens":0}}}}}}
+    , .{ esc_resp_id, created_ts, esc_item_id, esc_blob });
+    defer allocator.free(out);
+
+    log.info("POST /v1/responses/compact ({d} msgs -> {d}b blob)\n", .{ pi.messages.items.len, blob.len });
+    try sendResponse(stream, "200 OK", "application/json", out);
+}
+
 fn handleResponses(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -4474,24 +4925,61 @@ fn handleResponses(
     const has_current_tool_output = responses_mod.inputContainsFunctionCallOutput(input_val);
 
     // ── sampling params ──
-    const max_tokens: u32 = blk: {
+    // Track whether the user explicitly supplied max_output_tokens so we can
+    // echo `null` (vs. our internal default) in the response envelope.
+    const req_max_output_tokens: ?u32 = blk: {
         const v = root.get("max_output_tokens") orelse root.get("max_tokens");
         break :blk if (v) |val| switch (val) {
-            .integer => |i| @intCast(i),
-            else => if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else DEFAULT_API_MAX_TOKENS,
-        } else if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else DEFAULT_API_MAX_TOKENS;
+            .integer => |i| @as(?u32, @intCast(i)),
+            else => null,
+        } else null;
     };
+    const max_tokens: u32 = req_max_output_tokens orelse
+        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else DEFAULT_API_MAX_TOKENS);
     const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
     const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
     const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
         .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
         else => 0,
     } else 0;
-    const repeat_penalty: f32 = blk: {
-        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
-    };
+    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+
+    // ── echo fields (parsed but not consumed by generation; round-tripped
+    // back into the response envelope to satisfy the OpenAI Responses schema) ──
+    const top_logprobs_echo: u32 = if (root.get("top_logprobs")) |v| switch (v) {
+        .integer => |i| if (i >= 0 and i <= 20) @intCast(i) else 0,
+        else => 0,
+    } else 0;
+    const max_tool_calls_echo: ?u32 = if (root.get("max_tool_calls")) |v| switch (v) {
+        .integer => |i| if (i >= 0) @as(?u32, @intCast(i)) else null,
+        else => null,
+    } else null;
+    const truncation_echo: []const u8 = if (root.get("truncation")) |v|
+        (if (v == .string and (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "disabled"))) v.string else "disabled")
+    else
+        "disabled";
+    const parallel_tool_calls_echo: bool = if (root.get("parallel_tool_calls")) |v|
+        (if (v == .bool) v.bool else true)
+    else
+        true;
+    const background_echo: bool = if (root.get("background")) |v|
+        (if (v == .bool) v.bool else false)
+    else
+        false;
+    const service_tier_echo: []const u8 = if (root.get("service_tier")) |v|
+        (if (v == .string) v.string else "default")
+    else
+        "default";
+    const safety_identifier_echo: ?[]const u8 = if (root.get("safety_identifier")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
+    const prompt_cache_key_echo: ?[]const u8 = if (root.get("prompt_cache_key")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
     const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
         .integer => |i| @intCast(i),
         else => null,
@@ -4683,29 +5171,75 @@ fn handleResponses(
     const esc_model = try jsonEscape(allocator, model_name);
     defer allocator.free(esc_model);
 
+    // ── pre-render request echoes (live for both the streaming skeleton
+    // and the final completed envelope) ──
+    const echo_tools_json = try renderResponsesToolsEcho(allocator, root.get("tools"));
+    defer allocator.free(echo_tools_json);
+    const echo_tool_choice_json = try renderResponsesToolChoiceEcho(allocator, root.get("tool_choice"));
+    defer allocator.free(echo_tool_choice_json);
+    const echo_text_json = try renderResponsesTextEcho(allocator, root);
+    defer allocator.free(echo_text_json);
+    const echo_reasoning_json = try renderResponsesReasoningEcho(allocator, root);
+    defer allocator.free(echo_reasoning_json);
+    const echo_metadata_json = try renderResponsesMetadataEcho(allocator, root);
+    defer allocator.free(echo_metadata_json);
+
+    const response_echo = ResponseEcho{
+        .tools_json = echo_tools_json,
+        .tool_choice_json = echo_tool_choice_json,
+        .text_json = echo_text_json,
+        .reasoning_json = echo_reasoning_json,
+        .metadata_json = echo_metadata_json,
+        .instructions = instructions,
+        .truncation = truncation_echo,
+        .service_tier = service_tier_echo,
+        .safety_identifier = safety_identifier_echo,
+        .prompt_cache_key = prompt_cache_key_echo,
+        .temperature = temperature,
+        .top_p = top_p,
+        .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
+        .top_logprobs = top_logprobs_echo,
+        .parallel_tool_calls = parallel_tool_calls_echo,
+        .background = background_echo,
+        .max_output_tokens = req_max_output_tokens,
+        .max_tool_calls = max_tool_calls_echo,
+    };
+
+    // SSE event sequence counter (required field on every Responses streaming event).
+    var seq_num: u64 = 0;
+
     // ── streaming: send SSE headers + response.created + response.in_progress ──
     if (is_stream) {
-        const sse_headers =
-            "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/event-stream\r\n" ++
-            "Cache-Control: no-cache\r\n" ++
-            "Connection: close\r\n" ++
-            "Access-Control-Allow-Origin: *\r\n" ++
-            "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-            "\r\n";
-        try stream.writeAll(sse_headers);
-        logHttpStreamStart("responses");
+        if (stream.ws_mode == null) {
+            const sse_headers =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: text/event-stream\r\n" ++
+                "Cache-Control: no-cache\r\n" ++
+                "Connection: close\r\n" ++
+                "Access-Control-Allow-Origin: *\r\n" ++
+                "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+                "\r\n";
+            try stream.writeAll(sse_headers);
+            logHttpStreamStart("responses");
+        }
 
         // Skeleton envelope (status:in_progress, output:[])
-        const skel = try buildResponsesEnvelope(stream.io, allocator, esc_resp_id, esc_model, "in_progress", "[]", 0, 0, should_store, prev_id, false);
+        const skel = try buildResponsesEnvelope(
+            stream.io, allocator, esc_resp_id, esc_model,
+            "in_progress", "[]",
+            0, 0, 0, 0,
+            should_store, prev_id,
+            false, false, response_echo,
+        );
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
         defer allocator.free(created_payload);
-        try sendAnthropicEvent(stream, "response.created", created_payload);
+        try sendResponsesEvent(allocator, stream, &seq_num, "response.created", created_payload);
         const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel});
         defer allocator.free(ip_payload);
-        try sendAnthropicEvent(stream, "response.in_progress", ip_payload);
+        try sendResponsesEvent(allocator, stream, &seq_num, "response.in_progress", ip_payload);
     }
 
     // ── generate (streaming path: emit deltas live; non-streaming: existing) ──
@@ -4836,10 +5370,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, before);
+                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
                     }
                     if (streamed_reasoning_started) live_output_index += 1;
 
@@ -4855,10 +5389,10 @@ fn handleResponses(
                         if (!streamed_message_started) {
                             streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                             streamed_message_index = live_output_index;
-                            try emitResponsesMessageStart(allocator, stream, streamed_message_index, streamed_message_id.?);
+                            try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
                             streamed_message_started = true;
                         }
-                        try emitResponsesMessageDelta(allocator, stream, streamed_message_index, streamed_message_id.?, content_after);
+                        try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, content_after);
                     }
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
@@ -4871,10 +5405,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
+                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
                         const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
@@ -4887,10 +5421,10 @@ fn handleResponses(
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
-                    try emitResponsesMessageStart(allocator, stream, streamed_message_index, streamed_message_id.?);
+                    try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
                     streamed_message_started = true;
                 }
-                try emitResponsesMessageDelta(allocator, stream, streamed_message_index, streamed_message_id.?, token_text);
+                try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, token_text);
             }
         }
 
@@ -4899,10 +5433,10 @@ fn handleResponses(
             if (!streamed_reasoning_started) {
                 streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                 streamed_reasoning_index = live_output_index;
-                try emitResponsesReasoningStart(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?);
+                try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                 streamed_reasoning_started = true;
             }
-            try emitResponsesReasoningDelta(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
+            try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
         }
 
         result = .{
@@ -4978,13 +5512,13 @@ fn handleResponses(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
-            try emitResponsesReasoningEnd(allocator, stream, streamed_reasoning_index, streamed_reasoning_id.?, rt);
+            try emitResponsesReasoningEnd(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
             defer allocator.free(rid);
             try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
             if (is_stream) {
-                try emitResponsesReasoningEvents(allocator, stream, output_index, rid, rt);
+                try emitResponsesReasoningEvents(allocator, stream, &seq_num, output_index, rid, rt);
             }
         }
         emitted += 1;
@@ -5014,7 +5548,7 @@ fn handleResponses(
             try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
             emitted += 1;
             if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, output_index, fc_id, call_id, tc.name, tc.arguments);
+                try emitResponsesFunctionCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
             }
             output_index += 1;
         }
@@ -5026,13 +5560,13 @@ fn handleResponses(
         if (is_stream and streamed_message_started) {
             // Live deltas already streamed; emit just the closing events.
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-            try emitResponsesMessageEnd(allocator, stream, streamed_message_index, streamed_message_id.?, visible_text);
+            try emitResponsesMessageEnd(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, visible_text);
         } else {
             const mid = try responses_mod.makeId(stream.io, allocator, "msg");
             defer allocator.free(mid);
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
             if (is_stream) {
-                try emitResponsesMessageEvents(allocator, stream, output_index, mid, visible_text);
+                try emitResponsesMessageEvents(allocator, stream, &seq_num, output_index, mid, visible_text);
             }
         }
         emitted += 1;
@@ -5042,6 +5576,8 @@ fn handleResponses(
     try out_buf.append(allocator, ']');
 
     // ── envelope ──
+    const is_incomplete = std.mem.eql(u8, status_str, "incomplete");
+    const is_completed_status = std.mem.eql(u8, status_str, "completed") or is_incomplete;
     const envelope = try buildResponsesEnvelope(
         stream.io,
         allocator,
@@ -5051,9 +5587,13 @@ fn handleResponses(
         out_buf.items,
         result.prompt_tokens,
         result.completion_tokens,
+        cache_result.cached_tokens,
+        0, // reasoning_tokens — not tracked separately yet
         should_store,
         prev_id,
-        std.mem.eql(u8, status_str, "incomplete"),
+        is_incomplete,
+        is_completed_status,
+        response_echo,
     );
     defer allocator.free(envelope);
 
@@ -5068,7 +5608,7 @@ fn handleResponses(
     if (is_stream) {
         const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
         defer allocator.free(completed_payload);
-        try sendAnthropicEvent(stream, "response.completed", completed_payload);
+        try sendResponsesEvent(allocator, stream, &seq_num, "response.completed", completed_payload);
     } else {
         try sendResponse(stream, "200 OK", "application/json", envelope);
     }
@@ -5085,8 +5625,565 @@ fn handleResponses(
     }
 }
 
+// ─── WebSocket transport for /v1/responses ────────────────────────────────
+
+const WsConnT = ws_mod.WsConn(Conn);
+
+/// Connection-local cache for `store: false` continuations on a WS session.
+/// Each entry owns its arena (StoredResponse.deinit frees both).
+const WsLocalCache = struct {
+    map: std.StringHashMapUnmanaged(*responses_mod.StoredResponse) = .{},
+    gpa: std.mem.Allocator,
+
+    fn put(self: *WsLocalCache, sr: *responses_mod.StoredResponse) !void {
+        if (self.map.fetchRemove(sr.id)) |kv| kv.value.deinit();
+        try self.map.put(self.gpa, sr.id, sr);
+    }
+
+    fn get(self: *WsLocalCache, id: []const u8) ?*responses_mod.StoredResponse {
+        return self.map.get(id);
+    }
+
+    fn evict(self: *WsLocalCache, id: []const u8) void {
+        if (self.map.fetchRemove(id)) |kv| kv.value.deinit();
+    }
+
+    fn deinit(self: *WsLocalCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |sr_ptr| sr_ptr.*.deinit();
+        self.map.deinit(self.gpa);
+    }
+};
+
+/// Returns the call_id of the first `function_call_output` input item that
+/// has no matching `function_call` in the prev response's history (or in
+/// the same input list, for parallel tool-call replies). Returns null if
+/// every output has a matching call.
+fn orphanFunctionCallOutputId(
+    input_val: std.json.Value,
+    prev_id: ?[]const u8,
+    local: *WsLocalCache,
+    global: *responses_mod.ResponseStore,
+) ?[]const u8 {
+    if (input_val != .array) return null;
+    // Collect all known call_ids from (a) prev history and (b) current input's
+    // function_call items.
+    var known: std.StringHashMapUnmanaged(void) = .{};
+    defer known.deinit(std.heap.page_allocator);
+    if (prev_id) |pid| blk: {
+        const sr = local.get(pid) orelse global.get(pid) orelse break :blk;
+        for (sr.history) |m| {
+            if (m.tool_calls) |tcs| for (tcs) |tc| {
+                _ = known.put(std.heap.page_allocator, tc.id, {}) catch {};
+            };
+        }
+    }
+    for (input_val.array.items) |item| {
+        if (item != .object) continue;
+        const t_v = item.object.get("type") orelse continue;
+        if (t_v != .string or !std.mem.eql(u8, t_v.string, "function_call")) continue;
+        const cid_v = item.object.get("call_id") orelse continue;
+        if (cid_v == .string) {
+            _ = known.put(std.heap.page_allocator, cid_v.string, {}) catch {};
+        }
+    }
+    // Now check each function_call_output.
+    for (input_val.array.items) |item| {
+        if (item != .object) continue;
+        const t_v = item.object.get("type") orelse continue;
+        if (t_v != .string or !std.mem.eql(u8, t_v.string, "function_call_output")) continue;
+        const cid_v = item.object.get("call_id") orelse return "";
+        if (cid_v != .string) return "";
+        if (!known.contains(cid_v.string)) return cid_v.string;
+    }
+    return null;
+}
+
+fn wsBridgeSend(impl: *anyopaque, data: []const u8) anyerror!void {
+    const ws_conn: *WsConnT = @ptrCast(@alignCast(impl));
+    try ws_conn.writeText(data);
+}
+
+/// Send a JSON error frame for a single WS turn. The compliance suite's
+/// frame handler treats a `{"type":"error"}` text frame as terminal —
+/// emitting a trailing `[DONE]` would land in the *next* turn's bucket
+/// (same bug as success-path: see `handleResponsesWebSocket`).
+fn wsSendErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, status: u32, code: []const u8, message: []const u8) !void {
+    const esc_code = try jsonEscape(allocator, code);
+    defer allocator.free(esc_code);
+    const esc_msg = try jsonEscape(allocator, message);
+    defer allocator.free(esc_msg);
+    const err_frame = try std.fmt.allocPrint(
+        allocator,
+        \\{{"type":"error","status":{d},"error":{{"code":{s},"message":{s}}}}}
+    ,
+        .{ status, esc_code, esc_msg },
+    );
+    defer allocator.free(err_frame);
+    try ws_conn.writeText(err_frame);
+}
+
+/// Drive a WebSocket connection that bridges to /v1/responses.
+///
+/// Each text frame is a `response.create`-shaped JSON message. We translate
+/// it into an HTTP-like body and reuse `handleResponses` (with a
+/// `Conn.ws_mode` bridge) so all SSE events become WS text frames. After
+/// each turn we emit `[DONE]` and wait for the next message on the same
+/// connection, supporting chained `response.create` calls and
+/// `previous_response_id` continuations.
+fn handleResponsesWebSocket(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    headers: []const u8,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    config: *const model_mod.ModelConfig,
+) !void {
+    ws_mod.handshake(stream, headers) catch |err| {
+        log.warn("WS handshake failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    log.info("WS /v1/responses connected\n", .{});
+
+    var ws_conn = WsConnT.init(stream);
+    defer ws_conn.deinit(allocator);
+
+    var local_cache: WsLocalCache = .{ .gpa = allocator };
+    defer local_cache.deinit();
+
+    var bridge: WsBridge = .{ .impl = &ws_conn, .sendTextFn = &wsBridgeSend, .allocator = allocator };
+    defer bridge.reset();
+
+    // Frame loop — one iteration per inbound WS message.
+    while (true) {
+        const msg = ws_conn.readMessage(allocator) catch |err| switch (err) {
+            error.WsClosed => return,
+            error.WsProtocol => {
+                ws_conn.writeClose(1002, "protocol error") catch {};
+                return;
+            },
+            error.WsTooLarge => {
+                ws_conn.writeClose(1009, "message too large") catch {};
+                return;
+            },
+            else => return,
+        };
+        defer allocator.free(msg.payload);
+
+        switch (msg.opcode) {
+            .close => {
+                ws_conn.writeClose(1000, "") catch {};
+                return;
+            },
+            .ping => {
+                try ws_conn.writePong(msg.payload);
+                continue;
+            },
+            .pong => continue,
+            .text => {},
+            else => continue,
+        }
+
+        // Parse the request payload — must be {"type":"response.create", ...}
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, msg.payload, .{}) catch {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Invalid JSON in request body");
+            continue;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Request must be a JSON object");
+            continue;
+        }
+        const root = parsed.value.object;
+        const type_val = root.get("type");
+        if (type_val == null or type_val.? != .string or !std.mem.eql(u8, type_val.?.string, "response.create")) {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Expected type=response.create");
+            continue;
+        }
+        // The plan disallows stream/stream_options/background here — WS is
+        // inherently streaming and stateless (no background jobs).
+        if (root.get("stream") != null or root.get("stream_options") != null or root.get("background") != null) {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "stream/stream_options/background are not allowed over WebSocket");
+            continue;
+        }
+
+        // ── Resolve previous_response_id against per-conn cache first.
+        //    For store:false continuations on this connection, the chain
+        //    root is in `local_cache` only. For store:true responses we
+        //    fall back to the global store (lets stored chains survive
+        //    across connections). On miss, evict any stale local entry
+        //    before reporting the error.
+        const prev_id_owned: ?[]const u8 = if (root.get("previous_response_id")) |v|
+            (if (v == .string) v.string else null)
+        else
+            null;
+        var prev_in_local: bool = false;
+        if (prev_id_owned) |pid| {
+            if (local_cache.get(pid) != null) {
+                prev_in_local = true;
+            } else {
+                const store = getOrInitResponseStore(stream.io, allocator);
+                if (store.get(pid) == null) {
+                    local_cache.evict(pid);
+                    try wsSendErrorTurn(allocator, &ws_conn, 404, "previous_response_not_found", "previous_response_id not found");
+                    continue;
+                }
+            }
+        }
+
+        // Validate any function_call_output items reference real call_ids
+        // in the prev response's history. An orphan output means the user
+        // is trying to feed back a tool result for a call the model never
+        // made — the turn must fail and (per compliance) evict the chain
+        // root from the local cache.
+        if (prev_id_owned) |pid| {
+            if (root.get("input")) |input_v| {
+                if (orphanFunctionCallOutputId(input_v, prev_id_owned, &local_cache, getOrInitResponseStore(stream.io, allocator))) |_| {
+                    local_cache.evict(pid);
+                    try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "function_call_output references a missing call_id");
+                    continue;
+                }
+            }
+        }
+
+        // For store:false continuations on this connection, the chain root
+        // lives in `local_cache` (not the global store). Move it into the
+        // global store *just for this turn* so handleResponses' lookup at
+        // line 4634 can find it. We restore the original location at end
+        // of turn. (The kludge avoids modifying handleResponses.)
+        const did_borrow_to_global = prev_id_owned != null and prev_in_local;
+        if (did_borrow_to_global) {
+            const sr = local_cache.map.get(prev_id_owned.?).?;
+            // Remove from local without freeing.
+            _ = local_cache.map.remove(prev_id_owned.?);
+            const store = getOrInitResponseStore(stream.io, allocator);
+            store.put(sr) catch {};
+        }
+
+        // ── Reserialize the request as an HTTP body, forcing
+        //    `stream: true` (WS is inherently streaming) and `store: true`
+        //    so handleResponses always persists the result. We move the
+        //    entry to local_cache below if the user actually wanted
+        //    `store: false`, achieving connection-scoped lifetime.
+        const want_user_store: bool = if (root.get("store")) |v| (if (v == .bool) v.bool else true) else true;
+        const body = try buildResponsesBodyFromWsRequest(allocator, root);
+        defer allocator.free(body);
+
+        if (!acquireInferenceSlot(stream.io)) {
+            try wsSendErrorTurn(allocator, &ws_conn, 503, "server_error", "Server request queue is full. Try again shortly.");
+            continue;
+        }
+        xfm.useCurrentThreadStream();
+
+        // Reset sequence numbering per response per the OpenAI spec.
+        // (handleResponses owns its own seq_num, fresh each call.)
+        var seq: u64 = 0;
+        _ = &seq;
+
+        stream.ws_mode = &bridge;
+        defer stream.ws_mode = null;
+
+        bridge.reset();
+        handleResponses(allocator, stream, body, xfm, tok, chat_config, config) catch |err| {
+            log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
+            // Best-effort error frame; connection may already be torn.
+            wsSendErrorTurn(allocator, &ws_conn, 500, "server_error", @errorName(err)) catch {};
+            releaseInferenceSlot(stream.io);
+            // Restore borrowed prev entry back to local cache on failure.
+            if (did_borrow_to_global and prev_id_owned != null) {
+                const store = getOrInitResponseStore(stream.io, allocator);
+                if (store.map.fetchRemove(prev_id_owned.?)) |kv| {
+                    store.lru.remove(&kv.value.list_node);
+                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
+                }
+            }
+            continue;
+        };
+        releaseInferenceSlot(stream.io);
+
+        // Handle the borrowed prev: move it back from global to local
+        // cache. On success, also do the eviction-on-failure check —
+        // if the just-completed turn ended in a non-completed status
+        // (failed/incomplete), evict the chain root from local cache.
+        if (did_borrow_to_global and prev_id_owned != null) {
+            const store = getOrInitResponseStore(stream.io, allocator);
+            if (store.map.fetchRemove(prev_id_owned.?)) |kv| {
+                store.lru.remove(&kv.value.list_node);
+                const turn_failed = bridge.captured_status != null and !std.mem.eql(u8, bridge.captured_status.?, "completed");
+                if (turn_failed) {
+                    // Compliance: a failed continuation evicts the chain root.
+                    kv.value.deinit();
+                } else {
+                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
+                }
+            }
+        }
+
+        // For store:false on this WS, move the freshly-stored response
+        // from the global store into the connection-local cache so it
+        // (a) survives the user's `store: false` semantics within this
+        // connection (allowing previous_response_id chains) and
+        // (b) does NOT leak across reconnects (other WS connections
+        // looking up this id should get previous_response_not_found).
+        if (!want_user_store) {
+            if (bridge.captured_resp_id) |rid| {
+                const store = getOrInitResponseStore(stream.io, allocator);
+                if (store.map.fetchRemove(rid)) |kv| {
+                    store.lru.remove(&kv.value.list_node);
+                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
+                }
+            }
+        }
+
+        // No `[DONE]` on the success path: the OpenAI Responses streaming
+        // schema treats `response.completed` (or .failed/.incomplete) as
+        // the per-response terminator, and the compliance suite advances to
+        // the next turn the moment it sees one. A trailing `[DONE]` would
+        // arrive *after* that advance and be misread as the next turn's
+        // marker, killing chained sessions. We still emit `[DONE]` for
+        // error fallbacks (see `wsSendErrorTurn`) where no terminal event
+        // is sent.
+    }
+}
+
+/// Reshape a WS `response.create` JSON object into an OpenAI-Responses HTTP
+/// request body. We strip the `type` discriminator and force both
+/// `stream: true` (WS is inherently streaming) and `store: true` (so
+/// handleResponses persists the response in the global store, where the WS
+/// handler can later move it into the connection-local cache when the user
+/// requested `store: false`).
+fn buildResponsesBodyFromWsRequest(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, '{');
+    var first = true;
+    var stream_seen = false;
+    var store_seen = false;
+    var iter = root.iterator();
+    while (iter.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (std.mem.eql(u8, k, "type")) continue;
+        if (std.mem.eql(u8, k, "stream")) stream_seen = true;
+        if (std.mem.eql(u8, k, "store")) store_seen = true;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        const ek = try jsonEscape(allocator, k);
+        defer allocator.free(ek);
+        try buf.appendSlice(allocator, ek);
+        try buf.append(allocator, ':');
+        if (std.mem.eql(u8, k, "stream") or std.mem.eql(u8, k, "store")) {
+            try buf.appendSlice(allocator, "true");
+        } else {
+            try responses_mod.serializeJsonValue(allocator, &buf, entry.value_ptr.*);
+        }
+    }
+    if (!stream_seen) {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "\"stream\":true");
+    }
+    if (!store_seen) {
+        if (!first) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "\"store\":true");
+    }
+    try buf.append(allocator, '}');
+    return try buf.toOwnedSlice(allocator);
+}
+
+// ─── Response envelope echo helpers ──────────────────────────────────────
+// The OpenAI Responses API ResponseResource schema requires the response to
+// echo most request configuration (tools, tool_choice, text.format, reasoning,
+// metadata, etc.). These helpers re-render those values from the parsed
+// request JSON in the exact shape the schema demands. Caller owns the result.
+
+fn renderResponsesToolsEcho(allocator: std.mem.Allocator, tools_val: ?std.json.Value) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    var emitted: usize = 0;
+    if (tools_val) |tv| if (tv == .array) {
+        for (tv.array.items) |tool_val| {
+            if (tool_val != .object) continue;
+            const tool = tool_val.object;
+            const t = if (tool.get("type")) |x| (if (x == .string) x.string else "") else "";
+            if (!std.mem.eql(u8, t, "function")) continue;
+
+            // Accept both flat (Responses API) and nested-under-"function" (chat-completions) shapes.
+            var fn_obj_opt: ?std.json.ObjectMap = null;
+            if (tool.get("function")) |fv| if (fv == .object) {
+                fn_obj_opt = fv.object;
+            };
+
+            const name_v: ?std.json.Value = tool.get("name") orelse if (fn_obj_opt) |fo| fo.get("name") else null;
+            const desc_v: ?std.json.Value = tool.get("description") orelse if (fn_obj_opt) |fo| fo.get("description") else null;
+            const params_v: ?std.json.Value = tool.get("parameters") orelse if (fn_obj_opt) |fo| fo.get("parameters") else null;
+            const strict_v: ?std.json.Value = tool.get("strict") orelse if (fn_obj_opt) |fo| fo.get("strict") else null;
+
+            if (emitted > 0) try buf.append(allocator, ',');
+            emitted += 1;
+            try buf.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
+            if (name_v) |nv| if (nv == .string) {
+                const e = try jsonEscape(allocator, nv.string);
+                defer allocator.free(e);
+                try buf.appendSlice(allocator, e);
+            } else {
+                try buf.appendSlice(allocator, "\"\"");
+            } else {
+                try buf.appendSlice(allocator, "\"\"");
+            }
+            try buf.appendSlice(allocator, ",\"description\":");
+            if (desc_v) |dv| if (dv == .string) {
+                const e = try jsonEscape(allocator, dv.string);
+                defer allocator.free(e);
+                try buf.appendSlice(allocator, e);
+            } else {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                try buf.appendSlice(allocator, "null");
+            }
+            try buf.appendSlice(allocator, ",\"parameters\":");
+            if (params_v) |pv| if (pv == .object) {
+                try responses_mod.serializeJsonValue(allocator, &buf, pv);
+            } else {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                try buf.appendSlice(allocator, "null");
+            }
+            try buf.appendSlice(allocator, ",\"strict\":");
+            if (strict_v) |sv| if (sv == .bool) {
+                try buf.appendSlice(allocator, if (sv.bool) "true" else "false");
+            } else {
+                try buf.appendSlice(allocator, "null");
+            } else {
+                try buf.appendSlice(allocator, "null");
+            }
+            try buf.append(allocator, '}');
+        }
+    };
+    try buf.append(allocator, ']');
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn renderResponsesToolChoiceEcho(allocator: std.mem.Allocator, tc_val: ?std.json.Value) ![]const u8 {
+    if (tc_val) |v| switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "auto") or std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "required")) {
+                return try std.fmt.allocPrint(allocator, "\"{s}\"", .{s});
+            }
+        },
+        .object => |obj| {
+            const t = if (obj.get("type")) |x| (if (x == .string) x.string else "") else "";
+            if (std.mem.eql(u8, t, "function")) {
+                var name: []const u8 = "";
+                if (obj.get("name")) |x| {
+                    if (x == .string) name = x.string;
+                } else if (obj.get("function")) |fv| if (fv == .object) {
+                    if (fv.object.get("name")) |nv| if (nv == .string) {
+                        name = nv.string;
+                    };
+                };
+                if (name.len > 0) {
+                    const esc = try jsonEscape(allocator, name);
+                    defer allocator.free(esc);
+                    return try std.fmt.allocPrint(allocator, "{{\"type\":\"function\",\"name\":{s}}}", .{esc});
+                }
+                return try allocator.dupe(u8, "{\"type\":\"function\"}");
+            }
+        },
+        else => {},
+    };
+    return try allocator.dupe(u8, "\"auto\"");
+}
+
+fn renderResponsesTextEcho(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]const u8 {
+    if (root.get("text")) |tv| if (tv == .object) {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try responses_mod.serializeJsonValue(allocator, &buf, tv);
+        return try buf.toOwnedSlice(allocator);
+    };
+    if (root.get("response_format")) |rf| if (rf == .object) {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{\"format\":");
+        try responses_mod.serializeJsonValue(allocator, &buf, rf);
+        try buf.append(allocator, '}');
+        return try buf.toOwnedSlice(allocator);
+    };
+    return try allocator.dupe(u8, "{\"format\":{\"type\":\"text\"}}");
+}
+
+fn renderResponsesReasoningEcho(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]const u8 {
+    var effort_buf: [32]u8 = undefined;
+    var effort_str: []const u8 = "null";
+    var summary_str: []const u8 = "null";
+    if (root.get("reasoning")) |rv| if (rv == .object) {
+        if (rv.object.get("effort")) |ev| if (ev == .string) {
+            const s = ev.string;
+            const valid = std.mem.eql(u8, s, "minimal") or
+                std.mem.eql(u8, s, "low") or
+                std.mem.eql(u8, s, "medium") or
+                std.mem.eql(u8, s, "high");
+            if (valid) {
+                effort_str = std.fmt.bufPrint(&effort_buf, "\"{s}\"", .{s}) catch "null";
+            }
+        };
+        if (rv.object.get("summary")) |sv| if (sv == .string) {
+            const s = sv.string;
+            const valid = std.mem.eql(u8, s, "auto") or
+                std.mem.eql(u8, s, "concise") or
+                std.mem.eql(u8, s, "detailed");
+            if (valid) {
+                // share buffer is fine since alloc happens immediately after
+                if (std.mem.eql(u8, s, "auto")) summary_str = "\"auto\""
+                else if (std.mem.eql(u8, s, "concise")) summary_str = "\"concise\""
+                else summary_str = "\"detailed\"";
+            }
+        };
+    };
+    return try std.fmt.allocPrint(allocator, "{{\"effort\":{s},\"summary\":{s}}}", .{ effort_str, summary_str });
+}
+
+fn renderResponsesMetadataEcho(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]const u8 {
+    if (root.get("metadata")) |mv| if (mv == .object) {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        try responses_mod.serializeJsonValue(allocator, &buf, mv);
+        return try buf.toOwnedSlice(allocator);
+    };
+    return try allocator.dupe(u8, "{}");
+}
+
+/// Echoed-back fields that round out the OpenAI Responses envelope.
+/// Owned by the caller (POST handler); freed after the final envelope is built.
+const ResponseEcho = struct {
+    // Pre-rendered JSON fragments (raw object/array text — caller owns).
+    tools_json: []const u8 = "[]",
+    tool_choice_json: []const u8 = "\"auto\"",
+    text_json: []const u8 = "{\"format\":{\"type\":\"text\"}}",
+    reasoning_json: []const u8 = "{\"effort\":null,\"summary\":null}",
+    metadata_json: []const u8 = "{}",
+    // Plain values; serialized inline.
+    instructions: ?[]const u8 = null,
+    truncation: []const u8 = "disabled",
+    service_tier: []const u8 = "default",
+    safety_identifier: ?[]const u8 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    temperature: f32 = 1.0,
+    top_p: f32 = 1.0,
+    presence_penalty: f32 = 0.0,
+    frequency_penalty: f32 = 0.0,
+    top_logprobs: u32 = 0,
+    parallel_tool_calls: bool = true,
+    background: bool = false,
+    max_output_tokens: ?u32 = null,
+    max_tool_calls: ?u32 = null,
+};
+
 /// Build the Responses envelope JSON body. Used for both the response.created
 /// skeleton (in_progress, output:[]) and the final response.completed body.
+/// Shape matches the OpenAI Responses API ResponseResource schema.
 fn buildResponsesEnvelope(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -5096,40 +6193,157 @@ fn buildResponsesEnvelope(
     output_json: []const u8,
     input_tokens: u32,
     output_tokens: u32,
+    cached_input_tokens: u32,
+    reasoning_output_tokens: u32,
     should_store: bool,
     prev_id: ?[]const u8,
     incomplete: bool,
+    completed: bool,
+    echo: ResponseEcho,
 ) ![]const u8 {
-    const incomplete_json: []const u8 = if (incomplete)
-        ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"
-    else
-        ",\"incomplete_details\":null";
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    var num_buf: [32]u8 = undefined;
 
-    var prev_field: []const u8 = ",\"previous_response_id\":null";
-    var prev_owned = false;
+    try buf.append(allocator, '{');
+    try buf.appendSlice(allocator, "\"id\":");
+    try buf.appendSlice(allocator, esc_resp_id);
+
+    try buf.appendSlice(allocator, ",\"object\":\"response\",\"created_at\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{nowSecs(io)}));
+
+    if (completed) {
+        try buf.appendSlice(allocator, ",\"completed_at\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{nowSecs(io)}));
+    } else {
+        try buf.appendSlice(allocator, ",\"completed_at\":null");
+    }
+
+    try buf.appendSlice(allocator, ",\"status\":\"");
+    try buf.appendSlice(allocator, status_str);
+    try buf.append(allocator, '"');
+
+    if (incomplete) {
+        try buf.appendSlice(allocator, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
+    } else {
+        try buf.appendSlice(allocator, ",\"incomplete_details\":null");
+    }
+
+    try buf.appendSlice(allocator, ",\"model\":");
+    try buf.appendSlice(allocator, esc_model);
+
     if (prev_id) |pid| {
         const esc_pid = try jsonEscape(allocator, pid);
         defer allocator.free(esc_pid);
-        prev_field = try std.fmt.allocPrint(allocator, ",\"previous_response_id\":{s}", .{esc_pid});
-        prev_owned = true;
+        try buf.appendSlice(allocator, ",\"previous_response_id\":");
+        try buf.appendSlice(allocator, esc_pid);
+    } else {
+        try buf.appendSlice(allocator, ",\"previous_response_id\":null");
     }
-    defer if (prev_owned) allocator.free(prev_field);
 
-    return try std.fmt.allocPrint(allocator,
-        \\{{"id":{s},"object":"response","created_at":{d},"status":"{s}","model":{s},"output":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"total_tokens":{d}}},"store":{}{s}{s}}}
-    , .{
-        esc_resp_id,
-        nowSecs(io),
-        status_str,
-        esc_model,
-        output_json,
-        input_tokens,
-        output_tokens,
-        input_tokens + output_tokens,
-        should_store,
-        prev_field,
-        incomplete_json,
-    });
+    if (echo.instructions) |s| {
+        const esc = try jsonEscape(allocator, s);
+        defer allocator.free(esc);
+        try buf.appendSlice(allocator, ",\"instructions\":");
+        try buf.appendSlice(allocator, esc);
+    } else {
+        try buf.appendSlice(allocator, ",\"instructions\":null");
+    }
+
+    try buf.appendSlice(allocator, ",\"output\":");
+    try buf.appendSlice(allocator, output_json);
+
+    try buf.appendSlice(allocator, ",\"error\":null");
+
+    try buf.appendSlice(allocator, ",\"tools\":");
+    try buf.appendSlice(allocator, echo.tools_json);
+
+    try buf.appendSlice(allocator, ",\"tool_choice\":");
+    try buf.appendSlice(allocator, echo.tool_choice_json);
+
+    try buf.appendSlice(allocator, ",\"truncation\":\"");
+    try buf.appendSlice(allocator, echo.truncation);
+    try buf.append(allocator, '"');
+
+    try buf.appendSlice(allocator, ",\"parallel_tool_calls\":");
+    try buf.appendSlice(allocator, if (echo.parallel_tool_calls) "true" else "false");
+
+    try buf.appendSlice(allocator, ",\"text\":");
+    try buf.appendSlice(allocator, echo.text_json);
+
+    try buf.appendSlice(allocator, ",\"top_p\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{echo.top_p}));
+    try buf.appendSlice(allocator, ",\"presence_penalty\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{echo.presence_penalty}));
+    try buf.appendSlice(allocator, ",\"frequency_penalty\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{echo.frequency_penalty}));
+    try buf.appendSlice(allocator, ",\"top_logprobs\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{echo.top_logprobs}));
+    try buf.appendSlice(allocator, ",\"temperature\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{echo.temperature}));
+
+    try buf.appendSlice(allocator, ",\"reasoning\":");
+    try buf.appendSlice(allocator, echo.reasoning_json);
+
+    try buf.appendSlice(allocator, ",\"usage\":{\"input_tokens\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{input_tokens}));
+    try buf.appendSlice(allocator, ",\"output_tokens\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{output_tokens}));
+    try buf.appendSlice(allocator, ",\"total_tokens\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{input_tokens + output_tokens}));
+    try buf.appendSlice(allocator, ",\"input_tokens_details\":{\"cached_tokens\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{cached_input_tokens}));
+    try buf.appendSlice(allocator, "},\"output_tokens_details\":{\"reasoning_tokens\":");
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{reasoning_output_tokens}));
+    try buf.appendSlice(allocator, "}}");
+
+    if (echo.max_output_tokens) |n| {
+        try buf.appendSlice(allocator, ",\"max_output_tokens\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{n}));
+    } else {
+        try buf.appendSlice(allocator, ",\"max_output_tokens\":null");
+    }
+
+    if (echo.max_tool_calls) |n| {
+        try buf.appendSlice(allocator, ",\"max_tool_calls\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{n}));
+    } else {
+        try buf.appendSlice(allocator, ",\"max_tool_calls\":null");
+    }
+
+    try buf.appendSlice(allocator, ",\"store\":");
+    try buf.appendSlice(allocator, if (should_store) "true" else "false");
+
+    try buf.appendSlice(allocator, ",\"background\":");
+    try buf.appendSlice(allocator, if (echo.background) "true" else "false");
+
+    try buf.appendSlice(allocator, ",\"service_tier\":\"");
+    try buf.appendSlice(allocator, echo.service_tier);
+    try buf.append(allocator, '"');
+
+    try buf.appendSlice(allocator, ",\"metadata\":");
+    try buf.appendSlice(allocator, echo.metadata_json);
+
+    if (echo.safety_identifier) |s| {
+        const esc = try jsonEscape(allocator, s);
+        defer allocator.free(esc);
+        try buf.appendSlice(allocator, ",\"safety_identifier\":");
+        try buf.appendSlice(allocator, esc);
+    } else {
+        try buf.appendSlice(allocator, ",\"safety_identifier\":null");
+    }
+
+    if (echo.prompt_cache_key) |s| {
+        const esc = try jsonEscape(allocator, s);
+        defer allocator.free(esc);
+        try buf.appendSlice(allocator, ",\"prompt_cache_key\":");
+        try buf.appendSlice(allocator, esc);
+    } else {
+        try buf.appendSlice(allocator, ",\"prompt_cache_key\":null");
+    }
+
+    try buf.append(allocator, '}');
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Emit output_item.added (type=reasoning) + reasoning_summary_part.added.
@@ -5137,6 +6351,7 @@ fn buildResponsesEnvelope(
 fn emitResponsesReasoningStart(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
 ) !void {
@@ -5147,14 +6362,14 @@ fn emitResponsesReasoningStart(
             \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"reasoning","id":{s},"summary":[]}}}}
         , .{ output_index, esc_id });
         defer allocator.free(item_added);
-        try sendAnthropicEvent(stream, "response.output_item.added", item_added);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
     }
     {
         const part_added = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.reasoning_summary_part.added","item_id":{s},"output_index":{d},"summary_index":0,"part":{{"type":"summary_text","text":""}}}}
         , .{ esc_id, output_index });
         defer allocator.free(part_added);
-        try sendAnthropicEvent(stream, "response.reasoning_summary_part.added", part_added);
+        try sendResponsesEvent(allocator, stream, seq, "response.reasoning_summary_part.added", part_added);
     }
 }
 
@@ -5162,6 +6377,7 @@ fn emitResponsesReasoningStart(
 fn emitResponsesReasoningDelta(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
     delta_text: []const u8,
@@ -5175,13 +6391,14 @@ fn emitResponsesReasoningDelta(
         \\{{"type":"response.reasoning_summary_text.delta","item_id":{s},"output_index":{d},"summary_index":0,"delta":{s}}}
     , .{ esc_id, output_index, esc_delta });
     defer allocator.free(delta);
-    try sendAnthropicEvent(stream, "response.reasoning_summary_text.delta", delta);
+    try sendResponsesEvent(allocator, stream, seq, "response.reasoning_summary_text.delta", delta);
 }
 
 /// Emit reasoning_summary_text.done + reasoning_summary_part.done + output_item.done.
 fn emitResponsesReasoningEnd(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
     full_text: []const u8,
@@ -5195,21 +6412,21 @@ fn emitResponsesReasoningEnd(
             \\{{"type":"response.reasoning_summary_text.done","item_id":{s},"output_index":{d},"summary_index":0,"text":{s}}}
         , .{ esc_id, output_index, esc_text });
         defer allocator.free(done);
-        try sendAnthropicEvent(stream, "response.reasoning_summary_text.done", done);
+        try sendResponsesEvent(allocator, stream, seq, "response.reasoning_summary_text.done", done);
     }
     {
         const part_done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.reasoning_summary_part.done","item_id":{s},"output_index":{d},"summary_index":0,"part":{{"type":"summary_text","text":{s}}}}}
         , .{ esc_id, output_index, esc_text });
         defer allocator.free(part_done);
-        try sendAnthropicEvent(stream, "response.reasoning_summary_part.done", part_done);
+        try sendResponsesEvent(allocator, stream, seq, "response.reasoning_summary_part.done", part_done);
     }
     {
         const item_done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"reasoning","id":{s},"summary":[{{"type":"summary_text","text":{s}}}]}}}}
         , .{ output_index, esc_id, esc_text });
         defer allocator.free(item_done);
-        try sendAnthropicEvent(stream, "response.output_item.done", item_done);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
     }
 }
 
@@ -5218,13 +6435,14 @@ fn emitResponsesReasoningEnd(
 fn emitResponsesReasoningEvents(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
     reasoning_text: []const u8,
 ) !void {
-    try emitResponsesReasoningStart(allocator, stream, output_index, item_id);
-    try emitResponsesReasoningDelta(allocator, stream, output_index, item_id, reasoning_text);
-    try emitResponsesReasoningEnd(allocator, stream, output_index, item_id, reasoning_text);
+    try emitResponsesReasoningStart(allocator, stream, seq, output_index, item_id);
+    try emitResponsesReasoningDelta(allocator, stream, seq, output_index, item_id, reasoning_text);
+    try emitResponsesReasoningEnd(allocator, stream, seq, output_index, item_id, reasoning_text);
 }
 
 /// Emit the SSE event sequence for a function_call output item: output_item.added,
@@ -5232,6 +6450,7 @@ fn emitResponsesReasoningEvents(
 fn emitResponsesFunctionCallEvents(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     fc_id: []const u8,
     call_id: []const u8,
@@ -5252,28 +6471,28 @@ fn emitResponsesFunctionCallEvents(
             \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":"","status":"in_progress"}}}}
         , .{ output_index, esc_id, esc_call, esc_name });
         defer allocator.free(item_added);
-        try sendAnthropicEvent(stream, "response.output_item.added", item_added);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
     }
     {
         const delta = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.function_call_arguments.delta","item_id":{s},"output_index":{d},"delta":{s}}}
         , .{ esc_id, output_index, esc_args });
         defer allocator.free(delta);
-        try sendAnthropicEvent(stream, "response.function_call_arguments.delta", delta);
+        try sendResponsesEvent(allocator, stream, seq, "response.function_call_arguments.delta", delta);
     }
     {
         const done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.function_call_arguments.done","item_id":{s},"output_index":{d},"arguments":{s}}}
         , .{ esc_id, output_index, esc_args });
         defer allocator.free(done);
-        try sendAnthropicEvent(stream, "response.function_call_arguments.done", done);
+        try sendResponsesEvent(allocator, stream, seq, "response.function_call_arguments.done", done);
     }
     {
         const item_done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":{s},"status":"completed"}}}}
         , .{ output_index, esc_id, esc_call, esc_name, esc_args });
         defer allocator.free(item_done);
-        try sendAnthropicEvent(stream, "response.output_item.done", item_done);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
     }
 }
 
@@ -5282,6 +6501,7 @@ fn emitResponsesFunctionCallEvents(
 fn emitResponsesMessageStart(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
 ) !void {
@@ -5292,14 +6512,14 @@ fn emitResponsesMessageStart(
             \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"message","id":{s},"role":"assistant","status":"in_progress","content":[]}}}}
         , .{ output_index, esc_id });
         defer allocator.free(item_added);
-        try sendAnthropicEvent(stream, "response.output_item.added", item_added);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
     }
     {
         const part_added = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.content_part.added","item_id":{s},"output_index":{d},"content_index":0,"part":{{"type":"output_text","text":"","annotations":[]}}}}
         , .{ esc_id, output_index });
         defer allocator.free(part_added);
-        try sendAnthropicEvent(stream, "response.content_part.added", part_added);
+        try sendResponsesEvent(allocator, stream, seq, "response.content_part.added", part_added);
     }
 }
 
@@ -5307,6 +6527,7 @@ fn emitResponsesMessageStart(
 fn emitResponsesMessageDelta(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
     delta_text: []const u8,
@@ -5320,13 +6541,14 @@ fn emitResponsesMessageDelta(
         \\{{"type":"response.output_text.delta","item_id":{s},"output_index":{d},"content_index":0,"delta":{s}}}
     , .{ esc_id, output_index, esc_delta });
     defer allocator.free(delta);
-    try sendAnthropicEvent(stream, "response.output_text.delta", delta);
+    try sendResponsesEvent(allocator, stream, seq, "response.output_text.delta", delta);
 }
 
 /// Emit output_text.done + content_part.done + output_item.done.
 fn emitResponsesMessageEnd(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
     full_text: []const u8,
@@ -5340,21 +6562,21 @@ fn emitResponsesMessageEnd(
             \\{{"type":"response.output_text.done","item_id":{s},"output_index":{d},"content_index":0,"text":{s}}}
         , .{ esc_id, output_index, esc_text });
         defer allocator.free(done);
-        try sendAnthropicEvent(stream, "response.output_text.done", done);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_text.done", done);
     }
     {
         const part_done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.content_part.done","item_id":{s},"output_index":{d},"content_index":0,"part":{{"type":"output_text","text":{s},"annotations":[]}}}}
         , .{ esc_id, output_index, esc_text });
         defer allocator.free(part_done);
-        try sendAnthropicEvent(stream, "response.content_part.done", part_done);
+        try sendResponsesEvent(allocator, stream, seq, "response.content_part.done", part_done);
     }
     {
         const item_done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"message","id":{s},"role":"assistant","status":"completed","content":[{{"type":"output_text","text":{s},"annotations":[]}}]}}}}
         , .{ output_index, esc_id, esc_text });
         defer allocator.free(item_done);
-        try sendAnthropicEvent(stream, "response.output_item.done", item_done);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
     }
 }
 
@@ -5363,13 +6585,14 @@ fn emitResponsesMessageEnd(
 fn emitResponsesMessageEvents(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    seq: *u64,
     output_index: u32,
     item_id: []const u8,
     text: []const u8,
 ) !void {
-    try emitResponsesMessageStart(allocator, stream, output_index, item_id);
-    try emitResponsesMessageDelta(allocator, stream, output_index, item_id, text);
-    try emitResponsesMessageEnd(allocator, stream, output_index, item_id, text);
+    try emitResponsesMessageStart(allocator, stream, seq, output_index, item_id);
+    try emitResponsesMessageDelta(allocator, stream, seq, output_index, item_id, text);
+    try emitResponsesMessageEnd(allocator, stream, seq, output_index, item_id, text);
 }
 
 /// Persist a finished response to the in-memory store. The stored history is

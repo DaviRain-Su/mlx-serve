@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 @MainActor
 class DownloadManager: ObservableObject {
@@ -37,6 +38,25 @@ class DownloadManager: ObservableObject {
         let path = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         return path
+    }()
+
+    /// LM Studio's downloads root, resolved once at app launch.
+    /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
+    /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
+    let lmStudioRoot: String? = {
+        let settingsPath = NSString(string: "~/.lmstudio/settings.json").expandingTildeInPath
+        let configured: String? = {
+            guard let data = FileManager.default.contents(atPath: settingsPath),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let folder = json["downloadsFolder"] as? String,
+                  !folder.isEmpty else { return nil }
+            return (folder as NSString).expandingTildeInPath
+        }()
+        let fallback = NSString(string: "~/.lmstudio/models").expandingTildeInPath
+        let candidate = configured ?? fallback
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else { return nil }
+        return candidate
     }()
 
     /// Check if a model has all required files for loading.
@@ -231,8 +251,24 @@ class DownloadManager: ObservableObject {
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
                                                fileIndex: neededFiles.count, fileCount: neededFiles.count)
         } catch {
-            downloads[repoId] = DownloadState(status: .failed, error: error.localizedDescription)
+            let message = error.localizedDescription
+            downloads[repoId] = DownloadState(status: .failed, error: message)
+            if !(error is CancellationError) {
+                presentFailureAlert(repoId: repoId, message: message)
+            }
         }
+    }
+
+    private func presentFailureAlert(repoId: String, message: String) {
+        let modelName = repoId.components(separatedBy: "/").last ?? repoId
+        let alert = NSAlert()
+        alert.messageText = "Download Failed: \(modelName)"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        // LSUIElement app — bring focus to make sure the alert is visible.
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     /// Stream download directly to a file on disk (survives interruptions).
@@ -284,39 +320,62 @@ class DownloadManager: ObservableObject {
         return entries.contains { $0.hasSuffix(".partial") }
     }
 
-    func discoverLocalModels() -> [LocalModel] {
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: modelsDir) else {
-            return []
+    private func makeLocalModel(at dirPath: String, displayName: String, idKey: String, source: LocalModelSource) -> LocalModel? {
+        let resolved = (dirPath as NSString).resolvingSymlinksInPath
+        let configPath = (resolved as NSString).appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configPath) else { return nil }
+
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
+        guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return nil }
+
+        var modelType = "unknown"
+        if let data = FileManager.default.contents(atPath: configPath),
+           let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let mt = cfg["model_type"] as? String {
+            modelType = mt
         }
-        return entries.compactMap { name in
-            guard !name.hasPrefix(".") else { return nil }
-            var dirPath = (modelsDir as NSString).appendingPathComponent(name)
-            dirPath = (dirPath as NSString).resolvingSymlinksInPath
 
-            let configPath = (dirPath as NSString).appendingPathComponent("config.json")
-            guard FileManager.default.fileExists(atPath: configPath) else { return nil }
+        let size = directorySize(resolved)
+        return LocalModel(
+            id: "\(source.rawValue):\(idKey)",
+            name: displayName,
+            path: resolved,
+            sizeFormatted: MemoryInfo.format(Int64(size)),
+            modelType: modelType,
+            source: source
+        )
+    }
 
-            let dirEntries = (try? FileManager.default.contentsOfDirectory(atPath: dirPath)) ?? []
-            let hasSafetensors = dirEntries.contains { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }
-            guard hasSafetensors else { return nil }
+    func discoverLocalModels() -> [LocalModel] {
+        var out: [LocalModel] = []
 
-            // Read model_type from config.json
-            var modelType = "unknown"
-            if let configData = FileManager.default.contents(atPath: configPath),
-               let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
-               let mt = config["model_type"] as? String {
-                modelType = mt
+        // ~/.mlx-serve/models — one level deep
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: modelsDir) {
+            for name in entries where !name.hasPrefix(".") {
+                let p = (modelsDir as NSString).appendingPathComponent(name)
+                if let m = makeLocalModel(at: p, displayName: name, idKey: name, source: .mlxServe) {
+                    out.append(m)
+                }
             }
+        }
 
-            let size = directorySize(dirPath)
-            return LocalModel(
-                id: name,
-                name: name,
-                path: dirPath,
-                sizeFormatted: MemoryInfo.format(Int64(size)),
-                modelType: modelType
-            )
-        }.sorted { $0.name < $1.name }
+        // LM Studio — two levels deep: <root>/<publisher>/<repo>/
+        if let root = lmStudioRoot,
+           let pubs = try? FileManager.default.contentsOfDirectory(atPath: root) {
+            for pub in pubs where !pub.hasPrefix(".") {
+                let pubPath = (root as NSString).appendingPathComponent(pub)
+                guard let repos = try? FileManager.default.contentsOfDirectory(atPath: pubPath) else { continue }
+                for repo in repos where !repo.hasPrefix(".") {
+                    let repoPath = (pubPath as NSString).appendingPathComponent(repo)
+                    let display = "\(pub)/\(repo)"
+                    if let m = makeLocalModel(at: repoPath, displayName: display, idKey: display, source: .lmStudio) {
+                        out.append(m)
+                    }
+                }
+            }
+        }
+
+        return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     func removeIncomplete(repoId: String) {

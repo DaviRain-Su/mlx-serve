@@ -24,6 +24,8 @@ brew install mlx-serve          # CLI server only
 ## Features
 
 - OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
+- OpenAI Responses API (`/v1/responses`) — stateful chains via `previous_response_id`, streaming SSE with `sequence_number`, plus `/v1/responses/compact` for opaque round-trippable history blobs
+- WebSocket transport on `/v1/responses` — same JSON-per-frame contract over `Upgrade: websocket`
 - Anthropic-compatible API (`/v1/messages`) — works with Claude Code
 - Streaming and non-streaming responses
 - Tool calling (function calling) with automatic detection
@@ -38,8 +40,8 @@ brew install mlx-serve          # CLI server only
 
 Menu bar app that wraps the server with a full UI:
 
-- **Model browser** -- download models from HuggingFace with resumable downloads
-- **Chat interface** -- multi-session chat with markdown rendering
+- **Model browser** -- download models from HuggingFace with resumable downloads. Auto-discovers models from LM Studio (reads `~/.lmstudio/settings.json` `downloadsFolder`); they appear in a separate "Other Discovered Models" section in the picker so you don't re-download what's already on disk.
+- **Chat interface** -- multi-session chat with markdown rendering. Drop in PDFs or images alongside text; PDFs are extracted via PDFKit and inlined into the prompt.
 - **Agent mode** -- 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop
 - **Editable system prompt** -- customize agent behavior via `~/.mlx-serve/system-prompt.md` (Agent menu → Edit System Prompt)
 - **Persistent memory** -- agent can save memories across sessions to `~/.mlx-serve/memory.md`
@@ -192,12 +194,27 @@ curl http://localhost:8080/v1/messages \
 
 Compatible with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:8080 claude`) and Anthropic SDKs. Supports streaming, tool calling, and extended thinking.
 
+### POST /v1/responses (OpenAI Responses API)
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-serve",
+    "input": "Write a haiku about programming.",
+    "stream": true
+  }'
+```
+
+Stateful chains via `previous_response_id`, full streaming SSE with per-event `sequence_number`, schema-conformant envelope with `tools` / `tool_choice` / `text` / `reasoning` / `usage` echo. `POST /v1/responses/compact` returns an opaque base64 history blob that round-trips back as a `compaction` input item without any LLM call. Same endpoint also accepts an `Upgrade: websocket` handshake — each text frame is a `response.create` JSON message, and each SSE event becomes one outbound text frame.
+
 ### Other endpoints
 
 - `GET /health` -- health check
 - `GET /v1/models` -- list loaded models
 - `POST /v1/completions` -- text completions
 - `POST /v1/messages` -- Anthropic Messages API
+- `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` -- fetch / delete stored responses
 
 ## Performance
 
@@ -205,8 +222,8 @@ Benchmarked on Apple M4 (16 GB unified memory):
 
 | Model | Prefill | Decode | Memory |
 |---|---|---|---|
-| Gemma-4 E4B (4-bit) | ~390 tok/s | ~32 tok/s | 4.3 GB |
-| Qwen3.5-4B (4-bit) | ~155 tok/s | ~33 tok/s | 2.4 GB |
+| Gemma-4 E4B (4-bit) | ~390 tok/s | ~33 tok/s | 4.3 GB |
+| Qwen3.5-4B (4-bit) | ~380 tok/s | ~38 tok/s | 2.3 GB |
 | LFM2.5-350M (8-bit) | ~3800 tok/s | ~210 tok/s | 0.4 GB |
 | Nemotron-3-Nano-4B (8-bit) | -- | ~22 tok/s | 4.3 GB |
 

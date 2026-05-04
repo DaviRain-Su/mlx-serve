@@ -9,7 +9,15 @@ class AppState: ObservableObject {
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
     @Published var selectedModelPath: String = "" {
-        didSet { UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath") }
+        didSet {
+            UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
+            guard oldValue != selectedModelPath, !selectedModelPath.isEmpty else { return }
+            // If the server is up with a different model, restart it with the new one.
+            if server.status == .running || server.status == .starting {
+                server.stop()
+                server.start(modelPath: selectedModelPath, contextSize: contextSize)
+            }
+        }
     }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?

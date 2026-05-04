@@ -45,6 +45,45 @@ Write a detailed essay about quantum computing
 
 ---
 
+## 2026-05-04 — v26.5.1: Responses API + WebSockets, tokenizer arena fix
+
+**Changes since 2026-04-16**:
+- `loadTokenizer` keeps the parsed `tokenizer.json` arena alive and borrows vocab/merge string pointers from it (no per-entry dupe). Pre-sized hashmaps to skip rehashing.
+- New `/v1/responses` (Responses API + compaction) and WebSocket transport on `/v1/responses` — exercise the same forward-pass code path, no inference change expected.
+
+### mlx-serve
+
+| Model | Prefill (tok/s) | Decode (tok/s) | Memory |
+|---|---|---|---|
+| Gemma-4-E4B-4bit | 388.0 | 33.5 | 4.344 GB |
+| LFM2.5-350M-8bit | 3825.6 | 214.3 | 0.406 GB |
+| Qwen3.5-4B-4bit | 382.9 | 37.8 | 2.266 GB |
+
+### Δ vs 2026-04-16
+
+| Model | Prefill | Decode | Memory |
+|---|---|---|---|
+| Gemma-4-E4B-4bit | +5.2% (368.7 → 388.0) | +5.3% (31.8 → 33.5) | ≈ same |
+| LFM2.5-350M-8bit | +4.4% (3666.0 → 3825.6) | +4.9% (204.3 → 214.3) | same |
+| Qwen3.5-4B-4bit | **+165% (144.3 → 382.9)** | +15.2% (32.8 → 37.8) | -6.0% |
+
+### Analysis
+
+- **Qwen3.5 prefill jump is the headline**: 144 → 383 tok/s on 844-token prompts, now ~93% of mlx-lm 0.31.2's reference (410). The previous gap was attributed to per-timestep GatedDeltaNet recurrence vs mlx-lm's parallel scan, but no SSM/scan code changed — the fix is the tokenizer arena change. The old 2026-04-16 measurement included tokenizer-load time inside the prefill metric, and the per-timestep `allocator.dupe` over 144k vocab + ~150k merges was eating multiple seconds of wall-clock per warmup run. With borrow-from-arena, that overhead vanishes.
+- **Gemma / LFM gains** (~5%) are within run-to-run thermal variance from the same effect on smaller string tables. Real but minor.
+- **Decode is unchanged** in absolute terms — small movements (Gemma 31.8 → 33.5, Qwen 32.8 → 37.8) are within the typical noise floor of 256-token decode runs on a 16 GB M4. No code on the decode hot path changed.
+- **No regressions** from the +1395 lines of `server.zig` for Responses/WebSocket — those endpoints don't touch the chat-completions forward pass that bench.sh exercises.
+
+### Reference (mlx-lm 0.31.2, 2026-04-16, unchanged)
+
+| Model | Prefill (tok/s) | Decode (tok/s) | Memory |
+|---|---|---|---|
+| Gemma-4-E4B-4bit | 559.1 | 31.6 | 4.316 GB |
+| LFM2.5-350M-8bit | 4303.2 | 232.0 | 0.421 GB |
+| Qwen3.5-4B-4bit | 409.8 | 36.6 | 2.476 GB |
+
+---
+
 ## 2026-04-16 — Nemotron-H SSM precision fix + time_step_limit fix
 
 **Commit**: `dfd66c4` + uncommitted

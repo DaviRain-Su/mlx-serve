@@ -1,5 +1,23 @@
 # Changelog
 
+## v26.5.1 — OpenAI Responses API + WebSockets, tokenizer arena fix, LM Studio discovery
+
+- **Tokenizer ~30× faster load**: `loadTokenizer` keeps the parsed `tokenizer.json` arena alive and borrows vocab/merge string pointers from it instead of duping per entry; hashmaps pre-sized to skip rehashing. Headline downstream effect: **Qwen3.5-4B prefill 144 → 383 tok/s** (+165%, now ~93% of mlx-lm 0.31.2 reference) on 844-token prompts. Gemma-4-E4B and LFM2.5-350M within run-variance of prior numbers.
+
+- **OpenAI Responses API (`POST /v1/responses`, `GET`/`DELETE /v1/responses/{id}`)**: stateful chains via `previous_response_id`, in-memory `ResponseStore`, streaming SSE with per-event `sequence_number`, schema-conformant envelope (`tools` / `tool_choice` / `text` / `reasoning` / `usage` echo). `experiments/openresponses` compliance suite passes 17/17. Plus `POST /v1/responses/compact` — opaque base64 history blob (`{v:1, msgs:[…]}`) that round-trips back as a `compaction` input item without an LLM call.
+
+- **WebSocket transport on `/v1/responses`**: standard `Upgrade: websocket` handshake, each text frame is a `response.create` JSON message and each SSE event becomes one outbound text frame. New `src/ws.zig` (RFC 6455 framing, server-side). Per-connection `WsLocalCache` for `store: false` responses; no `[DONE]` on success — `response.completed` is the per-response terminator.
+
+- **PDF chat attachments** (MLX Core): drag-drop or paperclip-pick a PDF; PDFKit extracts the text into the message preamble. Encrypted or scan-only PDFs surface a clear error alert instead of silently dropping.
+
+- **LM Studio model auto-discovery** (MLX Core): reads LM Studio's `downloadsFolder` from `~/.lmstudio/settings.json` (falls back to `~/.lmstudio/models`), scans two levels deep for valid MLX models, groups them in the picker under "Other Discovered Models" alongside "MLX-Serve Models". GGUF folders skipped automatically via the existing `.safetensors` check. The Model Browser's "Downloaded" tab still shows only mlx-serve-managed models.
+
+- **Server auto-restarts on model-dropdown change** (MLX Core): switching model while the server is running stops and relaunches with the new model. Fixed `ServerManager.stop()` to detach the dying process's `terminationHandler` + stderr handler so its trailing "Shutting down gracefully…" can't bleed into the new server's log or hijack `status = .starting` into `.error("Failed to start")`.
+
+- **Native NSAlert on download failure** (MLX Core): "Not enough disk space. Need 8.4 GB but only 4.6 GB available." now pops as a modal alert in addition to the inline red text — doesn't get missed when the menu bar popover closes.
+
+---
+
 ## v26.4.33 — Hotfix: thread-local streams in mlx 0.31.2
 
 - **Inference now runs on the listener thread.** mlx 0.31.2 made GPU streams thread-local — model weights loaded on the main thread couldn't be evaluated from connection threads, so any chat completion crashed with `MLX error: There is no Stream(gpu, 1) in current thread.`. Removed the thread-per-connection spawn in `server.zig` and handle connections inline. The `inference_mutex` was already serializing the slow path, so this doesn't reduce real concurrency — only quick endpoints (`/health`, `/v1/models`, `/props`) get briefly delayed during generation, which is fine.

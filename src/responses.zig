@@ -372,6 +372,8 @@ pub fn parseInput(
                 } else if (std.mem.eql(u8, t, "reasoning")) {
                     // Drop on input — model regenerates its own reasoning.
                     continue;
+                } else if (std.mem.eql(u8, t, "compaction")) {
+                    appendCompactionInputItem(allocator, &pi, obj) catch {};
                 } else {
                     // Unknown item type — skip silently.
                     continue;
@@ -489,6 +491,93 @@ fn appendFunctionCallOutputItem(
         .content = output,
         .tool_call_id = call_id,
     });
+}
+
+// ─── compaction (round-trippable opaque blob) ────────────────────────────
+//
+// The OpenAI Responses spec treats `encrypted_content` as opaque, provider-
+// defined data. We synthesize a self-describing blob: base64-encoded JSON of
+// `{v:1, msgs:[{role, content}, ...]}`. No LLM call is required — the message
+// list is a faithful (lossy on tool-calls / images) snapshot of the resolved
+// input that round-trips back into a fresh response.create as `input`.
+
+/// Encode a sequence of messages as a compaction blob (base64 over JSON).
+/// Caller owns the returned slice. Tool calls / images are dropped — the blob
+/// only carries text-form turns. That matches the spec's "summarized" framing
+/// while staying self-contained.
+pub fn encodeCompactionBlob(allocator: std.mem.Allocator, messages: []const chat_mod.Message) ![]u8 {
+    var json_buf = std.ArrayList(u8).empty;
+    defer json_buf.deinit(allocator);
+    try json_buf.appendSlice(allocator, "{\"v\":1,\"msgs\":[");
+    var emitted: usize = 0;
+    for (messages) |m| {
+        // Skip empty turns and tool-role messages (no faithful round-trip path).
+        if (m.content.len == 0) continue;
+        if (emitted > 0) try json_buf.append(allocator, ',');
+        emitted += 1;
+        const esc_role = try jsonEscape(allocator, m.role);
+        defer allocator.free(esc_role);
+        const esc_content = try jsonEscape(allocator, m.content);
+        defer allocator.free(esc_content);
+        try json_buf.appendSlice(allocator, "{\"role\":");
+        try json_buf.appendSlice(allocator, esc_role);
+        try json_buf.appendSlice(allocator, ",\"content\":");
+        try json_buf.appendSlice(allocator, esc_content);
+        try json_buf.append(allocator, '}');
+    }
+    try json_buf.appendSlice(allocator, "]}");
+
+    const enc = std.base64.standard.Encoder;
+    const out_len = enc.calcSize(json_buf.items.len);
+    const out = try allocator.alloc(u8, out_len);
+    _ = enc.encode(out, json_buf.items);
+    return out;
+}
+
+fn appendCompactionInputItem(
+    allocator: std.mem.Allocator,
+    pi: *ParsedInput,
+    obj: std.json.ObjectMap,
+) !void {
+    const enc_val = obj.get("encrypted_content") orelse return;
+    if (enc_val != .string) return;
+    const enc_str = enc_val.string;
+    if (enc_str.len == 0) return;
+
+    const dec = std.base64.standard.Decoder;
+    const dec_len = dec.calcSizeForSlice(enc_str) catch return;
+    const decoded = try allocator.alloc(u8, dec_len);
+    defer allocator.free(decoded);
+    dec.decode(decoded, enc_str) catch return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const root = parsed.value.object;
+    const v_val = root.get("v") orelse return;
+    if (v_val != .integer or v_val.integer != 1) return;
+    const msgs_val = root.get("msgs") orelse return;
+    if (msgs_val != .array) return;
+
+    for (msgs_val.array.items) |m_val| {
+        if (m_val != .object) continue;
+        const role_val = m_val.object.get("role") orelse continue;
+        if (role_val != .string) continue;
+        const content_val = m_val.object.get("content") orelse continue;
+        if (content_val != .string) continue;
+
+        // Inner JSON values are owned by `parsed` (freed at scope end).
+        // Dupe both fields so they outlive this function.
+        const role_owned = try allocator.dupe(u8, role_val.string);
+        try pi.owned_strings.append(allocator, role_owned);
+        const content_owned = try allocator.dupe(u8, content_val.string);
+        try pi.owned_strings.append(allocator, content_owned);
+
+        try pi.messages.append(allocator, .{
+            .role = role_owned,
+            .content = content_owned,
+        });
+    }
 }
 
 // ─── tool_choice → instruction string ────────────────────────────────────
@@ -796,6 +885,50 @@ test "parseInput function_call + function_call_output round-trip" {
     try testing.expectEqualStrings("call_1", pi.messages.items[1].tool_calls.?[0].id);
     try testing.expectEqualStrings("tool", pi.messages.items[2].role);
     try testing.expectEqualStrings("call_1", pi.messages.items[2].tool_call_id.?);
+}
+
+test "compaction blob round-trips through encode + parseInput" {
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "hello there" },
+        .{ .role = "assistant", .content = "hi back" },
+    };
+    const blob = try encodeCompactionBlob(testing.allocator, &msgs);
+    defer testing.allocator.free(blob);
+
+    // Build the input array with a compaction item carrying the blob.
+    const input_json = try std.fmt.allocPrint(testing.allocator,
+        \\[{{"type":"compaction","id":"cmp_1","encrypted_content":"{s}"}}]
+    , .{blob});
+    defer testing.allocator.free(input_json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input_json, .{});
+    defer parsed.deinit();
+
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null);
+    defer pi.deinit();
+
+    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+    try testing.expectEqualStrings("user", pi.messages.items[0].role);
+    try testing.expectEqualStrings("hello there", pi.messages.items[0].content);
+    try testing.expectEqualStrings("assistant", pi.messages.items[1].role);
+    try testing.expectEqualStrings("hi back", pi.messages.items[1].content);
+}
+
+test "compaction with malformed envelope is silently skipped" {
+    // Bad base64 + bogus inner JSON shouldn't crash, just produces no messages.
+    const inputs = [_][]const u8{
+        \\[{"type":"compaction","encrypted_content":"!!!not-base64!!!"}]
+        ,
+        \\[{"type":"compaction","encrypted_content":""}]
+        ,
+    };
+    for (inputs) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        var pi = try parseInput(testing.allocator, parsed.value, null, null, null);
+        defer pi.deinit();
+        try testing.expectEqual(@as(usize, 0), pi.messages.items.len);
+    }
 }
 
 test "parseToolChoice none drops tools, required emits instruction" {

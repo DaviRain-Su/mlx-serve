@@ -107,6 +107,14 @@ class ServerManager: ObservableObject {
         healthTimer = nil
 
         if let proc = process, proc.isRunning {
+            // Intentional shutdown: detach handlers so the trailing exit and any
+            // final stderr (e.g. "Shutting down gracefully...") can't bleed into
+            // the next server's serverLog or trigger handleTermination's error path
+            // if start() runs before the old process has fully exited.
+            proc.terminationHandler = nil
+            if let pipe = proc.standardError as? Pipe {
+                pipe.fileHandleForReading.readabilityHandler = nil
+            }
             proc.terminate()
             DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
                 if proc.isRunning { proc.interrupt() }
