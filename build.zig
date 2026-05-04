@@ -1,8 +1,30 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Pin LC_BUILD_VERSION minos to macOS 14 (Sonoma) so binaries built on newer
+    // runners (macos-26 in CI) still load on Sonoma. dyld refuses any image whose
+    // minos is newer than the running OS.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{
+            .os_version_min = .{ .semver = .{ .major = 14, .minor = 0, .patch = 0 } },
+        },
+    });
     const optimize = b.standardOptimizeOption(.{});
+
+    // Setting any non-default target field disables Zig's native macOS SDK detection,
+    // so we resolve the SDK path ourselves and surface its frameworks dir.
+    const macos_sdk_frameworks: ?[]const u8 = blk: {
+        if (target.result.os.tag != .macos) break :blk null;
+        var code: u8 = undefined;
+        const stdout = b.runAllowFail(
+            &.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" },
+            &code,
+            .inherit,
+        ) catch break :blk null;
+        const sdk = std.mem.trim(u8, stdout, " \n\r\t");
+        if (sdk.len == 0) break :blk null;
+        break :blk b.fmt("{s}/System/Library/Frameworks", .{sdk});
+    };
 
     // Version from build option or default
     const version = b.option([]const u8, "version", "Version string") orelse "0.1.0-dev";
@@ -36,6 +58,9 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("mlxc", .{});
     mod.linkSystemLibrary("webp", .{});
 
+    if (macos_sdk_frameworks) |fw_path| {
+        mod.addFrameworkPath(.{ .cwd_relative = fw_path });
+    }
     mod.linkFramework("IOKit", .{});
     mod.linkFramework("CoreFoundation", .{});
 
@@ -79,6 +104,9 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("mlxc", .{});
     test_mod.linkSystemLibrary("webp", .{});
 
+    if (macos_sdk_frameworks) |fw_path| {
+        test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
+    }
     test_mod.linkFramework("IOKit", .{});
     test_mod.linkFramework("CoreFoundation", .{});
 

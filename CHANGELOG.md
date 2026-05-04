@@ -1,5 +1,12 @@
 # Changelog
 
+## v26.5.2 — Sonoma compatibility for CLI binary
+
+- **Fix `mlx-serve` failing to launch on macOS 14 (Sonoma)**: pin `LC_BUILD_VERSION minos` to 14.0 in `build.zig` so binaries built on the `macos-26` (Tahoe) CI runner still load on Sonoma. dyld refuses any image whose minOS is newer than the running OS. MLX Core (Swift) was already fine via `Package.swift`'s `.macOS(.v14)`; only the Zig binary was affected.
+- **SDK auto-detection workaround**: setting any non-default target field in Zig disables native macOS framework discovery, so `build.zig` now resolves the SDK with `xcrun --sdk macosx --show-sdk-path` and adds its `Frameworks` dir as a search path. No workflow change needed.
+
+---
+
 ## v26.5.1 — OpenAI Responses API + WebSockets, tokenizer arena fix, LM Studio discovery
 
 - **Tokenizer ~30× faster load**: `loadTokenizer` keeps the parsed `tokenizer.json` arena alive and borrows vocab/merge string pointers from it instead of duping per entry; hashmaps pre-sized to skip rehashing. Headline downstream effect: **Qwen3.5-4B prefill 144 → 383 tok/s** (+165%, now ~93% of mlx-lm 0.31.2 reference) on 844-token prompts. Gemma-4-E4B and LFM2.5-350M within run-variance of prior numbers.
