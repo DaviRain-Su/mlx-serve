@@ -20,6 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select Xcode (Swift 6.1+ required by MCP swift-sdk)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
