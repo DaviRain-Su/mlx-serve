@@ -612,10 +612,8 @@ final class MCPManager: ObservableObject {
                 parts.append("[image: \(mimeType)]")
             case .audio(_, let mimeType):
                 parts.append("[audio: \(mimeType)]")
-            case .resource(let resource, _, _):
-                parts.append("[resource: \(resource)]")
-            case .resourceLink(let uri, let name, _, _, _, _):
-                parts.append("[resource link: \(name) at \(uri)]")
+            case .resource(let uri, let mimeType, _):
+                parts.append("[resource: \(uri) (\(mimeType))]")
             }
         }
         return parts.isEmpty ? "(no content)" : parts.joined(separator: "\n")
