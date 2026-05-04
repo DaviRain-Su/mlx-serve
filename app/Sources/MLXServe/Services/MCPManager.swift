@@ -606,11 +606,11 @@ final class MCPManager: ObservableObject {
         var parts: [String] = []
         for item in content {
             switch item {
-            case .text(let text, _, _):
+            case .text(let text):
                 parts.append(text)
-            case .image(_, let mimeType, _, _):
+            case .image(_, let mimeType, _):
                 parts.append("[image: \(mimeType)]")
-            case .audio(_, let mimeType, _, _):
+            case .audio(_, let mimeType):
                 parts.append("[audio: \(mimeType)]")
             case .resource(let resource, _, _):
                 parts.append("[resource: \(resource)]")
