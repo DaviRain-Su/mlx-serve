@@ -5,10 +5,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + test + package only — skip tag, notarize, release, and formula push. Use to verify the workflow on a branch before cutting a real release."
+        type: boolean
+        default: false
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-14
     permissions:
       contents: write
 
@@ -21,7 +26,7 @@ jobs:
           version: 0.16.0
 
       - name: Install dependencies
-        run: brew install mlx-c webp create-dmg
+        run: brew bundle install --file=Brewfile
 
       - name: Import signing certificate
         env:
@@ -48,10 +53,16 @@ jobs:
 
       - name: Extract version
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # CalVer: YY.MM.build_number
-            VERSION="$(date -u +%y.%-m).${{ github.run_number }}"
+            # CalVer YY.M.N — N auto-increments from the last vYY.M.* release tag.
+            PREFIX="$(date -u +%y.%-m)"
+            LAST_N=$(gh release list --limit 100 --json tagName \
+              --jq "[.[] | .tagName | select(test(\"^v${PREFIX}\\\\.[0-9]+$\")) | sub(\"^v${PREFIX}\\\\.\"; \"\") | tonumber] | max // 0")
+            N=$((LAST_N + 1))
+            VERSION="${PREFIX}.${N}"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           else
@@ -60,7 +71,7 @@ jobs:
           fi
 
       - name: Create tag (manual dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
         run: |
           git tag v${{ steps.version.outputs.version }}
           git push origin v${{ steps.version.outputs.version }}
@@ -68,11 +79,23 @@ jobs:
       - name: Build mlx-serve (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
 
+      - name: Smoke test mlx-serve binary
+        run: |
+          ./zig-out/bin/mlx-serve --version
+          ./zig-out/bin/mlx-serve --help > /dev/null
+
+      - name: Run Zig tests
+        run: zig build test --summary all
+
       - name: Build Swift app
         working-directory: app
         run: |
           swift build -c release
           echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
+
+      - name: Run Swift tests
+        working-directory: app
+        run: swift test
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary
@@ -127,6 +150,11 @@ jobs:
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
 
           codesign --verify --deep --strict --verbose=2 "$STAGING/mlx-serve"
+
+          # Smoke test the install_name_tool-rewired binary so missing-dylib
+          # errors surface here rather than after notarization.
+          "./$STAGING/mlx-serve" --version
+
           ditto -c -k --keepParent "$STAGING" "mlx-serve-cli.zip"
 
       # ── .app bundle (menu bar app with everything inside) ──
@@ -215,6 +243,7 @@ jobs:
 
       # ── Notarize both ──
       - name: Notarize CLI
+        if: ${{ !inputs.dry_run }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -227,6 +256,7 @@ jobs:
             --wait
 
       - name: Notarize app bundle
+        if: ${{ !inputs.dry_run }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -254,6 +284,7 @@ jobs:
         run: security delete-keychain $RUNNER_TEMP/signing.keychain-db || true
 
       - name: Create Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -263,7 +294,18 @@ jobs:
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg
 
+      - name: Upload dry-run artifacts
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-${{ steps.version.outputs.version }}
+          path: |
+            mlx-serve-bin-macos-arm64.tar.gz
+            MLXCore.dmg
+          retention-days: 7
+
       - name: Update Homebrew formulas
+        if: ${{ !inputs.dry_run }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           DMG_SHA=$(shasum -a 256 MLXCore.dmg | awk '{print $1}')

@@ -1,5 +1,17 @@
 # Changelog
 
+## v26.5.3 — Real Sonoma compatibility, CI test gate, dependency pinning
+
+- **Bundled dylibs are now actually Sonoma-compatible.** Switched the release runner from `macos-26` to `macos-14`; Homebrew bottles for `mlx`, `mlx-c`, `webp`, and `libsharpyuv` come out stamped `minos 14.0` instead of `minos 26.0`. v26.5.2 fixed the Zig binary's minOS but the bundled libs still required Tahoe — dyld would refuse them on Sonoma at first launch, surfacing as "Server failed to start" in MLX Core.
+- **CI test gate**: `zig build test` and `swift test` now run between build and packaging. A regression that breaks the suite no longer ships.
+- **Post-build smoke tests**: `mlx-serve --version` runs against both the freshly built binary and the install_name_tool-rewired CLI artifact, so missing-dylib failures surface before the notarize step burns a submission slot.
+- **Homebrew dependencies pinned in `build.zig`**: builds now hard-fail with a clear message if `mlx`, `mlx-c`, or `webp` are below the minimum versions the codebase expects (mlx >= 0.31.2 — the version the v26.4.33 thread-local-stream hotfix targeted).
+- **Zig 0.16+ enforced**: `comptime` check at the top of `build.zig` produces "needs Zig 0.16, run brew upgrade zig" instead of a cryptic `StdIo.inherit` enum error on older Zig. Belt-and-suspenders to `build.zig.zon`'s `minimum_zig_version`, which Zig 0.15 doesn't enforce for root projects.
+- **`Brewfile`**: declarative dep manifest. `brew bundle install` from a fresh checkout (or in CI) covers `zig`, `mlx-c`, `webp`, `create-dmg`.
+- **`workflow_dispatch` version scheme fixed**: now reads the latest `vYY.M.N` release tag and increments N (matching the documented CalVer scheme). Was using `github.run_number`, a global counter, which would have produced versions like v26.5.1234.
+
+---
+
 ## v26.5.2 — Sonoma compatibility for CLI binary
 
 - **Fix `mlx-serve` failing to launch on macOS 14 (Sonoma)**: pin `LC_BUILD_VERSION minos` to 14.0 in `build.zig` so binaries built on the `macos-26` (Tahoe) CI runner still load on Sonoma. dyld refuses any image whose minOS is newer than the running OS. MLX Core (Swift) was already fine via `Package.swift`'s `.macOS(.v14)`; only the Zig binary was affected.

@@ -1,4 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+comptime {
+    const required: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
+    if (builtin.zig_version.order(required) == .lt) {
+        @compileError(std.fmt.comptimePrint(
+            "mlx-serve requires Zig {d}.{d}.{d} or newer (have {d}.{d}.{d}). Run `brew upgrade zig`.",
+            .{ required.major, required.minor, required.patch, builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
+        ));
+    }
+}
 
 pub fn build(b: *std.Build) void {
     // Pin LC_BUILD_VERSION minos to macOS 14 (Sonoma) so binaries built on newer
@@ -25,6 +36,10 @@ pub fn build(b: *std.Build) void {
         if (sdk.len == 0) break :blk null;
         break :blk b.fmt("{s}/System/Library/Frameworks", .{sdk});
     };
+
+    if (target.result.os.tag == .macos) {
+        verifyBrewDeps(b);
+    }
 
     // Version from build option or default
     const version = b.option([]const u8, "version", "Version string") orelse "0.1.0-dev";
@@ -117,4 +132,48 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+}
+
+const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
+
+const required_brew_deps = [_]BrewDep{
+    .{ .name = "mlx", .min = .{ .major = 0, .minor = 31, .patch = 2 } },
+    .{ .name = "mlx-c", .min = .{ .major = 0, .minor = 6, .patch = 0 } },
+    .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
+};
+
+fn verifyBrewDeps(b: *std.Build) void {
+    for (required_brew_deps) |dep| {
+        var code: u8 = undefined;
+        const stdout = b.runAllowFail(
+            &.{ "brew", "list", "--versions", dep.name },
+            &code,
+            .inherit,
+        ) catch {
+            std.debug.print(
+                "\n[mlx-serve] missing Homebrew dependency '{s}' (>= {d}.{d}.{d}). Install with: brew install mlx-c webp\n\n",
+                .{ dep.name, dep.min.major, dep.min.minor, dep.min.patch },
+            );
+            std.process.exit(1);
+        };
+        const trimmed = std.mem.trim(u8, stdout, " \n\r\t");
+        const space = std.mem.indexOfScalar(u8, trimmed, ' ') orelse {
+            std.debug.print("[mlx-serve] cannot parse `brew list --versions {s}` output: {s}\n", .{ dep.name, trimmed });
+            std.process.exit(1);
+        };
+        var ver_str = trimmed[space + 1 ..];
+        // Strip Homebrew revision suffix (e.g., "0.6.0_2" -> "0.6.0").
+        if (std.mem.indexOfScalar(u8, ver_str, '_')) |us| ver_str = ver_str[0..us];
+        const have = std.SemanticVersion.parse(ver_str) catch {
+            std.debug.print("[mlx-serve] cannot parse '{s}' version '{s}'\n", .{ dep.name, ver_str });
+            std.process.exit(1);
+        };
+        if (have.order(dep.min) == .lt) {
+            std.debug.print(
+                "\n[mlx-serve] Homebrew '{s}' is {d}.{d}.{d}; need >= {d}.{d}.{d}. Run: brew upgrade {s}\n\n",
+                .{ dep.name, have.major, have.minor, have.patch, dep.min.major, dep.min.minor, dep.min.patch, dep.name },
+            );
+            std.process.exit(1);
+        }
+    }
 }
